@@ -9,6 +9,16 @@ const {
   resolveCouponDiscount,
   calculateTax
 } = require('../services/checkoutComputation.service');
+const {
+  normalizePaymentMethod,
+  normalizePaymentPlan,
+  createInvalidPaymentMethodError,
+  createQuoteExpiredError,
+  createQuoteStaleError,
+  sendCheckoutFlowError,
+  buildRequestLogContext
+} = require('../utils/checkoutFlow');
+const logger = require('../utils/logger');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 
@@ -21,19 +31,6 @@ function allowDemoMockShipping(req) {
   }
   return true;
 }
-
-const normalizePaymentMethod = (value) => {
-  const v = String(value || '').toLowerCase().trim();
-  if (v === 'cod') return 'cod';
-  if (v === 'online' || v === 'prepaid') return 'online';
-  return null;
-};
-
-const normalizePaymentPlan = (value) => {
-  const v = String(value || '').toLowerCase().trim();
-  if (v === 'partial' || v === 'advance') return 'advance';
-  return 'full';
-};
 
 async function buildFinalTotals({ cartDoc, pin, finalUserType, couponCode, paymentMethodHint, req }) {
   if (allowDemoMockShipping(req)) {
@@ -104,6 +101,13 @@ exports.quoteCheckout = async (req, res) => {
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const { addressId, couponCode, paymentMethodHint } = req.body || {};
 
+    if (paymentMethodHint !== undefined && paymentMethodHint !== null && paymentMethodHint !== '') {
+      const normalizedPaymentMethodHint = normalizePaymentMethod(paymentMethodHint);
+      if (!normalizedPaymentMethodHint) {
+        throw createInvalidPaymentMethodError();
+      }
+    }
+
     if (!addressId) {
       return res.status(400).json({ success: false, message: 'addressId is required' });
     }
@@ -142,6 +146,19 @@ exports.quoteCheckout = async (req, res) => {
     const fp = cartFingerprintFromItems(cartDoc.items);
     const quoteExpiresAt = new Date(Date.now() + QUOTE_TTL_MS);
     const couponCodeUpper = couponCode ? String(couponCode).toUpperCase().trim() : '';
+
+    await CheckoutQuote.updateMany(
+      {
+        userId,
+        status: { $in: ['active', 'confirmed'] }
+      },
+      {
+        $set: {
+          status: 'expired',
+          lastValidatedAt: new Date()
+        }
+      }
+    );
 
     cartDoc.deliverySnapshot = {
       addressId,
@@ -188,6 +205,12 @@ exports.quoteCheckout = async (req, res) => {
       quoteExpiresAt
     });
 
+    logger.info('Checkout quote created', buildRequestLogContext(req, {
+      quoteId: String(quote._id),
+      cartFingerprint: fp,
+      paymentMethodHint: paymentMethodHint || null
+    }));
+
     const eta =
       finalTotals.deliveryMeta?.estimatedDays != null
         ? `Estimated delivery in ${finalTotals.deliveryMeta.estimatedDays} business days`
@@ -215,13 +238,12 @@ exports.quoteCheckout = async (req, res) => {
     });
   } catch (err) {
     if (err.statusCode) {
-      return res.status(err.statusCode).json({
-        success: false,
-        message: err.message,
-        code: err.code
-      });
+      return sendCheckoutFlowError(res, err, 'Failed to build checkout quote');
     }
-    console.error('quoteCheckout:', err);
+    logger.error('quoteCheckout failed', buildRequestLogContext(req, {
+      error: err.message,
+      stack: err.stack
+    }));
     return res.status(500).json({ success: false, message: 'Failed to build checkout quote' });
   }
 };
@@ -242,7 +264,7 @@ exports.confirmCheckout = async (req, res) => {
 
     const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
     if (!normalizedPaymentMethod) {
-      return res.status(400).json({ success: false, message: 'paymentMethod must be cod or prepaid/online' });
+      throw createInvalidPaymentMethodError();
     }
     const normalizedPaymentPlan = normalizePaymentPlan(paymentPlan);
 
@@ -254,7 +276,7 @@ exports.confirmCheckout = async (req, res) => {
     if (quote.quoteExpiresAt.getTime() <= Date.now()) {
       quote.status = 'expired';
       await quote.save();
-      return res.status(400).json({ success: false, message: 'Quote expired. Please refresh checkout totals.' });
+      throw createQuoteExpiredError();
     }
 
     const address = await Address.findById(quote.addressId).lean();
@@ -274,7 +296,9 @@ exports.confirmCheckout = async (req, res) => {
 
     const fp = cartFingerprintFromItems(cartDoc.items);
     if (fp !== quote.cartFingerprint) {
-      return res.status(400).json({ success: false, message: 'Cart changed. Regenerate quote.' });
+      throw createQuoteStaleError('cart_changed', {
+        message: 'Cart changed. Please refresh quote before proceeding.'
+      });
     }
 
     const couponCode = quote.couponCodeUpper || null;
@@ -303,17 +327,17 @@ exports.confirmCheckout = async (req, res) => {
       roundMoney2(quote.amountPayable) !== roundMoney2(recomputed.totalAmount);
 
     if (mismatch) {
-      return res.status(409).json({
-        success: false,
-        code: 'QUOTE_STALE',
+      throw createQuoteStaleError('pricing_changed', {
         message: 'Pricing changed since quote creation. Please refresh quote before proceeding.',
-        latest: {
-          itemsSubtotal: recomputed.subtotal,
-          promotionDiscount: recomputed.discount,
-          deliveryCharges: recomputed.deliveryCharges,
-          taxes: recomputed.tax,
-          amountPayable: recomputed.totalAmount,
-          codAvailable: recomputed.deliveryMeta?.codAvailable !== false
+        details: {
+          latest: {
+            itemsSubtotal: recomputed.subtotal,
+            promotionDiscount: recomputed.discount,
+            deliveryCharges: recomputed.deliveryCharges,
+            taxes: recomputed.tax,
+            amountPayable: recomputed.totalAmount,
+            codAvailable: recomputed.deliveryMeta?.codAvailable !== false
+          }
         }
       });
     }
@@ -322,6 +346,12 @@ exports.confirmCheckout = async (req, res) => {
     quote.status = 'confirmed';
     quote.confirmedAt = new Date();
     await quote.save();
+
+    logger.info('Checkout quote confirmed', buildRequestLogContext(req, {
+      quoteId: String(quote._id),
+      paymentMethod: normalizedPaymentMethod,
+      paymentPlan: normalizedPaymentPlan
+    }));
 
     return res.json({
       success: true,
@@ -351,13 +381,12 @@ exports.confirmCheckout = async (req, res) => {
     });
   } catch (err) {
     if (err.statusCode) {
-      return res.status(err.statusCode).json({
-        success: false,
-        message: err.message,
-        code: err.code
-      });
+      return sendCheckoutFlowError(res, err, 'Failed to confirm checkout quote');
     }
-    console.error('confirmCheckout:', err);
+    logger.error('confirmCheckout failed', buildRequestLogContext(req, {
+      error: err.message,
+      stack: err.stack
+    }));
     return res.status(500).json({ success: false, message: 'Failed to confirm checkout quote' });
   }
 };

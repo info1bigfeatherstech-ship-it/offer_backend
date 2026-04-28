@@ -5,6 +5,7 @@ const Cart = require('../models/cart');
 const CheckoutQuote = require('../models/CheckoutQuote');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
+const OrderIdempotencyKey = require('../models/OrderIdempotencyKey');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -17,6 +18,18 @@ const {
 } = require('../services/checkoutComputation.service');
 const { releaseReservedInventoryForOrder } = require('../services/orderInventory.service');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
+const {
+    normalizePaymentMethod,
+    normalizePaymentPlan,
+    normalizeIdempotencyKey,
+    createInvalidPaymentMethodError,
+    createQuoteExpiredError,
+    createQuoteStaleError,
+    createCheckoutFlowError,
+    sendCheckoutFlowError,
+    isOrderStaffRequest,
+    buildRequestLogContext
+} = require('../utils/checkoutFlow');
 
 // Initialize Razorpay (trim — stray spaces/newlines in .env break auth)
 const razorpay = new Razorpay({
@@ -59,24 +72,256 @@ async function applyRefundEntryToOrder(order, refundEntity) {
     await order.save();
 }
 
+async function abortTransactionSafely(session) {
+    if (!session?.inTransaction()) return;
+    try {
+        await session.abortTransaction();
+    } catch (_) {
+        // Swallow abort failures to preserve the original controller error.
+    }
+}
+
+async function reserveInventoryAtomically(lines, session) {
+    for (const line of lines) {
+        const variant = line?.variant;
+        const product = line?.product;
+
+        if (!product?._id || !variant?._id) {
+            throw createCheckoutFlowError({
+                statusCode: 500,
+                code: 'ORDER_LINE_INVALID',
+                message: 'Order line is missing product or variant information'
+            });
+        }
+
+        if (variant.inventory?.trackInventory === false) {
+            continue;
+        }
+
+        const requestedQty = Number(line.quantity);
+        if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
+            throw createCheckoutFlowError({
+                statusCode: 400,
+                code: 'ORDER_LINE_QUANTITY_INVALID',
+                message: 'Order line quantity must be greater than 0'
+            });
+        }
+
+        const reserveResult = await Product.updateOne(
+            {
+                _id: product._id,
+                variants: {
+                    $elemMatch: {
+                        _id: variant._id,
+                        'inventory.trackInventory': true,
+                        'inventory.quantity': { $gte: requestedQty }
+                    }
+                }
+            },
+            {
+                $inc: { 'variants.$.inventory.quantity': -requestedQty }
+            }
+        ).session(session);
+
+        if (reserveResult.modifiedCount !== 1) {
+            throw createCheckoutFlowError({
+                statusCode: 409,
+                code: 'INSUFFICIENT_STOCK_RACE',
+                message: `${product.name || 'Product'} stock changed during checkout. Please refresh your cart and try again.`,
+                details: {
+                    productId: String(product._id),
+                    variantId: String(variant._id),
+                    requestedQuantity: requestedQty
+                }
+            });
+        }
+    }
+}
+
+function buildUnauthorizedOrderResponse(res) {
+    return res.status(403).json({
+        success: false,
+        message: 'Unauthorized'
+    });
+}
+
+function buildOrderResponsePayload(order, {
+    normalizedPaymentMethod,
+    discount,
+    splitMode,
+    appliedCouponCode,
+    razorpayOrder = null,
+    idempotentReplay = false
+}) {
+    return {
+        success: true,
+        message: normalizedPaymentMethod === 'cod' ? 'Order placed successfully' : 'Order created. Complete payment to confirm.',
+        order: {
+            orderId: order.orderId,
+            totalAmount: order.totalAmount,
+            subtotal: order.subtotal,
+            tax: order.tax,
+            discount: discount ?? order.discount ?? 0,
+            orderStatus: order.orderStatus,
+            paymentStatus: order.paymentStatus,
+            balanceDueInr: order.balanceDueInr,
+            onlinePaymentMode: splitMode || order.paymentInfo?.splitMode || 'full'
+        },
+        appliedCoupon: appliedCouponCode ?? order.appliedCoupon?.code ?? null,
+        razorpayOrder: razorpayOrder ? {
+            id: razorpayOrder.id,
+            amount: razorpayOrder.amount,
+            currency: razorpayOrder.currency
+        } : null,
+        paymentMethod: normalizedPaymentMethod,
+        idempotentReplay
+    };
+}
+
+async function resolveIdempotencyRecord({ req, body }) {
+    const idempotencyKey = normalizeIdempotencyKey(req.headers['idempotency-key']);
+    if (!idempotencyKey) {
+        return { enabled: false, record: null, normalizedKey: null };
+    }
+
+    const requestHash = OrderIdempotencyKey.buildRequestHash({
+        addressId: body.addressId || null,
+        paymentMethod: body.paymentMethod || null,
+        couponCode: body.couponCode || null,
+        onlinePaymentMode: body.onlinePaymentMode || 'full',
+        quoteId: body.quoteId || null
+    });
+
+    let record = await OrderIdempotencyKey.findOne({ userId: req.userId, key: idempotencyKey });
+    let createdNow = false;
+
+    if (!record) {
+        try {
+            record = await OrderIdempotencyKey.create({
+                userId: req.userId,
+                key: idempotencyKey,
+                requestHash,
+                status: 'pending'
+            });
+            createdNow = true;
+        } catch (error) {
+            if (error?.code !== 11000) {
+                throw error;
+            }
+            record = await OrderIdempotencyKey.findOne({ userId: req.userId, key: idempotencyKey });
+        }
+    }
+
+    if (record.requestHash !== requestHash) {
+        throw createCheckoutFlowError({
+            statusCode: 409,
+            code: 'IDEMPOTENCY_KEY_REUSED',
+            message: 'This Idempotency-Key is already used for a different order request.',
+            details: { key: idempotencyKey }
+        });
+    }
+
+    if (record.status === 'completed' && record.orderId) {
+        const existingOrder = await Order.findOne({ orderId: record.orderId, userId: req.userId });
+        if (!existingOrder) {
+            logger.warn('Idempotency record points to missing order', buildRequestLogContext(req, {
+                idempotencyKey,
+                orderId: record.orderId
+            }));
+            await OrderIdempotencyKey.deleteOne({ _id: record._id });
+            record = await OrderIdempotencyKey.create({
+                userId: req.userId,
+                key: idempotencyKey,
+                requestHash,
+                status: 'pending'
+            });
+            createdNow = true;
+        } else {
+            return {
+                enabled: true,
+                normalizedKey: idempotencyKey,
+                requestHash,
+                record,
+                existingOrder
+            };
+        }
+    }
+
+    const pendingAgeMs = record.createdAt ? Date.now() - record.createdAt.getTime() : 0;
+    if (!createdNow && record.status === 'pending' && pendingAgeMs <= 10 * 60 * 1000) {
+        const lockIsFresh = record.updatedAt ? Date.now() - record.updatedAt.getTime() <= 60 * 1000 : true;
+        if (lockIsFresh) {
+            throw createCheckoutFlowError({
+                statusCode: 409,
+                code: 'IDEMPOTENCY_REQUEST_IN_PROGRESS',
+                message: 'An order request with this Idempotency-Key is already being processed.',
+                details: { key: idempotencyKey }
+            });
+        }
+    }
+
+    if (record.status === 'pending') {
+        record.requestHash = requestHash;
+        record.updatedAt = new Date();
+        await record.save();
+    }
+
+    return {
+        enabled: true,
+        normalizedKey: idempotencyKey,
+        requestHash,
+        record,
+        existingOrder: null
+    };
+}
+
 // ========== MAIN ORDER CREATION API ==========
 // ========== MAIN ORDER CREATION API ==========
 exports.createOrder = async (req, res) => {
-    logger.debug('Create order request received');
+    logger.debug('Create order request received', buildRequestLogContext(req));
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
         // Never trust client totals — only address, payment channel, user type, coupon code, Razorpay split mode
         const { addressId, paymentMethod, couponCode, onlinePaymentMode = 'full', quoteId } = req.body || {};
+        const idempotency = await resolveIdempotencyRecord({ req, body: req.body || {} });
+        if (idempotency.existingOrder) {
+            logger.info('Replaying existing order for idempotent request', buildRequestLogContext(req, {
+                idempotencyKey: idempotency.normalizedKey,
+                orderId: idempotency.existingOrder.orderId
+            }));
+            return res.status(200).json(
+                buildOrderResponsePayload(idempotency.existingOrder, {
+                    normalizedPaymentMethod: idempotency.existingOrder.paymentInfo?.method || 'online',
+                    discount: idempotency.existingOrder.discount,
+                    splitMode: idempotency.existingOrder.paymentInfo?.splitMode,
+                    appliedCouponCode: idempotency.existingOrder.appliedCoupon?.code || null,
+                    razorpayOrder: idempotency.existingOrder.paymentInfo?.razorpayOrderId
+                        ? {
+                            id: idempotency.existingOrder.paymentInfo.razorpayOrderId,
+                            amount: idempotency.existingOrder.paymentInfo?.amountPaise || null,
+                            currency: 'INR'
+                        }
+                        : null,
+                    idempotentReplay: true
+                })
+            );
+        }
+
         const userId = req.userId;
         const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
-        const normalizedPaymentMethod = String(paymentMethod || '').toLowerCase() === 'prepaid' ? 'online' : paymentMethod;
-        const normalizedOnlinePaymentMode =
-            String(onlinePaymentMode || '').toLowerCase() === 'partial' ? 'advance' : onlinePaymentMode;
+        const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
+        if (!normalizedPaymentMethod) {
+            throw createInvalidPaymentMethodError();
+        }
+        const normalizedOnlinePaymentMode = normalizePaymentPlan(onlinePaymentMode);
 
         if (!quoteId) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(400).json({
                 success: false,
                 message: 'quoteId is required. Generate and confirm checkout quote before placing order.'
@@ -86,7 +331,10 @@ exports.createOrder = async (req, res) => {
         // 1. Validate address
         const address = await Address.findById(addressId).session(session);
         if (!address) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(404).json({
                 success: false,
                 message: 'Address not found'
@@ -94,7 +342,10 @@ exports.createOrder = async (req, res) => {
         }
 
         if (String(address.userId) !== String(userId)) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(403).json({
                 success: false,
                 message: 'Address does not belong to this user'
@@ -104,7 +355,10 @@ exports.createOrder = async (req, res) => {
         // 2. Get user's cart
         const cartDoc = await Cart.findOne({ userId }).session(session);
         if (!cartDoc || !cartDoc.items || cartDoc.items.length === 0) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(400).json({
                 success: false,
                 message: 'cart is empty'
@@ -114,7 +368,10 @@ exports.createOrder = async (req, res) => {
         const normalizePin = (p) => String(p || '').replace(/\D/g, '').slice(0, 6);
         const pin = normalizePin(address.postalCode);
         if (pin.length !== 6) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(400).json({
                 success: false,
                 message: 'Address must include a valid 6-digit postal code'
@@ -124,56 +381,48 @@ exports.createOrder = async (req, res) => {
         const fp = cartFingerprintFromItems(cartDoc.items);
         const quote = await CheckoutQuote.findOne({ _id: quoteId, userId }).session(session);
         if (!quote) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(404).json({
                 success: false,
                 message: 'Checkout quote not found'
             });
         }
         if (quote.status !== 'confirmed') {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
+            throw createQuoteStaleError('quote_not_confirmed', {
                 message: 'Checkout quote is not confirmed. Please confirm quote before placing order.'
             });
         }
         if (quote.quoteExpiresAt.getTime() <= Date.now()) {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
-                message: 'Checkout quote expired. Please generate quote again.'
-            });
+            throw createQuoteExpiredError();
         }
         if (String(quote.addressId) !== String(addressId)) {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
-                message: 'Address changed after quote confirmation. Regenerate quote.'
+            throw createQuoteStaleError('address_changed', {
+                message: 'Address changed after quote confirmation. Please refresh quote before proceeding.'
             });
         }
         if (normalizePin(quote.postalCode) !== pin) {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
-                message: 'Pincode changed after quote confirmation. Regenerate quote.'
+            throw createQuoteStaleError('address_changed', {
+                message: 'Pincode changed after quote confirmation. Please refresh quote before proceeding.'
             });
         }
         if (String(quote.cartFingerprint) !== String(fp)) {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
-                message: 'Cart changed after quote confirmation. Regenerate quote.'
+            throw createQuoteStaleError('cart_changed', {
+                message: 'Cart changed after quote confirmation. Please refresh quote before proceeding.'
             });
         }
         if (String(quote.couponCodeUpper || '') !== String((couponCode || '')).toUpperCase().trim()) {
-            await session.abortTransaction();
-            return res.status(409).json({
-                success: false,
-                message: 'Coupon changed after quote confirmation. Regenerate quote.'
+            throw createQuoteStaleError('coupon_changed', {
+                message: 'Coupon changed after quote confirmation. Please refresh quote before proceeding.'
             });
         }
         if (normalizedPaymentMethod === 'cod' && quote.shippingMeta?.codAvailable === false) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
             return res.status(400).json({
                 success: false,
                 code: 'COD_NOT_AVAILABLE',
@@ -225,28 +474,36 @@ exports.createOrder = async (req, res) => {
                     : 0
             );
         } catch (e) {
-            await session.abortTransaction();
+            await abortTransactionSafely(session);
             session.endSession();
-            const status = e.statusCode || 500;
-            return res.status(status).json({
-                success: false,
-                message: e.message || 'Checkout validation failed',
-                code: e.code
-            });
+            return sendCheckoutFlowError(res, e, 'Checkout validation failed');
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const quoteTotalsMismatch =
+            roundMoney2(quote.itemsSubtotal) !== roundMoney2(subtotal) ||
+            roundMoney2(quote.promotionDiscount) !== roundMoney2(discount) ||
+            roundMoney2(quote.deliveryCharges) !== roundMoney2(deliveryCharges) ||
+            roundMoney2(quote.taxes) !== roundMoney2(tax) ||
+            roundMoney2(quote.amountPayable) !== roundMoney2(totalAmount);
 
-        for (const line of lines) {
-            const variant = line.variant;
-            const product = line.product;
-            if (variant.inventory?.trackInventory) {
-                await Product.updateOne(
-                    { _id: product._id, 'variants._id': variant._id },
-                    { $inc: { 'variants.$.inventory.quantity': -line.quantity } }
-                ).session(session);
-            }
+        if (quoteTotalsMismatch) {
+            throw createQuoteStaleError('pricing_changed', {
+                message: 'Pricing changed after quote confirmation. Please refresh quote before placing order.',
+                details: {
+                    latest: {
+                        itemsSubtotal: subtotal,
+                        promotionDiscount: discount,
+                        deliveryCharges,
+                        taxes: tax,
+                        amountPayable: totalAmount,
+                        codAvailable: quote.shippingMeta?.codAvailable !== false
+                    }
+                }
+            });
         }
+
+        await reserveInventoryAtomically(lines, session);
 
         // 8. Generate order ID
         const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -317,6 +574,19 @@ exports.createOrder = async (req, res) => {
 
         await session.commitTransaction();
         session.endSession();
+
+        if (idempotency.enabled) {
+            await OrderIdempotencyKey.updateOne(
+                { _id: idempotency.record._id },
+                {
+                    $set: {
+                        status: 'completed',
+                        orderId: order.orderId,
+                        completedAt: new Date()
+                    }
+                }
+            );
+        }
 
         // 11. If online payment, create Razorpay order (amount in paise must match verify/webhook logic)
         let razorpayOrder = null;
@@ -396,35 +666,47 @@ exports.createOrder = async (req, res) => {
             }
         }
         
-        console.log("Order created", order.orderId);
-        
-        return res.status(201).json({
-            success: true,
-            message: normalizedPaymentMethod === 'cod' ? 'Order placed successfully' : 'Order created. Complete payment to confirm.',
-            order: {
-                orderId: order.orderId,
-                totalAmount: order.totalAmount,
-                subtotal: order.subtotal,
-                tax: order.tax,
-                discount: discount,
-                orderStatus: order.orderStatus,
-                paymentStatus: order.paymentStatus,
-                balanceDueInr: order.balanceDueInr,
-                onlinePaymentMode: splitMode
-            },
-            appliedCoupon: appliedCouponCode,
-            razorpayOrder: razorpayOrder ? {
-                id: razorpayOrder.id,
-                amount: razorpayOrder.amount,
-                currency: razorpayOrder.currency
-            } : null,
+        logger.info('Order created successfully', buildRequestLogContext(req, {
+            orderId: order.orderId,
+            quoteId: String(quote._id),
             paymentMethod: normalizedPaymentMethod
-        });
+        }));
+        
+        return res.status(201).json(
+            buildOrderResponsePayload(order, {
+                normalizedPaymentMethod,
+                discount,
+                splitMode,
+                appliedCouponCode,
+                razorpayOrder
+            })
+        );
 
     } catch (error) {
-        await session.abortTransaction();
+        await abortTransactionSafely(session);
         session.endSession();
-        console.error('Create order error:', error);
+        const idempotencyKey = normalizeIdempotencyKey(req.headers['idempotency-key']);
+        if (idempotencyKey) {
+            try {
+                await OrderIdempotencyKey.deleteOne({
+                    userId: req.userId,
+                    key: idempotencyKey,
+                    status: 'pending'
+                });
+            } catch (cleanupError) {
+                logger.warn('Failed to clean pending idempotency key after createOrder error', buildRequestLogContext(req, {
+                    idempotencyKey,
+                    error: cleanupError.message
+                }));
+            }
+        }
+        if (error?.statusCode) {
+            return sendCheckoutFlowError(res, error, 'Error creating order');
+        }
+        logger.error('Create order error', buildRequestLogContext(req, {
+            error: error.message,
+            stack: error.stack
+        }));
         return res.status(500).json({
             success: false,
             message: 'Error creating order',
@@ -537,7 +819,34 @@ exports.verifyPayment = async (req, res) => {
             });
         }
 
-        if (payment.status !== 'captured' && payment.status !== 'authorized') {
+        if (payment.status !== 'captured') {
+            if (payment.status === 'authorized') {
+                order.paymentInfo = order.paymentInfo || {};
+                order.paymentInfo.status = 'authorized';
+                order.paymentInfo.authorizedPaymentId = razorpay_payment_id;
+                order.paymentInfo.authorizedAt = new Date();
+                if (Array.isArray(order.paymentInfo.sessions)) {
+                    const s = order.paymentInfo.sessions.find((x) => x.razorpayOrderId === razorpay_order_id);
+                    if (s) {
+                        s.status = 'authorized';
+                        s.razorpayPaymentId = razorpay_payment_id;
+                        s.authorizedAt = new Date();
+                    }
+                }
+                order.markModified('paymentInfo');
+                await order.save();
+
+                return res.status(409).json({
+                    success: false,
+                    code: 'PAYMENT_NOT_CAPTURED_YET',
+                    message: 'Payment is authorized but not captured yet. Please retry after capture confirmation.',
+                    details: {
+                        paymentStatus: payment.status,
+                        orderId: order.orderId
+                    }
+                });
+            }
+
             return res.status(400).json({
                 success: false,
                 message: `Payment not completed (status: ${payment.status})`
@@ -968,8 +1277,7 @@ exports.getOrder = async (req, res) => {
     try {
         const { orderId } = req.params;
         
-        const staffRole = String(req.user?.role || req.userType || '').toLowerCase();
-        const isOrderStaff = ['admin', 'order_manager'].includes(staffRole);
+        const isOrderStaff = isOrderStaffRequest(req);
 
         let orderQuery = Order.findOne({ orderId: orderId })
             .populate('items.productId', 'name slug variants')
@@ -989,10 +1297,7 @@ exports.getOrder = async (req, res) => {
         }
 
         if (order.userId.toString() !== req.userId && !isOrderStaff) {
-            return res.status(403).json({
-                success: false,
-                message: 'Unauthorized'
-            });
+            return buildUnauthorizedOrderResponse(res);
         }
 
         const transformedOrder = order.toObject();
@@ -1164,8 +1469,7 @@ exports.updateOrderStatus = async (req, res) => {
         const { orderId } = req.params;
         const { status } = req.body;
 
-        const role = String(req.user?.role || req.userType || '').toLowerCase();
-        if (!['admin', 'order_manager'].includes(role)) {
+        if (!isOrderStaffRequest(req)) {
             return res.status(403).json({
                 success: false,
                 message: 'Admin access required'
@@ -1232,11 +1536,8 @@ exports.generateInvoice = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== req.userId && req.userType !== 'admin') {
-            return res.status(403).json({
-                success: false,
-                message: 'Unauthorized'
-            });
+        if (order.userId.toString() !== req.userId && !isOrderStaffRequest(req)) {
+            return buildUnauthorizedOrderResponse(res);
         }
 
         const invoice = {
@@ -1287,11 +1588,8 @@ exports.trackOrder = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== req.userId && req.userType !== 'admin') {
-            return res.status(403).json({
-                success: false,
-                message: 'Unauthorized'
-            });
+        if (order.userId.toString() !== req.userId && !isOrderStaffRequest(req)) {
+            return buildUnauthorizedOrderResponse(res);
         }
 
         const timeline = {
