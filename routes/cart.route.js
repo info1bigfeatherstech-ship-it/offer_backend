@@ -14,28 +14,31 @@ const {
 } = require('../controllers/cart.controller');
 
 const { verifyToken } = require('../middlewares/auth.middleware');
-const { resolveStorefrontMiddleware } = require('../middlewares/storefront.middleware');
+const {
+  resolveStorefrontMiddleware,
+  requireWholesaleUserForWholesaleStorefront
+} = require('../middlewares/storefront.middleware');
 
 // Get logged-in user's cart
-router.get('/', resolveStorefrontMiddleware, verifyToken, getCart);
+router.get('/', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, getCart);
 
 // Add item to cart
-router.post('/', resolveStorefrontMiddleware, verifyToken, addToCart);
+router.post('/', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, addToCart);
 
 // Update quantity (or remove if qty <= 0)
-router.put('/item', resolveStorefrontMiddleware, verifyToken, updateCartItem);
+router.put('/item', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, updateCartItem);
 
 // Remove single item
-router.delete('/item', resolveStorefrontMiddleware, verifyToken, removeCartItem);
+router.delete('/item', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, removeCartItem);
 
 // Bulk remove items
-router.post('/bulk-remove', resolveStorefrontMiddleware, verifyToken, bulkRemove);
+router.post('/bulk-remove', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, bulkRemove);
 
 // Clear full cart
-router.delete('/clear', resolveStorefrontMiddleware, verifyToken, clearCart);
+router.delete('/clear', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, clearCart);
 
 // Merge guest cart after login
-router.post('/merge', resolveStorefrontMiddleware, verifyToken, mergeCart);
+router.post('/merge', resolveStorefrontMiddleware, verifyToken, requireWholesaleUserForWholesaleStorefront, mergeCart);
 
 
 

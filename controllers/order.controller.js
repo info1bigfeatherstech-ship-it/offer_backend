@@ -331,6 +331,7 @@ exports.createOrder = async (req, res) => {
 
         const userId = req.userId;
         const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
+        const storefront = req.storefront || 'ecomm';
         const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
         if (!normalizedPaymentMethod) {
             throw createInvalidPaymentMethodError();
@@ -466,6 +467,7 @@ exports.createOrder = async (req, res) => {
                 cart: cartDoc,
                 postalCode: pin,
                 finalUserType,
+                storefront,
                 couponCode,
                 session,
                 consumeCoupon,

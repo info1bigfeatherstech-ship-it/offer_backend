@@ -6,6 +6,10 @@ const crypto = require('crypto');
 const Coupon = require('../models/Coupon');
 const Product = require('../models/Product');
 const ShiprocketService = require('../utils/shiprocket');
+const {
+  isProductListedOnStorefront,
+  isVariantListedOnStorefront
+} = require('../utils/storefrontCatalog');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -109,7 +113,7 @@ function aggregateShipping(lines) {
  * @param {import('mongoose').ClientSession|null} session
  * @returns {Promise<{ lines: any[], subtotal: number, orderItems: any[], totalWeight: number, dims: object, fingerprint: string }>}
  */
-async function evaluateCartForCheckout(cart, finalUserType, session = null) {
+async function evaluateCartForCheckout(cart, finalUserType, session = null, storefront = 'ecomm') {
   if (!cart?.items?.length) {
     const err = new Error('Cart is empty');
     err.statusCode = 400;
@@ -123,20 +127,28 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null) {
 
   for (const cartItem of cart.items) {
     let pq = Product.findById(cartItem.productId).select(
-      'name slug variants shipping hsnCode gstRate isFragile status'
+      'name slug variants shipping hsnCode gstRate isFragile status channelStatus'
     );
     if (session) pq = pq.session(session);
     const product = await pq;
-    if (!product || product.status !== 'active') {
+    if (!product) {
       const err = new Error('Product not available');
       err.statusCode = 404;
       throw err;
     }
 
+    if (!isProductListedOnStorefront(product, storefront)) {
+      const err = new Error('Product not available on this storefront');
+      err.statusCode = 404;
+      err.code = 'PRODUCT_NOT_AVAILABLE_ON_STOREFRONT';
+      throw err;
+    }
+
     const variant = findVariant(product, cartItem.variantId);
-    if (!variant) {
+    if (!variant || !isVariantListedOnStorefront(variant, storefront)) {
       const err = new Error('Variant not found');
       err.statusCode = 404;
+      err.code = 'VARIANT_NOT_AVAILABLE_ON_STOREFRONT';
       throw err;
     }
 
@@ -238,6 +250,7 @@ async function computeCheckoutTotals({
   cart,
   postalCode,
   finalUserType,
+  storefront = 'ecomm',
   couponCode,
   session,
   consumeCoupon,
@@ -245,7 +258,7 @@ async function computeCheckoutTotals({
   deliveryChargesOverride = null,
   deliveryMetaOverride = null
 }) {
-  const evaluated = await evaluateCartForCheckout(cart, finalUserType, session);
+  const evaluated = await evaluateCartForCheckout(cart, finalUserType, session, storefront);
   const { discount, appliedCouponCode } = await resolveCouponDiscount(
     couponCode,
     evaluated.subtotal,

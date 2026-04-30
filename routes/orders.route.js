@@ -3,6 +3,9 @@ const router = express.Router();
 const { verifyToken } = require('../middlewares/auth.middleware');
 const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
 const {
+  requireWholesaleUserForWholesaleStorefront
+} = require('../middlewares/storefront.middleware');
+const {
   createOrder,
   verifyPayment,
   payOrderBalance,
@@ -18,15 +21,15 @@ const {
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
 
-router.post('/items', verifyToken, createOrder);
-router.post('/items/verify-payment', verifyToken, verifyPayment);
-router.post('/items/:orderId/initiate-payment', verifyToken, initiatePendingOrderPayment);
-router.post('/items/:orderId/pay-balance', verifyToken, payOrderBalance);
-router.get('/items', verifyToken, getUserOrders);
-router.get('/items/:orderId', verifyToken, getOrder);
-router.get('/items/:orderId/track', verifyToken, trackOrder);
-router.get('/items/:orderId/invoice', verifyToken, generateInvoice);
-router.put('/items/:orderId/cancel', verifyToken, cancelOrder);
+router.post('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, createOrder);
+router.post('/items/verify-payment', verifyToken, requireWholesaleUserForWholesaleStorefront, verifyPayment);
+router.post('/items/:orderId/initiate-payment', verifyToken, requireWholesaleUserForWholesaleStorefront, initiatePendingOrderPayment);
+router.post('/items/:orderId/pay-balance', verifyToken, requireWholesaleUserForWholesaleStorefront, payOrderBalance);
+router.get('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, getUserOrders);
+router.get('/items/:orderId', verifyToken, requireWholesaleUserForWholesaleStorefront, getOrder);
+router.get('/items/:orderId/track', verifyToken, requireWholesaleUserForWholesaleStorefront, trackOrder);
+router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholesaleStorefront, generateInvoice);
+router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
 
 router.post(
   '/admin/items/:orderId/refund',

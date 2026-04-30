@@ -32,9 +32,9 @@ function allowDemoMockShipping(req) {
   return true;
 }
 
-async function buildFinalTotals({ cartDoc, pin, finalUserType, couponCode, paymentMethodHint, req }) {
+async function buildFinalTotals({ cartDoc, pin, finalUserType, storefront, couponCode, paymentMethodHint, req }) {
   if (allowDemoMockShipping(req)) {
-    const evaluated = await evaluateCartForCheckout(cartDoc, finalUserType, null);
+    const evaluated = await evaluateCartForCheckout(cartDoc, finalUserType, null, storefront);
     const { discount, appliedCouponCode } = await resolveCouponDiscount(
       couponCode,
       evaluated.subtotal,
@@ -67,6 +67,7 @@ async function buildFinalTotals({ cartDoc, pin, finalUserType, couponCode, payme
     cart: cartDoc,
     postalCode: pin,
     finalUserType,
+    storefront,
     couponCode,
     session: null,
     consumeCoupon: false,
@@ -81,6 +82,7 @@ async function buildFinalTotals({ cartDoc, pin, finalUserType, couponCode, payme
         cart: cartDoc,
         postalCode: pin,
         finalUserType,
+        storefront,
         couponCode,
         session: null,
         consumeCoupon: false,
@@ -99,6 +101,7 @@ exports.quoteCheckout = async (req, res) => {
   try {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
+    const storefront = req.storefront || 'ecomm';
     const { addressId, couponCode, paymentMethodHint } = req.body || {};
 
     if (paymentMethodHint !== undefined && paymentMethodHint !== null && paymentMethodHint !== '') {
@@ -138,6 +141,7 @@ exports.quoteCheckout = async (req, res) => {
       cartDoc,
       pin,
       finalUserType,
+      storefront,
       couponCode,
       paymentMethodHint,
       req
@@ -256,6 +260,7 @@ exports.confirmCheckout = async (req, res) => {
   try {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
+    const storefront = req.storefront || 'ecomm';
     const { quoteId, paymentMethod, paymentPlan } = req.body || {};
 
     if (!quoteId) {
@@ -306,6 +311,7 @@ exports.confirmCheckout = async (req, res) => {
       cartDoc,
       pin,
       finalUserType,
+      storefront,
       couponCode,
       paymentMethodHint: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
       req: { body: { demoMockShipping: Boolean(quote.shippingMeta?.mock) } }
