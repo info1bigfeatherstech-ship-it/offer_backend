@@ -18,9 +18,9 @@ const findVariant = (product, variantId) => {
   return product.variants.find((v) => String(v._id) === String(variantId));
 };
 
-const getUserSpecificPrice = (variant, userType) => {
+const getStorefrontSpecificPrice = (variant, storefront) => {
   const now = new Date();
-  if (userType === 'wholesaler') {
+  if (storefront === 'wholesale') {
     const wholesaleBase = variant.price?.wholesaleBase || variant.price?.base || 0;
     let wholesaleSale = variant.price?.wholesaleSale || variant.price?.wholesaleBase || wholesaleBase;
     const isWholesaleSaleValid =
@@ -158,8 +158,8 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
       throw err;
     }
 
-    const price = getUserSpecificPrice(variant, finalUserType);
-    if (finalUserType === 'wholesaler' && cartItem.quantity < price.moq) {
+    const price = getStorefrontSpecificPrice(variant, storefront);
+    if (storefront === 'wholesale' && cartItem.quantity < price.moq) {
       const err = new Error(`Minimum order quantity for ${product.name} is ${price.moq}`);
       err.statusCode = 400;
       throw err;
@@ -336,7 +336,7 @@ async function refreshDeliveryOnly(postalCode, weightKg, dims, codAmount = 0) {
 module.exports = {
   roundMoney2,
   findVariant,
-  getUserSpecificPrice,
+  getStorefrontSpecificPrice,
   couponUserEligible,
   cartFingerprintFromItems,
   evaluateCartForCheckout,

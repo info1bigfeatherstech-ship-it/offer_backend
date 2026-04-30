@@ -36,9 +36,9 @@ const isSaleValid = (price) => {
   return true;
 };
 
-// Helper: Get user-specific pricing for a variant
-const getUserSpecificPrice = (variant, userType) => {
-  if (userType === 'wholesaler') {
+// Helper: Get storefront-specific pricing for a variant
+const getStorefrontSpecificPrice = (variant, storefront) => {
+  if (storefront === 'wholesale') {
     const wholesaleBase = Number(variant.price?.wholesaleBase || 0);
     const wholesaleSaleRaw = variant.price?.wholesaleSale;
     const wholesaleSale = wholesaleSaleRaw != null ? Number(wholesaleSaleRaw) : null;
@@ -64,10 +64,10 @@ const calculateDiscountPercentage = (base, sale) => {
 };
 
 //  HELPER: Format cart item with FULL variant data (including virtuals)
-const formatcartItem = (item, product, variant, userType) => {
+const formatcartItem = (item, product, variant, storefront) => {
   if (!product || !variant) return null;
   
-  const price = getUserSpecificPrice(variant, userType);
+  const price = getStorefrontSpecificPrice(variant, storefront);
   
   // Calculate sale validity and discount
   const isSaleValidForVariant = price.sale && price.sale > 0 && price.sale < price.base;
@@ -94,7 +94,7 @@ const formatcartItem = (item, product, variant, userType) => {
       current: currentPrice,
       isSaleActive: isSaleValidForVariant,
       discountPercentage,
-      minimumOrderQuantity: userType === 'wholesaler' ? (variant.minimumOrderQuantity || 1) : 1
+      minimumOrderQuantity: storefront === 'wholesale' ? (variant.minimumOrderQuantity || 1) : 1
     },
     isActive: variant.isActive,
     wholesale: variant.wholesale || false,
@@ -193,7 +193,7 @@ const getcart = async (req, res) => {
       
       if (!variant) continue;
       
-      const formattedItem = formatcartItem(item, product, variant, userType);
+      const formattedItem = formatcartItem(item, product, variant, storefront);
       if (formattedItem) {
         itemsWithFullData.push(formattedItem);
       }
@@ -301,8 +301,8 @@ const addTocart = async (req, res) => {
       }
     }
 
-    // Check MOQ for wholesaler
-    if (userType === 'wholesaler') {
+    // Check MOQ for wholesale storefront cart operations
+    if (storefront === 'wholesale') {
       const moq = variant.minimumOrderQuantity || 1;
       if (quantity < moq) {
         return res.status(400).json({
@@ -323,8 +323,8 @@ const addTocart = async (req, res) => {
       }
     }
 
-    // Prepare price snapshot based on userType
-    const price = getUserSpecificPrice(variant, userType);
+    // Prepare price snapshot based on storefront policy
+    const price = getStorefrontSpecificPrice(variant, storefront);
     
     const priceSnapshot = {
       base: price.base,
@@ -399,7 +399,7 @@ const addTocart = async (req, res) => {
       }
       if (!varObj) continue;
       
-      const formatted = formatcartItem(item, prod, varObj, userType);
+      const formatted = formatcartItem(item, prod, varObj, storefront);
       if (formatted) formattedItems.push(formatted);
     }
     
@@ -500,7 +500,7 @@ const updatecartItem = async (req, res) => {
         let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
         if (!varObj) varObj = firstListedVariant(prod, storefront);
         if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, userType);
+        const formatted = formatcartItem(it, prod, varObj, storefront);
         if (formatted) formattedItems.push(formatted);
       }
       
@@ -534,8 +534,8 @@ const updatecartItem = async (req, res) => {
       });
     }
 
-    // Check MOQ for wholesaler
-    if (userType === 'wholesaler') {
+    // Check MOQ for wholesale storefront cart operations
+    if (storefront === 'wholesale') {
       const moq = variant.minimumOrderQuantity || 1;
       if (quantity < moq) {
         return res.status(400).json({
@@ -552,8 +552,8 @@ const updatecartItem = async (req, res) => {
       });
     }
 
-    // Refresh price snapshot based on userType
-    const price = getUserSpecificPrice(variant, userType);
+    // Refresh price snapshot based on storefront policy
+    const price = getStorefrontSpecificPrice(variant, storefront);
 
     item.quantity = Number(quantity);
     item.priceSnapshot = {
@@ -586,7 +586,7 @@ const updatecartItem = async (req, res) => {
       let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
       if (!varObj) varObj = firstListedVariant(prod, storefront);
       if (!varObj) continue;
-      const formatted = formatcartItem(it, prod, varObj, userType);
+      const formatted = formatcartItem(it, prod, varObj, storefront);
       if (formatted) formattedItems.push(formatted);
     }
     
@@ -666,11 +666,11 @@ const mergecart = async (req, res) => {
       if (existing) {
         existing.quantity += qty;
       } else {
-        if (userType === 'wholesaler') {
+        if (storefront === 'wholesale') {
           const moq = Number(variant.minimumOrderQuantity || 1);
           qty = Math.max(qty, moq);
         }
-        const price = getUserSpecificPrice(variant, userType);
+        const price = getStorefrontSpecificPrice(variant, storefront);
         cart.items.push({
           productId,
           variantId,
@@ -707,7 +707,7 @@ const mergecart = async (req, res) => {
       let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
       if (!varObj) varObj = firstListedVariant(prod, storefront);
       if (!varObj) continue;
-      const formatted = formatcartItem(it, prod, varObj, userType);
+      const formatted = formatcartItem(it, prod, varObj, storefront);
       if (formatted) formattedItems.push(formatted);
     }
 
@@ -780,7 +780,7 @@ const removecartItem = async (req, res) => {
         let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
         if (!varObj) varObj = firstListedVariant(prod, storefront);
         if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, userType);
+        const formatted = formatcartItem(it, prod, varObj, storefront);
         if (formatted) formattedItems.push(formatted);
       }
     }
@@ -855,7 +855,7 @@ const bulkRemove = async (req, res) => {
         let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
         if (!varObj) varObj = firstListedVariant(prod, storefront);
         if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, userType);
+        const formatted = formatcartItem(it, prod, varObj, storefront);
         if (formatted) formattedItems.push(formatted);
       }
     }

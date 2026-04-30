@@ -12,20 +12,21 @@ const imageFileFilter = (req, file, cb) => {
     'image/jpeg',
     'image/png',
     'image/webp',
-    'image/jpg'
+    'image/jpg',
+    'image/svg'
   ];
 
   if (allowedMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('Only jpeg, jpg, png, webp images are allowed'), false);
+    cb(new Error('Only jpeg, jpg, png, webp, svg images are allowed'), false);
   }
 };
 
 const imageUpload = multer({
   storage: imageStorage,
   fileFilter: imageFileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 const uploadProductImages = imageUpload.any();
