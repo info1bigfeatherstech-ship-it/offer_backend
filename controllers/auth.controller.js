@@ -7,6 +7,7 @@ const redisManager = require('../config/redis.config');
 const tokenStore = require('../config/tokenBlacklist');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
+const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront-scope.middleware');
 
 // Import from OTP service
 const { sendOTP, generateOTP } = require("../services/otp.service");
@@ -48,10 +49,18 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
 
 const ACCESS_EXPIRES = process.env.ACCESS_TOKEN_EXPIRES || '15m';
 const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
+const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
+const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
+const REFRESH_COOKIE_BY_PORTAL = {
+  ecomm: 'refreshToken_ecomm',
+  wholesale: 'refreshToken_wholesale',
+  'admin-ecomm': 'refreshToken_admin_ecomm',
+  'admin-wholesale': 'refreshToken_admin_wholesale'
+};
 
-const generateAccessToken = (userId, userType = 'user', role = 'user') => {
+const generateAccessToken = (userId, userType = 'user', role = 'user', portal = null) => {
   return jwt.sign(
-    { id: userId, type: 'access', userType, role },
+    { id: userId, type: 'access', userType, role, portal: portal || undefined },
     process.env.JWT_SECRET,
     { expiresIn: ACCESS_EXPIRES }
   );
@@ -67,6 +76,199 @@ const generateRefreshToken = (userId) => {
 
 const hashToken = (token) => {
   return crypto.createHash('sha256').update(token).digest('hex');
+};
+
+const normalizePortal = (rawPortal) => {
+  const normalized = String(rawPortal || '').trim().toLowerCase();
+  if (!normalized) return '';
+  return normalized;
+};
+
+const normalizeRefreshPortal = (rawPortal) => {
+  const portal = normalizePortal(rawPortal);
+  return SUPPORTED_LOGIN_PORTALS.has(portal) ? portal : '';
+};
+
+const resolveRefreshCookieName = (portal) => {
+  return REFRESH_COOKIE_BY_PORTAL[normalizeRefreshPortal(portal)] || REFRESH_COOKIE_BY_PORTAL.ecomm;
+};
+
+const setRefreshTokenCookie = (res, portal, refreshToken) => {
+  const cookieName = resolveRefreshCookieName(portal);
+  res.cookie(cookieName, refreshToken, getRefreshCookieOptions());
+  if (cookieName !== 'refreshToken') {
+    res.clearCookie('refreshToken', getRefreshCookieOptions());
+  }
+  return cookieName;
+};
+
+const clearRefreshTokenCookie = (res, portal) => {
+  const cookieName = resolveRefreshCookieName(portal);
+  res.clearCookie(cookieName, getRefreshCookieOptions());
+  if (cookieName !== 'refreshToken') {
+    res.clearCookie('refreshToken', getRefreshCookieOptions());
+  }
+};
+
+const readRefreshTokenFromRequest = (req, portal) => {
+  const cookieName = resolveRefreshCookieName(portal);
+  const scopedCookie = req.cookies?.[cookieName];
+  if (scopedCookie) {
+    return { refreshToken: scopedCookie, cookieName };
+  }
+
+  // Defensive fallback: if portal inference is wrong, still recover from any scoped cookie.
+  const knownScopedCookies = Object.values(REFRESH_COOKIE_BY_PORTAL);
+  for (const knownName of knownScopedCookies) {
+    const candidate = req.cookies?.[knownName];
+    if (candidate) {
+      return { refreshToken: candidate, cookieName: knownName };
+    }
+  }
+
+  const legacyCookie = req.cookies?.refreshToken;
+  if (legacyCookie) {
+    return { refreshToken: legacyCookie, cookieName: 'refreshToken' };
+  }
+  return { refreshToken: null, cookieName };
+};
+
+const isPrivilegedRole = (role) => {
+  return PRIVILEGED_OPERATIONAL_ROLES.has(String(role || '').trim().toLowerCase());
+};
+
+const isPrivilegedAccount = (user) => {
+  if (!user) return false;
+  const userType = String(user.userType || '').trim().toLowerCase();
+  if (userType === 'admin') return true;
+  return isPrivilegedRole(user.role);
+};
+
+const isWholesalerAccount = (user) => {
+  if (!user) return false;
+  const userType = String(user.userType || '').trim().toLowerCase();
+  const role = String(user.role || '').trim().toLowerCase();
+  return userType === 'wholesaler' || role === 'wholesaler';
+};
+
+const buildLoginUserLookup = (identifier, portal) => {
+  const trimmedIdentifier = String(identifier || '').trim();
+  const query = {
+    $or: [{ email: trimmedIdentifier }, { phone: trimmedIdentifier }]
+  };
+
+  if (portal === 'admin-ecomm' || portal === 'admin-wholesale') {
+    const requestedStorefront = portal === 'admin-wholesale' ? 'wholesale' : 'ecomm';
+    query.$and = [
+      {
+        $or: [
+          { userType: 'admin' },
+          { role: { $in: Array.from(PRIVILEGED_OPERATIONAL_ROLES) } }
+        ]
+      },
+      {
+        $or: [
+          { allowedStorefronts: requestedStorefront },
+          { allowedStorefronts: { $exists: false } },
+          { allowedStorefronts: [] }
+        ]
+      }
+    ];
+  } else if (portal === 'wholesale') {
+    query.$and = [
+      {
+        $or: [{ userType: 'wholesaler' }, { role: 'wholesaler' }]
+      }
+    ];
+  }
+
+  return query;
+};
+
+const canLoginForPortal = (user, portal) => {
+  if (!portal) {
+    return {
+      allowed: !isPrivilegedAccount(user),
+      code: 'PORTAL_REQUIRED_FOR_PRIVILEGED_ACCOUNT',
+      message: 'Privileged accounts must login from an explicit admin portal.'
+    };
+  }
+
+  if (!SUPPORTED_LOGIN_PORTALS.has(portal)) {
+    return {
+      allowed: false,
+      code: 'INVALID_PORTAL',
+      message: `Unsupported portal "${portal}".`
+    };
+  }
+
+  const privileged = isPrivilegedAccount(user);
+  const normalizedAllowedStorefronts = normalizeAllowedStorefronts(user.allowedStorefronts);
+
+  if (portal === 'ecomm') {
+    if (privileged) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the ecomm user portal.'
+      };
+    }
+    return { allowed: true };
+  }
+
+  if (portal === 'wholesale') {
+    const isWholesaler = String(user.userType || '').trim().toLowerCase() === 'wholesaler' || String(user.role || '').trim().toLowerCase() === 'wholesaler';
+    if (!isWholesaler || privileged) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the wholesale user portal.'
+      };
+    }
+    return { allowed: true };
+  }
+
+  if (portal === 'admin-ecomm') {
+    if (!privileged) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the ecomm admin portal.'
+      };
+    }
+    if (!normalizedAllowedStorefronts.includes('ecomm')) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the ecomm admin portal.'
+      };
+    }
+    return { allowed: true };
+  }
+
+  if (portal === 'admin-wholesale') {
+    if (!privileged) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the wholesale admin portal.'
+      };
+    }
+    if (!normalizedAllowedStorefronts.includes('wholesale')) {
+      return {
+        allowed: false,
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account is not allowed to login from the wholesale admin portal.'
+      };
+    }
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    code: 'INVALID_PORTAL',
+    message: `Unsupported portal "${portal}".`
+  };
 };
 
 // ========== COOKIE CONFIGURATION (Industry Standard) ==========
@@ -238,7 +440,7 @@ const verifyOTPAndLogin = async (req, res) => {
       });
       await user.save();
 
-      res.cookie("refreshToken", refreshToken, getRefreshCookieOptions());
+      setRefreshTokenCookie(res, 'ecomm', refreshToken);
 
       return res.status(200).json({
         success: true,
@@ -297,7 +499,7 @@ const verifyOTPAndLogin = async (req, res) => {
 
     await user.save();
 
-    res.cookie("refreshToken", refreshToken, getRefreshCookieOptions());
+    setRefreshTokenCookie(res, 'ecomm', refreshToken);
 
     return res.status(200).json({
       success: true,
@@ -340,13 +542,10 @@ const login = async (req, res) => {
     }
 
     const { identifier, password } = req.body;
+    const portal = normalizePortal(req.body.portal || req.headers['x-auth-portal']);
 
-    const user = await User.findOne({
-      $or: [
-        { email: identifier },
-        { phone: identifier }
-      ]
-    }).select("+password +refreshTokens");
+    const user = await User.findOne(buildLoginUserLookup(identifier, portal))
+      .select("+password +refreshTokens name email phone userType role allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
 
     if (!user) {
       return res.status(401).json({
@@ -377,7 +576,17 @@ const login = async (req, res) => {
       });
     }
 
-const accessToken = generateAccessToken(user._id, user.userType, user.role);
+    const portalDecision = canLoginForPortal(user, portal);
+    if (!portalDecision.allowed) {
+      const statusCode = portalDecision.code === 'INVALID_PORTAL' ? 400 : 403;
+      return res.status(statusCode).json({
+        success: false,
+        code: portalDecision.code,
+        message: portalDecision.message
+      });
+    }
+
+const accessToken = generateAccessToken(user._id, user.userType, user.role, portal || null);
 const refreshToken = generateRefreshToken(user._id);
 const hashedRefreshToken = hashToken(refreshToken);
 
@@ -398,7 +607,7 @@ user.refreshTokens.push({
 
    await user.save();
 
-    res.cookie("refreshToken", refreshToken, getRefreshCookieOptions());
+    setRefreshTokenCookie(res, portal || 'ecomm', refreshToken);
 
 
     return res.status(200).json({
@@ -656,7 +865,8 @@ const logout = async (req, res) => {
       }
     }
 
-    const refreshToken = req.cookies?.refreshToken;
+    const logoutPortal = normalizeRefreshPortal(req.body?.portal || req.headers['x-auth-portal'] || req.user?.portal || req.user?.userType);
+    const { refreshToken } = readRefreshTokenFromRequest(req, logoutPortal || 'ecomm');
     if (refreshToken) {
       const hashedToken = hashToken(refreshToken);
       const decoded = jwt.decode(refreshToken);
@@ -669,7 +879,7 @@ const logout = async (req, res) => {
       }
     }
 
-    res.clearCookie("refreshToken", getRefreshCookieOptions());
+    clearRefreshTokenCookie(res, logoutPortal || 'ecomm');
 
     return res.status(200).json({
       success: true,
@@ -691,7 +901,8 @@ const refreshAccessToken = async (req, res) => {
   try {
     // console.log("🔄 Refresh token request received");
     
-    const refreshToken = req.cookies?.refreshToken;
+    const refreshPortal = normalizeRefreshPortal(req.body?.portal || req.headers['x-auth-portal']);
+    const { refreshToken, cookieName } = readRefreshTokenFromRequest(req, refreshPortal || 'ecomm');
 
     if (!refreshToken) {
     //   console.log(" No refresh token in cookies");
@@ -753,7 +964,14 @@ const refreshAccessToken = async (req, res) => {
     // console.log(" Token matched, generating new tokens");
 
     // Generate new tokens
-    const newAccessToken = generateAccessToken(user._id, user.userType, user.role);
+    const refreshedPortal = refreshPortal || (cookieName === 'refreshToken_admin_wholesale'
+      ? 'admin-wholesale'
+      : cookieName === 'refreshToken_admin_ecomm'
+        ? 'admin-ecomm'
+        : cookieName === 'refreshToken_wholesale'
+          ? 'wholesale'
+          : 'ecomm');
+    const newAccessToken = generateAccessToken(user._id, user.userType, user.role, refreshedPortal);
     const newRefreshToken = generateRefreshToken(user._id);
     const newHashedToken = hashToken(newRefreshToken);
 
@@ -770,7 +988,7 @@ const refreshAccessToken = async (req, res) => {
     await user.save();
 
     //  Use getRefreshCookieOptions() for consistent cookie settings
-    res.cookie("refreshToken", newRefreshToken, getRefreshCookieOptions());
+    setRefreshTokenCookie(res, refreshedPortal, newRefreshToken);
 
     // console.log(" New tokens sent successfully");
 
@@ -971,7 +1189,7 @@ user.refreshTokens.push({
 
 await user.save();
 
-res.cookie("refreshToken", refreshToken, getRefreshCookieOptions());
+setRefreshTokenCookie(res, 'ecomm', refreshToken);
 
 
     return res.status(200).json({
@@ -1033,7 +1251,7 @@ const logoutAllDevices = async (req, res) => {
     const user = await User.findById(req.userId);
     user.refreshTokens = [];
     await user.save();
-    res.clearCookie("refreshToken", getRefreshCookieOptions());
+    clearRefreshTokenCookie(res, 'ecomm');
     return res.json({ success: true, message: 'Logged out from all devices' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });

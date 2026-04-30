@@ -182,7 +182,12 @@ function parseProductCodeParts(productCode, contextLabel = 'productCode', { requ
 function assertVariantCodeSeries(codes, contextLabel = 'variants') {
   if (!Array.isArray(codes) || codes.length === 0) return;
   if (codes.length === 1) {
-    parseProductCodeParts(codes[0], `${contextLabel}[0] productCode`, { requireSuffix: true });
+    const first = parseProductCodeParts(codes[0], `${contextLabel}[0] productCode`, { requireSuffix: true });
+    if (first.sequence !== 1) {
+      throw new Error(
+        `First productCode for ${contextLabel} must be ${first.base}-01. Received ${first.normalized}.`
+      );
+    }
     return;
   }
 

@@ -145,6 +145,26 @@ function buildUnauthorizedOrderResponse(res) {
     });
 }
 
+/** ObjectId or populated user doc → string id; null if order has no buyer (legacy / bad row). */
+function normalizeOrderUserId(order) {
+    if (!order || order.userId == null) return null;
+    const u = order.userId;
+    if (typeof u === 'object' && u._id != null) return String(u._id);
+    return String(u);
+}
+
+/**
+ * Read access: staff may view any order in scope; customers only their own.
+ * Must not call .toString() on null userId; staff branch must not depend on owner id.
+ */
+function canViewOrderForRequest(req, order, isOrderStaff) {
+    if (isOrderStaff) return true;
+    const ownerId = normalizeOrderUserId(order);
+    if (!ownerId) return false;
+    const requesterId = req.userId != null ? String(req.userId) : null;
+    return Boolean(requesterId && ownerId === requesterId);
+}
+
 function buildOrderResponsePayload(order, {
     normalizedPaymentMethod,
     discount,
@@ -749,7 +769,8 @@ exports.verifyPayment = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== String(req.userId)) {
+        const paymentOwnerId = normalizeOrderUserId(order);
+        if (!paymentOwnerId || paymentOwnerId !== String(req.userId)) {
             return res.status(403).json({
                 success: false,
                 message: 'Unauthorized'
@@ -1296,7 +1317,7 @@ exports.getOrder = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== req.userId && !isOrderStaff) {
+        if (!canViewOrderForRequest(req, order, isOrderStaff)) {
             return buildUnauthorizedOrderResponse(res);
         }
 
@@ -1536,7 +1557,7 @@ exports.generateInvoice = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== req.userId && !isOrderStaffRequest(req)) {
+        if (!canViewOrderForRequest(req, order, isOrderStaffRequest(req))) {
             return buildUnauthorizedOrderResponse(res);
         }
 
@@ -1588,7 +1609,7 @@ exports.trackOrder = async (req, res) => {
             });
         }
 
-        if (order.userId.toString() !== req.userId && !isOrderStaffRequest(req)) {
+        if (!canViewOrderForRequest(req, order, isOrderStaffRequest(req))) {
             return buildUnauthorizedOrderResponse(res);
         }
 

@@ -89,7 +89,11 @@ router.post(
             .withMessage('Email or Phone number is required'),
         body('password')
             .notEmpty()
-            .withMessage('Password is required')
+            .withMessage('Password is required'),
+        body('portal')
+            .optional()
+            .isIn(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale'])
+            .withMessage('portal must be one of: ecomm, wholesale, admin-ecomm, admin-wholesale')
     ],
     login  // ✅ Accepts "email@example.com" OR "9876543210"
 );

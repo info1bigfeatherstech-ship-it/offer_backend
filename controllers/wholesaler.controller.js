@@ -17,6 +17,7 @@ const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
 
 const OWNER_REVIEW_PURPOSE = 'wholesaler_owner_review';
 const OWNER_REVIEW_TOKEN_EXPIRES = process.env.OWNER_REVIEW_TOKEN_EXPIRES || '48h';
+const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
 
 function normalizePhone(v) {
   return String(v || '').replace(/\D/g, '').slice(-10);
@@ -408,6 +409,58 @@ function generateAccessToken(userId, userType = 'user', role = 'user') {
   );
 }
 
+function isPrivilegedOperationalRole(role) {
+  return PRIVILEGED_OPERATIONAL_ROLES.has(String(role || '').trim().toLowerCase());
+}
+
+function isPrivilegedAccount(user) {
+  if (!user) return false;
+  const normalizedUserType = String(user.userType || '').trim().toLowerCase();
+  if (normalizedUserType === 'admin') return true;
+  return isPrivilegedOperationalRole(user.role);
+}
+
+function isWholesalerAccount(user) {
+  if (!user) return false;
+  const normalizedUserType = String(user.userType || '').trim().toLowerCase();
+  const normalizedRole = String(user.role || '').trim().toLowerCase();
+  return normalizedUserType === 'wholesaler' || normalizedRole === 'wholesaler';
+}
+
+function buildPrivilegedConflictPayload() {
+  return {
+    success: false,
+    code: 'IDENTITY_RESERVED_FOR_PRIVILEGED',
+    message: 'This mobile/email belongs to a privileged admin/staff account and cannot be used for wholesaler onboarding.'
+  };
+}
+
+function buildExistingWholesalerConflictPayload(status, requestId = null) {
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  if (normalizedStatus === 'activated') {
+    return {
+      success: false,
+      code: 'WHOLESALER_ALREADY_ACTIVE',
+      message: 'A wholesaler account already exists for this mobile/email.',
+      requestId
+    };
+  }
+  if (normalizedStatus === 'approved') {
+    return {
+      success: false,
+      code: 'WHOLESALER_ALREADY_APPROVED',
+      message: 'A wholesaler request for this mobile/email is already approved. Please activate the account instead of submitting a new request.',
+      requestId
+    };
+  }
+  return {
+    success: false,
+    code: 'WHOLESALER_REQUEST_ALREADY_EXISTS',
+    message: 'A wholesaler request already exists for this mobile/email.',
+    requestId
+  };
+}
+
 function generateRefreshToken(userId) {
   return jwt.sign(
     { id: userId, type: 'refresh' },
@@ -459,17 +512,27 @@ exports.submitWholesalerRequest = async (req, res) => {
       });
     }
 
-    const existingPending = await WholesalerDetails.findOne({
-      status: 'pending',
-      $or: [{ mobileNumber: payload.mobileNumber }, { email: payload.email }]
-    }).select('_id');
+    const existingUser = await User.findOne({
+      $or: [{ phone: payload.mobileNumber }, { email: payload.email }]
+    }).select('userType role status');
 
-    if (existingPending) {
-      return res.status(409).json({
-        success: false,
-        message: 'A pending request already exists for this mobile/email',
-        requestId: existingPending._id
-      });
+    if (isPrivilegedAccount(existingUser)) {
+      return res.status(409).json(buildPrivilegedConflictPayload());
+    }
+
+    if (isWholesalerAccount(existingUser)) {
+      return res.status(409).json(buildExistingWholesalerConflictPayload('activated'));
+    }
+
+    const existingRequest = await WholesalerDetails.findOne({
+      status: { $in: ['pending', 'approved', 'activated'] },
+      $or: [{ mobileNumber: payload.mobileNumber }, { email: payload.email }]
+    })
+      .sort({ updatedAt: -1 })
+      .select('_id status');
+
+    if (existingRequest) {
+      return res.status(409).json(buildExistingWholesalerConflictPayload(existingRequest.status, existingRequest._id));
     }
 
     const requestDoc = await WholesalerDetails.create({
@@ -1132,8 +1195,8 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       $or: [{ phone: doc.mobileNumber }, { email: doc.email }]
     }).select('+password +refreshTokens');
 
-    if (user && user.userType === 'admin') {
-      return res.status(409).json({ success: false, message: 'This mobile/email belongs to an admin account' });
+    if (isPrivilegedAccount(user)) {
+      return res.status(409).json(buildPrivilegedConflictPayload());
     }
 
     if (!user) {
@@ -1157,7 +1220,7 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       user.phone = user.phone || doc.mobileNumber;
       user.password = password;
       user.userType = 'wholesaler';
-      user.role = user.role === 'admin' ? user.role : 'wholesaler';
+      user.role = 'wholesaler';
       user.status = 'active';
       user.isPhoneVerified = true;
       user.isProfileComplete = true;
