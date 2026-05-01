@@ -31,6 +31,9 @@ const {
     buildRequestLogContext
 } = require('../utils/checkoutFlow');
 
+const normalizeDecisionCode = (errorLike, fallback) =>
+    String(errorLike?.code || fallback || 'ORDER_FLOW_ERROR').trim().toUpperCase();
+
 // Initialize Razorpay (trim — stray spaces/newlines in .env break auth)
 const razorpay = new Razorpay({
     key_id: String(process.env.RAZORPAY_KEY_ID || '').trim(),
@@ -79,6 +82,19 @@ async function abortTransactionSafely(session) {
     } catch (_) {
         // Swallow abort failures to preserve the original controller error.
     }
+}
+
+function generateOrderIdCandidate() {
+    if (typeof crypto.randomUUID === 'function') {
+        return `ORD-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
+    }
+    return `ORD-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+}
+
+function isOrderIdDuplicateError(error) {
+    if (!error || error.code !== 11000) return false;
+    const dup = error.keyPattern?.orderId || error.keyValue?.orderId;
+    return Boolean(dup);
 }
 
 async function reserveInventoryAtomically(lines, session) {
@@ -141,7 +157,17 @@ async function reserveInventoryAtomically(lines, session) {
 function buildUnauthorizedOrderResponse(res) {
     return res.status(403).json({
         success: false,
+        code: 'ORDER_ACCESS_DENIED',
         message: 'Unauthorized'
+    });
+}
+
+function respondOrderError(res, statusCode, code, message, extras = {}) {
+    return res.status(statusCode).json({
+        success: false,
+        code,
+        message,
+        ...extras
     });
 }
 
@@ -345,7 +371,30 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(400).json({
                 success: false,
+                code: 'QUOTE_ID_REQUIRED',
                 message: 'quoteId is required. Generate and confirm checkout quote before placing order.'
+            });
+        }
+        if (!mongoose.Types.ObjectId.isValid(String(quoteId))) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_QUOTE_ID',
+                message: 'Invalid quoteId'
+            });
+        }
+        if (!addressId || !mongoose.Types.ObjectId.isValid(String(addressId))) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_ADDRESS_ID',
+                message: 'Invalid addressId'
             });
         }
 
@@ -358,6 +407,7 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(404).json({
                 success: false,
+                code: 'ADDRESS_NOT_FOUND',
                 message: 'Address not found'
             });
         }
@@ -369,6 +419,7 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(403).json({
                 success: false,
+                code: 'ADDRESS_OWNERSHIP_MISMATCH',
                 message: 'Address does not belong to this user'
             });
         }
@@ -382,6 +433,7 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(400).json({
                 success: false,
+                code: 'CART_EMPTY',
                 message: 'cart is empty'
             });
         }
@@ -395,6 +447,7 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(400).json({
                 success: false,
+                code: 'INVALID_POSTAL_CODE',
                 message: 'Address must include a valid 6-digit postal code'
             });
         }
@@ -408,6 +461,7 @@ exports.createOrder = async (req, res) => {
             }
             return res.status(404).json({
                 success: false,
+                code: 'QUOTE_NOT_FOUND',
                 message: 'Checkout quote not found'
             });
         }
@@ -498,7 +552,7 @@ exports.createOrder = async (req, res) => {
         } catch (e) {
             await abortTransactionSafely(session);
             session.endSession();
-            return sendCheckoutFlowError(res, e, 'Checkout validation failed');
+            return sendCheckoutFlowError(res, e, 'Checkout validation failed', 'ORDER_CHECKOUT_VALIDATION_FAILED');
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
@@ -527,9 +581,6 @@ exports.createOrder = async (req, res) => {
 
         await reserveInventoryAtomically(lines, session);
 
-        // 8. Generate order ID
-        const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-
         const advancePercent = Math.min(90, Math.max(1, Number(process.env.CHECKOUT_ADVANCE_PERCENT) || 25));
         let razorpayChargePaise = Math.round(roundMoney2(totalAmount) * 100);
         let splitMode = 'full';
@@ -547,9 +598,7 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        // 9. Create order with discount
-        const order = new Order({
-            orderId: orderId,
+        const orderPayload = {
             userId: userId,
             items: orderItems,
             subtotal: subtotal,
@@ -576,13 +625,39 @@ exports.createOrder = async (req, res) => {
                 quoteId: String(quote._id),
                 sessions: []
             }
-        });
+        };
+
+        // 9. Create order with collision-safe orderId retries.
+        let order = null;
+        let orderSaved = false;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const candidateOrderId = generateOrderIdCandidate();
+            order = new Order({
+                orderId: candidateOrderId,
+                ...orderPayload
+            });
+            try {
+                await order.save({ session });
+                orderSaved = true;
+                break;
+            } catch (saveError) {
+                if (isOrderIdDuplicateError(saveError)) {
+                    continue;
+                }
+                throw saveError;
+            }
+        }
+        if (!orderSaved || !order) {
+            throw createCheckoutFlowError({
+                statusCode: 503,
+                code: 'ORDER_ID_GENERATION_FAILED',
+                message: 'Could not allocate a unique order ID. Please retry checkout.'
+            });
+        }
 
         if (normalizedPaymentMethod === 'online') {
             order.paymentHoldExpiresAt = new Date(Date.now() + paymentHoldExpiryService.getPaymentHoldMs());
         }
-
-        await order.save({ session });
 
         // 10. Clear cart
         cartDoc.items = [];
@@ -638,7 +713,7 @@ exports.createOrder = async (req, res) => {
                 razorpayOrder = await razorpay.orders.create({
                     amount: amountPaise,
                     currency: 'INR',
-                    receipt: orderId.slice(0, 40),
+                    receipt: order.orderId.slice(0, 40),
                     payment_capture: 1,
                     notes: {
                         orderId: order.orderId,
@@ -723,7 +798,12 @@ exports.createOrder = async (req, res) => {
             }
         }
         if (error?.statusCode) {
-            return sendCheckoutFlowError(res, error, 'Error creating order');
+            logger.warn('createOrder business rejection', buildRequestLogContext(req, {
+                code: normalizeDecisionCode(error, 'ORDER_CREATE_REJECTED'),
+                reason: error?.details?.reason || null,
+                statusCode: error.statusCode
+            }));
+            return sendCheckoutFlowError(res, error, 'Error creating order', 'ORDER_CREATE_FAILED');
         }
         logger.error('Create order error', buildRequestLogContext(req, {
             error: error.message,
@@ -731,6 +811,7 @@ exports.createOrder = async (req, res) => {
         }));
         return res.status(500).json({
             success: false,
+            code: 'ORDER_CREATE_FAILED',
             message: 'Error creating order',
             error: error.message
         });
@@ -743,10 +824,12 @@ exports.verifyPayment = async (req, res) => {
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body || {};
 
         if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !orderId) {
-            return res.status(400).json({
-                success: false,
-                message: 'razorpay_order_id, razorpay_payment_id, razorpay_signature and orderId are required'
-            });
+            return respondOrderError(
+                res,
+                400,
+                'PAYMENT_VERIFY_PAYLOAD_INVALID',
+                'razorpay_order_id, razorpay_payment_id, razorpay_signature and orderId are required'
+            );
         }
 
         const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -757,26 +840,17 @@ exports.verifyPayment = async (req, res) => {
             .digest('hex');
 
         if (expectedSignature !== razorpay_signature) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid payment signature'
-            });
+            return respondOrderError(res, 400, 'PAYMENT_SIGNATURE_INVALID', 'Invalid payment signature');
         }
 
         const order = await Order.findOne({ orderId: orderId });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         const paymentOwnerId = normalizeOrderUserId(order);
         if (!paymentOwnerId || paymentOwnerId !== String(req.userId)) {
-            return res.status(403).json({
-                success: false,
-                message: 'Unauthorized'
-            });
+            return respondOrderError(res, 403, 'ORDER_ACCESS_DENIED', 'Unauthorized');
         }
 
         order.paymentInfo = order.paymentInfo || {};
@@ -799,10 +873,7 @@ exports.verifyPayment = async (req, res) => {
             (Array.isArray(order.paymentInfo?.sessions) &&
                 order.paymentInfo.sessions.some((s) => s.razorpayOrderId === razorpay_order_id));
         if (!sessionMatches) {
-            return res.status(400).json({
-                success: false,
-                message: 'Payment does not match this order'
-            });
+            return respondOrderError(res, 400, 'PAYMENT_ORDER_MISMATCH', 'Payment does not match this order');
         }
 
         if (order.paymentStatus === 'paid' && order.orderStatus === 'confirmed') {
@@ -819,27 +890,23 @@ exports.verifyPayment = async (req, res) => {
 
         const payment = await razorpay.payments.fetch(razorpay_payment_id);
         if (payment.order_id !== razorpay_order_id) {
-            return res.status(400).json({
-                success: false,
-                message: 'Payment and order mismatch'
-            });
+            return respondOrderError(res, 400, 'PAYMENT_ORDER_MISMATCH', 'Payment and order mismatch');
         }
 
         const rpOrder = await razorpay.orders.fetch(razorpay_order_id);
         if (rpOrder?.notes?.orderId && rpOrder.notes.orderId !== order.orderId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Razorpay order is not linked to this checkout'
-            });
+            return respondOrderError(res, 400, 'PAYMENT_NOT_LINKED_TO_ORDER', 'Razorpay order is not linked to this checkout');
         }
 
         const expectedPaise = Number(rpOrder.amount);
         const paidPaise = Number(payment.amount);
         if (!Number.isFinite(paidPaise) || !Number.isFinite(expectedPaise) || paidPaise !== expectedPaise) {
-            return res.status(400).json({
-                success: false,
-                message: 'Paid amount does not match Razorpay order (server-validated)'
-            });
+            return respondOrderError(
+                res,
+                400,
+                'PAYMENT_AMOUNT_MISMATCH',
+                'Paid amount does not match Razorpay order (server-validated)'
+            );
         }
 
         if (payment.status !== 'captured') {
@@ -872,6 +939,7 @@ exports.verifyPayment = async (req, res) => {
 
             return res.status(400).json({
                 success: false,
+                code: 'PAYMENT_NOT_COMPLETED',
                 message: `Payment not completed (status: ${payment.status})`
             });
         }
@@ -928,11 +996,7 @@ exports.verifyPayment = async (req, res) => {
 
     } catch (error) {
         console.error('Payment verification error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error verifying payment',
-            error: error.message
-        });
+        return respondOrderError(res, 500, 'PAYMENT_VERIFY_FAILED', 'Error verifying payment');
     }
 };
 
@@ -942,7 +1006,7 @@ exports.razorpayWebhook = async (req, res) => {
         const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
         if (!webhookSecret) {
             console.error('RAZORPAY_WEBHOOK_SECRET is not set');
-            return res.status(500).json({ success: false, message: 'Webhook not configured' });
+            return respondOrderError(res, 500, 'WEBHOOK_NOT_CONFIGURED', 'Webhook not configured');
         }
 
         const webhookSignature = req.headers['x-razorpay-signature'];
@@ -956,15 +1020,15 @@ exports.razorpayWebhook = async (req, res) => {
             .digest('hex');
 
         if (!webhookSignature || expectedSignature.length !== webhookSignature.length) {
-            return res.status(400).json({ success: false, message: 'Invalid webhook signature' });
+            return respondOrderError(res, 400, 'WEBHOOK_SIGNATURE_INVALID', 'Invalid webhook signature');
         }
 
         try {
             if (!crypto.timingSafeEqual(Buffer.from(expectedSignature, 'utf8'), Buffer.from(webhookSignature, 'utf8'))) {
-                return res.status(400).json({ success: false, message: 'Invalid webhook signature' });
+                return respondOrderError(res, 400, 'WEBHOOK_SIGNATURE_INVALID', 'Invalid webhook signature');
             }
         } catch {
-            return res.status(400).json({ success: false, message: 'Invalid webhook signature' });
+            return respondOrderError(res, 400, 'WEBHOOK_SIGNATURE_INVALID', 'Invalid webhook signature');
         }
 
         const webhookBody = JSON.parse(rawBody.toString('utf8'));
@@ -1077,7 +1141,7 @@ exports.razorpayWebhook = async (req, res) => {
         return res.json({ success: true });
     } catch (error) {
         console.error('Webhook error:', error);
-        return res.status(500).json({ success: false, message: error.message });
+        return respondOrderError(res, 500, 'WEBHOOK_PROCESSING_FAILED', 'Webhook processing failed');
     }
 };
 
@@ -1087,19 +1151,19 @@ exports.payOrderBalance = async (req, res) => {
         const { orderId } = req.params;
         const order = await Order.findOne({ orderId, userId: req.userId });
         if (!order) {
-            return res.status(404).json({ success: false, message: 'Order not found' });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
         if (order.paymentStatus === 'paid') {
-            return res.status(400).json({ success: false, message: 'Order is already fully paid' });
+            return respondOrderError(res, 400, 'ORDER_ALREADY_PAID', 'Order is already fully paid');
         }
         const due = roundMoney2(order.balanceDueInr || order.totalAmount - (order.amountPaidInr || 0));
         if (!Number.isFinite(due) || due <= 0.01) {
-            return res.status(400).json({ success: false, message: 'No balance due on this order' });
+            return respondOrderError(res, 400, 'NO_BALANCE_DUE', 'No balance due on this order');
         }
 
         const amountPaise = Math.round(due * 100);
         if (!String(process.env.RAZORPAY_KEY_ID || '').trim() || !String(process.env.RAZORPAY_KEY_SECRET || '').trim()) {
-            return res.status(503).json({ success: false, message: 'Razorpay is not configured' });
+            return respondOrderError(res, 503, 'PAYMENT_GATEWAY_UNAVAILABLE', 'Razorpay is not configured');
         }
 
         const rz = await razorpay.orders.create({
@@ -1134,7 +1198,7 @@ exports.payOrderBalance = async (req, res) => {
         });
     } catch (error) {
         console.error('payOrderBalance:', error);
-        return res.status(500).json({ success: false, message: error.message || 'Failed to start balance payment' });
+        return respondOrderError(res, 500, 'PAY_BALANCE_INIT_FAILED', 'Failed to start balance payment');
     }
 };
 
@@ -1313,10 +1377,7 @@ exports.getOrder = async (req, res) => {
         const order = await orderQuery;
 
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         if (!canViewOrderForRequest(req, order, isOrderStaff)) {
@@ -1366,9 +1427,7 @@ exports.getOrder = async (req, res) => {
 
     } catch (error) {
         console.error('Get order error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error fetching order',
+        return respondOrderError(res, 500, 'ORDER_FETCH_FAILED', 'Error fetching order', {
             error: error.message
         });
     }
@@ -1390,9 +1449,7 @@ exports.getUserOrders = async (req, res) => {
 
     } catch (error) {
         console.error('Get user orders error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error fetching orders',
+        return respondOrderError(res, 500, 'USER_ORDERS_FETCH_FAILED', 'Error fetching orders', {
             error: error.message
         });
     }
@@ -1410,35 +1467,40 @@ exports.cancelOrder = async (req, res) => {
         const order = await Order.findOne({ orderId: orderId, userId: userId }).session(session);
         if (!order) {
             await session.abortTransaction();
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            session.endSession();
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         const cancellableStatuses = ['pending', 'confirmed'];
         if (!cancellableStatuses.includes(order.orderStatus)) {
             await session.abortTransaction();
-            return res.status(400).json({
-                success: false,
-                message: `Order cannot be cancelled in ${order.orderStatus} status`
-            });
+            session.endSession();
+            return respondOrderError(res, 400, 'ORDER_CANCELLATION_NOT_ALLOWED', `Order cannot be cancelled in ${order.orderStatus} status`);
         }
 
         const wasPaid = order.paymentStatus === 'paid';
+        const canInitiateRefund = wasPaid && Boolean(order.paymentInfo?.razorpayPaymentId);
 
         order.orderStatus = 'cancelled';
         order.paymentInfo = order.paymentInfo || {};
-        if (!wasPaid) {
-            order.paymentInfo.cancellationReason = 'user_cancelled';
-            order.paymentInfo.cancelledAt = new Date();
-            order.markModified('paymentInfo');
-        }
-        await order.save({ session });
+        order.paymentInfo.cancellationReason = 'user_cancelled';
+        order.paymentInfo.cancelledAt = new Date();
+        order.returnInfo = {
+            ...(order.returnInfo || {}),
+            status: canInitiateRefund ? 'refund_pending' : (wasPaid ? 'refund_unavailable' : 'not_required'),
+            requestedAt: new Date(),
+            refundAmount: canInitiateRefund ? order.totalAmount : (order.returnInfo?.refundAmount || 0)
+        };
+        order.markModified('paymentInfo');
 
+        await order.save({ session });
         await releaseReservedInventoryForOrder(order, session);
 
-        if (wasPaid && order.paymentInfo.razorpayPaymentId) {
+        await session.commitTransaction();
+        session.endSession();
+
+        let refundWarning = null;
+        if (canInitiateRefund) {
             try {
                 const refund = await razorpay.payments.refund(order.paymentInfo.razorpayPaymentId, {
                     amount: Math.round(order.totalAmount * 100),
@@ -1447,42 +1509,51 @@ exports.cancelOrder = async (req, res) => {
                         reason: 'Order cancelled by user'
                     }
                 });
-                
+
                 order.paymentStatus = 'refunded';
                 order.returnInfo = {
+                    ...(order.returnInfo || {}),
                     refundAmount: order.totalAmount,
                     refundId: refund.id,
-                    status: 'initiated',
-                    requestedAt: new Date()
+                    status: 'refunded',
+                    approvedAt: new Date()
                 };
-                await order.save({ session });
+                await order.save();
             } catch (refundError) {
-                console.error('Refund initiation failed:', refundError);
+                order.returnInfo = {
+                    ...(order.returnInfo || {}),
+                    status: 'refund_failed'
+                };
+                order.paymentInfo = {
+                    ...(order.paymentInfo || {}),
+                    refundFailureReason: refundError?.message || 'Refund API failed'
+                };
+                order.markModified('paymentInfo');
+                await order.save();
+                refundWarning = 'Order cancelled, but refund failed. Support team action required.';
+                logger.error('Refund initiation failed after cancellation', {
+                    orderId: order.orderId,
+                    message: refundError?.message
+                });
             }
         }
 
-        await session.commitTransaction();
-        session.endSession();
-
         return res.json({
             success: true,
-            message: 'Order cancelled successfully',
+            message: refundWarning || 'Order cancelled successfully',
             order: {
                 orderId: order.orderId,
                 orderStatus: order.orderStatus,
-                paymentStatus: order.paymentStatus
+                paymentStatus: order.paymentStatus,
+                refundStatus: order.returnInfo?.status || null
             }
         });
 
     } catch (error) {
-        await session.abortTransaction();
+        await abortTransactionSafely(session);
         session.endSession();
         console.error('Cancel order error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error cancelling order',
-            error: error.message
-        });
+        return respondOrderError(res, 500, 'ORDER_CANCELLATION_FAILED', 'Error cancelling order');
     }
 };
 
@@ -1491,20 +1562,33 @@ exports.updateOrderStatus = async (req, res) => {
     try {
         const { orderId } = req.params;
         const { status } = req.body;
+        const allowedStatuses = new Set([
+            'pending',
+            'confirmed',
+            'processing',
+            'shipped',
+            'out_for_delivery',
+            'delivered',
+            'cancelled',
+            'payment_failed'
+        ]);
 
         if (!isOrderStaffRequest(req)) {
-            return res.status(403).json({
-                success: false,
-                message: 'Admin access required'
-            });
+            return respondOrderError(res, 403, 'ORDER_ADMIN_ACCESS_REQUIRED', 'Admin access required');
+        }
+
+        if (!status || typeof status !== 'string' || !allowedStatuses.has(status)) {
+            return respondOrderError(
+                res,
+                400,
+                'ORDER_STATUS_INVALID',
+                'Invalid order status value'
+            );
         }
 
         const order = await Order.findOne({ orderId: orderId });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         order.orderStatus = status;
@@ -1536,9 +1620,7 @@ exports.updateOrderStatus = async (req, res) => {
 
     } catch (error) {
         console.error('Update order status error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error updating order status',
+        return respondOrderError(res, 500, 'ORDER_STATUS_UPDATE_FAILED', 'Error updating order status', {
             error: error.message
         });
     }
@@ -1553,10 +1635,7 @@ exports.generateInvoice = async (req, res) => {
             .populate('address');
 
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         if (!canViewOrderForRequest(req, order, isOrderStaffRequest(req))) {
@@ -1590,9 +1669,7 @@ exports.generateInvoice = async (req, res) => {
 
     } catch (error) {
         console.error('Generate invoice error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error generating invoice',
+        return respondOrderError(res, 500, 'INVOICE_GENERATION_FAILED', 'Error generating invoice', {
             error: error.message
         });
     }
@@ -1605,10 +1682,7 @@ exports.trackOrder = async (req, res) => {
         const order = await Order.findOne({ orderId: orderId });
 
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         if (!canViewOrderForRequest(req, order, isOrderStaffRequest(req))) {
@@ -1667,9 +1741,7 @@ exports.trackOrder = async (req, res) => {
 
     } catch (error) {
         console.error('Track order error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error tracking order',
+        return respondOrderError(res, 500, 'ORDER_TRACK_FAILED', 'Error tracking order', {
             error: error.message
         });
     }
@@ -1683,24 +1755,15 @@ exports.refundOrderPayment = async (req, res) => {
 
         const order = await Order.findOne({ orderId });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
         if (!['paid', 'partially_refunded'].includes(order.paymentStatus)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Order is not in a refundable payment state'
-            });
+            return respondOrderError(res, 400, 'ORDER_NOT_REFUNDABLE', 'Order is not in a refundable payment state');
         }
 
         if (!order.paymentInfo?.razorpayPaymentId) {
-            return res.status(400).json({
-                success: false,
-                message: 'No Razorpay payment on this order'
-            });
+            return respondOrderError(res, 400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment on this order');
         }
 
         const alreadyRefundedInr = roundMoney2(
@@ -1709,10 +1772,7 @@ exports.refundOrderPayment = async (req, res) => {
         const remainingInr = roundMoney2(order.totalAmount - alreadyRefundedInr);
 
         if (remainingInr <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Nothing left to refund'
-            });
+            return respondOrderError(res, 400, 'REFUND_NOTHING_PENDING', 'Nothing left to refund');
         }
 
         const requestedInr =
@@ -1721,17 +1781,11 @@ exports.refundOrderPayment = async (req, res) => {
                 : remainingInr;
 
         if (!Number.isFinite(requestedInr) || requestedInr <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid refund amount'
-            });
+            return respondOrderError(res, 400, 'REFUND_AMOUNT_INVALID', 'Invalid refund amount');
         }
 
         if (requestedInr > remainingInr) {
-            return res.status(400).json({
-                success: false,
-                message: `Refund cannot exceed remaining ${remainingInr} INR for this order`
-            });
+            return respondOrderError(res, 400, 'REFUND_AMOUNT_EXCEEDS_REMAINING', `Refund cannot exceed remaining ${remainingInr} INR for this order`);
         }
 
         const paise = Math.round(requestedInr * 100);
@@ -1762,10 +1816,11 @@ exports.refundOrderPayment = async (req, res) => {
         });
     } catch (error) {
         console.error('Refund order error:', error);
-        return res.status(500).json({
-            success: false,
-            message: error.error?.description || error.message || 'Refund failed',
-            error: error.error?.description || error.message
-        });
+        return respondOrderError(
+            res,
+            500,
+            'REFUND_INIT_FAILED',
+            error.error?.description || error.message || 'Refund failed'
+        );
     }
 };

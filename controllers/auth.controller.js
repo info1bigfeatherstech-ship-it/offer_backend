@@ -49,8 +49,17 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
 
 const ACCESS_EXPIRES = process.env.ACCESS_TOKEN_EXPIRES || '15m';
 const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
+const CONTACT_CHANGE_OTP_TTL_MS = 10 * 60 * 1000;
+const CONTACT_CHANGE_MAX_ATTEMPTS = 5;
 const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
 const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
+const respondAuthError = (res, statusCode, code, message, extras = {}) =>
+  res.status(statusCode).json({
+    success: false,
+    code,
+    message,
+    ...extras
+  });
 const REFRESH_COOKIE_BY_PORTAL = {
   ecomm: 'refreshToken_ecomm',
   wholesale: 'refreshToken_wholesale',
@@ -87,6 +96,11 @@ const normalizePortal = (rawPortal) => {
 const normalizeRefreshPortal = (rawPortal) => {
   const portal = normalizePortal(rawPortal);
   return SUPPORTED_LOGIN_PORTALS.has(portal) ? portal : '';
+};
+
+const normalizeContactField = (rawField) => {
+  const normalized = String(rawField || '').trim().toLowerCase();
+  return normalized === 'email' || normalized === 'phone' ? normalized : '';
 };
 
 const resolveRefreshCookieName = (portal) => {
@@ -142,13 +156,6 @@ const isPrivilegedAccount = (user) => {
   const userType = String(user.userType || '').trim().toLowerCase();
   if (userType === 'admin') return true;
   return isPrivilegedRole(user.role);
-};
-
-const isWholesalerAccount = (user) => {
-  if (!user) return false;
-  const userType = String(user.userType || '').trim().toLowerCase();
-  const role = String(user.role || '').trim().toLowerCase();
-  return userType === 'wholesaler' || role === 'wholesaler';
 };
 
 const buildLoginUserLookup = (identifier, portal) => {
@@ -217,7 +224,9 @@ const canLoginForPortal = (user, portal) => {
   }
 
   if (portal === 'wholesale') {
-    const isWholesaler = String(user.userType || '').trim().toLowerCase() === 'wholesaler' || String(user.role || '').trim().toLowerCase() === 'wholesaler';
+    const isWholesaler =
+      String(user.userType || '').trim().toLowerCase() === 'wholesaler' ||
+      String(user.role || '').trim().toLowerCase() === 'wholesaler';
     if (!isWholesaler || privileged) {
       return {
         allowed: false,
@@ -302,9 +311,7 @@ const register = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
+      return respondAuthError(res, 400, 'VALIDATION_FAILED', 'Validation failed', {
         errors: errors.array()
       });
     }
@@ -314,19 +321,13 @@ const register = async (req, res) => {
     // Check if email already exists (verified user)
     const existingEmailUser = await User.findOne({ email, isPhoneVerified: true });
     if (existingEmailUser) {
-      return res.status(409).json({
-        success: false,
-        message: 'User with this email already exists. Please login.'
-      });
+      return respondAuthError(res, 409, 'EMAIL_ALREADY_REGISTERED', 'User with this email already exists. Please login.');
     }
 
     // Check if phone already exists (verified user)
     const existingPhoneUser = await User.findOne({ phone, isPhoneVerified: true });
     if (existingPhoneUser) {
-      return res.status(409).json({
-        success: false,
-        message: 'User with this phone number already exists. Please login.'
-      });
+      return respondAuthError(res, 409, 'PHONE_ALREADY_REGISTERED', 'User with this phone number already exists. Please login.');
     }
 
     // Check if unverified user exists
@@ -378,11 +379,7 @@ const register = async (req, res) => {
 
   } catch (error) {
     console.error('Registration error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Error during registration',
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'REGISTRATION_FAILED', 'Error during registration', { error: error.message });
   }
 };
 
@@ -397,10 +394,7 @@ const verifyOTPAndLogin = async (req, res) => {
     let { phone, otp } = req.body;
 
     if (!phone || !otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Phone number and OTP are required"
-      });
+      return respondAuthError(res, 400, 'PHONE_OTP_PAYLOAD_INVALID', 'Phone number and OTP are required');
     }
 
     // Convert both to strings
@@ -408,10 +402,7 @@ const verifyOTPAndLogin = async (req, res) => {
     const otpString = String(otp).trim();
 
     if (!/^\d{10}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid phone number format. Must be 10 digits."
-      });
+      return respondAuthError(res, 400, 'PHONE_NUMBER_INVALID', 'Invalid phone number format. Must be 10 digits.');
     }
 
     //  FIX: Added all required fields to select
@@ -420,10 +411,7 @@ const verifyOTPAndLogin = async (req, res) => {
     );
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found with this phone number"
-      });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found with this phone number');
     }
 
     // If already verified, just login
@@ -460,18 +448,12 @@ const verifyOTPAndLogin = async (req, res) => {
 
     // Check OTP expiry
     if (!user.phoneVerificationOTPExpires || new Date() > user.phoneVerificationOTPExpires) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP has expired. Please request a new OTP."
-      });
+      return respondAuthError(res, 400, 'OTP_EXPIRED', 'OTP has expired. Please request a new OTP.');
     }
 
     // Compare OTP
     if (user.phoneVerificationOTP !== otpString) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid OTP"
-      });
+      return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
       
     // Activate user
@@ -520,11 +502,7 @@ const verifyOTPAndLogin = async (req, res) => {
 
   } catch (error) {
     console.error("Verify OTP error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error verifying OTP",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'OTP_VERIFY_FAILED', 'Error verifying OTP', { error: error.message });
   }
 };
 
@@ -534,9 +512,7 @@ const login = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: "Validation failed",
+      return respondAuthError(res, 400, 'VALIDATION_FAILED', 'Validation failed', {
         errors: errors.array()
       });
     }
@@ -548,32 +524,20 @@ const login = async (req, res) => {
       .select("+password +refreshTokens name email phone userType role allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid credentials"
-      });
+      return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
     }
 
     if (!user.isPhoneVerified) {
-      return res.status(403).json({
-        success: false,
-        message: "Phone number not verified. Please complete registration."
-      });
+      return respondAuthError(res, 403, 'PHONE_NOT_VERIFIED', 'Phone number not verified. Please complete registration.');
     }
 
     if (user.status !== "active") {
-      return res.status(403).json({
-        success: false,
-        message: "Your account is not active"
-      });
+      return respondAuthError(res, 403, 'ACCOUNT_INACTIVE', 'Your account is not active');
     }
 
     const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid credentials"
-      });
+      return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
     }
 
     const portalDecision = canLoginForPortal(user, portal);
@@ -628,11 +592,7 @@ user.refreshTokens.push({
 
   } catch (error) {
     console.error("Login error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error during login",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'LOGIN_FAILED', 'Error during login', { error: error.message });
   }
 };
 
@@ -643,10 +603,7 @@ const sendPasswordResetOTP = async (req, res) => {
     const { identifier } = req.body;
 
     if (!identifier) {
-      return res.status(400).json({
-        success: false,
-        message: "Email or phone number is required"
-      });
+      return respondAuthError(res, 400, 'IDENTIFIER_REQUIRED', 'Email or phone number is required');
     }
 
     const user = await User.findOne({
@@ -694,11 +651,7 @@ const sendPasswordResetOTP = async (req, res) => {
 
   } catch (error) {
     console.error("Send password reset OTP error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error sending OTP",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PASSWORD_RESET_OTP_SEND_FAILED', 'Error sending OTP', { error: error.message });
   }
 };
 
@@ -709,10 +662,7 @@ const verifyPasswordResetOTP = async (req, res) => {
     const { identifier, otp } = req.body;
 
     if (!identifier || !otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Identifier and OTP are required"
-      });
+      return respondAuthError(res, 400, 'IDENTIFIER_OTP_REQUIRED', 'Identifier and OTP are required');
     }
 
     const user = await User.findOne({
@@ -723,31 +673,19 @@ const verifyPasswordResetOTP = async (req, res) => {
     }).select("+passwordResetOTP +passwordResetOTPExpires");
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
 
     if (!user.passwordResetOTP || !user.passwordResetOTPExpires) {
-      return res.status(400).json({
-        success: false,
-        message: "No OTP request found"
-      });
+      return respondAuthError(res, 400, 'PASSWORD_RESET_OTP_NOT_REQUESTED', 'No OTP request found');
     }
 
     if (new Date() > user.passwordResetOTPExpires) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP has expired. Please request a new one."
-      });
+      return respondAuthError(res, 400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
     }
 
     if (user.passwordResetOTP !== otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid OTP"
-      });
+      return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
     // Don't delete OTP yet, will be deleted after password reset
@@ -758,11 +696,7 @@ const verifyPasswordResetOTP = async (req, res) => {
 
   } catch (error) {
     console.error("Verify password reset OTP error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error verifying OTP",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PASSWORD_RESET_OTP_VERIFY_FAILED', 'Error verifying OTP', { error: error.message });
   }
 };
 
@@ -773,17 +707,11 @@ const resetPasswordWithOTP = async (req, res) => {
     const { identifier, otp, newPassword } = req.body;
 
     if (!identifier || !otp || !newPassword) {
-      return res.status(400).json({
-        success: false,
-        message: "Identifier, OTP and new password are required"
-      });
+      return respondAuthError(res, 400, 'PASSWORD_RESET_PAYLOAD_INVALID', 'Identifier, OTP and new password are required');
     }
 
     if (newPassword.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 6 characters"
-      });
+      return respondAuthError(res, 400, 'PASSWORD_TOO_SHORT', 'Password must be at least 6 characters');
     }
 
     const user = await User.findOne({
@@ -794,31 +722,19 @@ const resetPasswordWithOTP = async (req, res) => {
     }).select("+passwordResetOTP +passwordResetOTPExpires");
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
 
     if (!user.passwordResetOTP || !user.passwordResetOTPExpires) {
-      return res.status(400).json({
-        success: false,
-        message: "No OTP request found"
-      });
+      return respondAuthError(res, 400, 'PASSWORD_RESET_OTP_NOT_REQUESTED', 'No OTP request found');
     }
 
     if (new Date() > user.passwordResetOTPExpires) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP has expired. Please request a new one."
-      });
+      return respondAuthError(res, 400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
     }
 
     if (user.passwordResetOTP !== otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid OTP"
-      });
+      return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
     // Update password (model will hash it)
@@ -834,11 +750,7 @@ const resetPasswordWithOTP = async (req, res) => {
 
   } catch (error) {
     console.error("Reset password error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error resetting password",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PASSWORD_RESET_FAILED', 'Error resetting password', { error: error.message });
   }
 };
 
@@ -888,10 +800,7 @@ const logout = async (req, res) => {
 
   } catch (error) {
     console.error("Logout error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error during logout"
-    });
+    return respondAuthError(res, 500, 'LOGOUT_FAILED', 'Error during logout');
   }
 };
 
@@ -906,11 +815,7 @@ const refreshAccessToken = async (req, res) => {
 
     if (!refreshToken) {
     //   console.log(" No refresh token in cookies");
-      return res.status(401).json({
-        success: false,
-        message: "Refresh token missing",
-        code: "REFRESH_TOKEN_MISSING"
-      });
+      return respondAuthError(res, 401, 'REFRESH_TOKEN_MISSING', 'Refresh token missing');
     }
 
     // console.log(" Refresh token found");
@@ -921,18 +826,12 @@ const refreshAccessToken = async (req, res) => {
     //   console.log(" Token verified, userId:", decoded.id);
     } catch (err) {
     //   console.log(" Token verification failed:", err.message);
-      return res.status(401).json({
-        success: false,
-        message: "Invalid or expired refresh token"
-      });
+      return respondAuthError(res, 401, 'REFRESH_TOKEN_INVALID', 'Invalid or expired refresh token');
     }
 
     if (decoded.type !== "refresh") {
     //   console.log(" Invalid token type:", decoded.type);
-      return res.status(401).json({
-        success: false,
-        message: "Invalid token type"
-      });
+      return respondAuthError(res, 401, 'REFRESH_TOKEN_TYPE_INVALID', 'Invalid token type');
     }
 
     const hashedToken = hashToken(refreshToken);
@@ -940,10 +839,7 @@ const refreshAccessToken = async (req, res) => {
 
     if (!user) {
     //   console.log(" User not found:", decoded.id);
-      return res.status(401).json({
-        success: false,
-        message: "User not found"
-      });
+      return respondAuthError(res, 401, 'USER_NOT_FOUND', 'User not found');
     }
 
     // Remove expired tokens
@@ -954,11 +850,7 @@ const refreshAccessToken = async (req, res) => {
     
     if (tokenIndex === -1) {
     //   console.log(" Token mismatch - session expired");
-      return res.status(401).json({
-        success: false,
-        message: "Session expired. Please login again.",
-        code: "SESSION_EXPIRED"
-      });
+      return respondAuthError(res, 401, 'SESSION_EXPIRED', 'Session expired. Please login again.');
     }
 
     // console.log(" Token matched, generating new tokens");
@@ -999,11 +891,7 @@ const refreshAccessToken = async (req, res) => {
 
   } catch (error) {
     console.error("Refresh token error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Could not refresh token",
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'REFRESH_TOKEN_ROTATION_FAILED', 'Could not refresh token', { error: error.message });
   }
 };
 // ========== 9️ GET CURRENT USER ==========
@@ -1012,7 +900,7 @@ const me = async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
 
     return res.status(200).json({
@@ -1032,11 +920,7 @@ const me = async (req, res) => {
     });
   } catch (error) {
     console.error('Me error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Error fetching profile',
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PROFILE_FETCH_FAILED', 'Error fetching profile', { error: error.message });
   }
 };
 
@@ -1045,13 +929,29 @@ const me = async (req, res) => {
 const updateProfile = async (req, res) => {
   try {
     const updates = {};
-    if (req.body.name) updates.name = req.body.name;
-    if (req.body.email) updates.email = req.body.email;
-    if (req.body.phone) updates.phone = req.body.phone;
+    const hasEmailChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
+    const hasPhoneChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'phone');
+
+    // Identity fields require explicit OTP/verification flow; do not mutate directly here.
+    if (hasEmailChange || hasPhoneChange) {
+      return res.status(409).json({
+        success: false,
+        code: 'PROFILE_CONTACT_CHANGE_REQUIRES_VERIFICATION',
+        message: 'Email/phone update requires verification flow. Use dedicated contact-change endpoint.'
+      });
+    }
+
+    if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+      updates.name = req.body.name.trim();
+    }
+
+    if (!Object.keys(updates).length) {
+      return respondAuthError(res, 400, 'PROFILE_FIELDS_MISSING', 'No updatable profile fields provided');
+    }
 
     const user = await User.findByIdAndUpdate(req.userId, { $set: updates }, { new: true });
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
 
     return res.status(200).json({
@@ -1065,13 +965,37 @@ const updateProfile = async (req, res) => {
       }
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      const key = Object.keys(error.keyPattern || {})[0] || 'field';
+      return res.status(409).json({
+        success: false,
+        code: 'DUPLICATE_PROFILE_FIELD',
+        message: `${key} is already in use`
+      });
+    }
     console.error('Update profile error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Error updating profile',
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PROFILE_UPDATE_FAILED', 'Error updating profile', { error: error.message });
   }
+};
+
+// ========== 10B REQUEST CONTACT CHANGE OTP ==========
+const requestContactChangeOTP = async (req, res) => {
+  return respondAuthError(
+    res,
+    403,
+    'CONTACT_CHANGE_DISABLED',
+    'Email/phone change is currently disabled. Please contact support.'
+  );
+};
+
+// ========== 10C VERIFY CONTACT CHANGE OTP ==========
+const verifyContactChangeOTP = async (req, res) => {
+  return respondAuthError(
+    res,
+    403,
+    'CONTACT_CHANGE_DISABLED',
+    'Email/phone change is currently disabled. Please contact support.'
+  );
 };
 
 // ========== 11 CHANGE PASSWORD ==========
@@ -1081,27 +1005,21 @@ const changePassword = async (req, res) => {
     const { oldPassword, newPassword } = req.body;
 
     if (!oldPassword || !newPassword) {
-      return res.status(400).json({
-        success: false,
-        message: 'Old and new passwords are required'
-      });
+      return respondAuthError(res, 400, 'PASSWORD_CHANGE_PAYLOAD_INVALID', 'Old and new passwords are required');
     }
 
     if (newPassword.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: 'New password must be at least 6 characters'
-      });
+      return respondAuthError(res, 400, 'PASSWORD_TOO_SHORT', 'New password must be at least 6 characters');
     }
 
     const user = await User.findById(req.userId).select('+password');
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
 
     const isValid = await user.comparePassword(oldPassword);
     if (!isValid) {
-      return res.status(401).json({ success: false, message: 'Old password is incorrect' });
+      return respondAuthError(res, 401, 'OLD_PASSWORD_INVALID', 'Old password is incorrect');
     }
 
     user.password = newPassword;
@@ -1114,11 +1032,7 @@ const changePassword = async (req, res) => {
 
   } catch (error) {
     console.error('Change password error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Error changing password',
-      error: error.message
-    });
+    return respondAuthError(res, 500, 'PASSWORD_CHANGE_FAILED', 'Error changing password', { error: error.message });
   }
 };
 
@@ -1129,10 +1043,7 @@ const googleAuth = async (req, res) => {
     const { idToken } = req.body;
 
     if (!idToken || typeof idToken !== "string") {
-      return res.status(400).json({
-        success: false,
-        message: "Valid idToken is required"
-      });
+      return respondAuthError(res, 400, 'GOOGLE_ID_TOKEN_REQUIRED', 'Valid idToken is required');
     }
 
     const ticket = await googleClient.verifyIdToken({
@@ -1143,10 +1054,7 @@ const googleAuth = async (req, res) => {
     const payload = ticket.getPayload();
 
     if (!payload.email || !payload.email_verified) {
-      return res.status(400).json({
-        success: false,
-        message: "Google email not verified"
-      });
+      return respondAuthError(res, 400, 'GOOGLE_EMAIL_NOT_VERIFIED', 'Google email not verified');
     }
 
     const { sub: googleId, email, name = "" } = payload;
@@ -1206,10 +1114,7 @@ setRefreshTokenCookie(res, 'ecomm', refreshToken);
 
   } catch (error) {
     console.error("[Google Auth Error]", error);
-    return res.status(500).json({
-      success: false,
-      message: "Google authentication failed"
-    });
+    return respondAuthError(res, 500, 'GOOGLE_AUTH_FAILED', 'Google authentication failed');
   }
 };
 
@@ -1220,6 +1125,9 @@ setRefreshTokenCookie(res, 'ecomm', refreshToken);
 const getActiveDevices = async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('refreshTokens');
+    if (!user) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
+    }
     const devices = user.refreshTokens.map(token => ({
       deviceId: token._id,
       deviceInfo: token.deviceInfo,
@@ -1228,7 +1136,11 @@ const getActiveDevices = async (req, res) => {
     }));
     return res.json({ success: true, devices });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      code: 'FETCH_DEVICES_FAILED',
+      message: 'Could not fetch active devices'
+    });
   }
 };
 
@@ -1236,12 +1148,22 @@ const getActiveDevices = async (req, res) => {
 const logoutDevice = async (req, res) => {
   try {
     const { deviceId } = req.body;
+    if (!deviceId) {
+      return res.status(400).json({ success: false, code: 'DEVICE_ID_REQUIRED', message: 'deviceId is required' });
+    }
     const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
+    }
     user.refreshTokens = user.refreshTokens.filter(t => t._id.toString() !== deviceId);
     await user.save();
     return res.json({ success: true, message: 'Device logged out successfully' });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      code: 'LOGOUT_DEVICE_FAILED',
+      message: 'Could not logout device'
+    });
   }
 };
 
@@ -1249,12 +1171,19 @@ const logoutDevice = async (req, res) => {
 const logoutAllDevices = async (req, res) => {
   try {
     const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
+    }
     user.refreshTokens = [];
     await user.save();
     clearRefreshTokenCookie(res, 'ecomm');
     return res.json({ success: true, message: 'Logged out from all devices' });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      code: 'LOGOUT_ALL_DEVICES_FAILED',
+      message: 'Could not logout from all devices'
+    });
   }
 };
 
@@ -1273,6 +1202,8 @@ module.exports = {
   me,
   updateProfile,
   changePassword,
+  requestContactChangeOTP,
+  verifyContactChangeOTP,
   googleAuth , 
   getActiveDevices,
   logoutDevice,

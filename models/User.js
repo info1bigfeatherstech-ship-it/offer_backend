@@ -106,6 +106,31 @@ const userSchema = new mongoose.Schema(
       select: false
     },
 
+    // ===== CONTACT CHANGE OTP FLOW =====
+    contactChangeField: {
+      type: String,
+      enum: ['email', 'phone'],
+      select: false
+    },
+    contactChangeValue: {
+      type: String,
+      trim: true,
+      select: false
+    },
+    contactChangeOTP: {
+      type: String,
+      select: false
+    },
+    contactChangeOTPExpires: {
+      type: Date,
+      select: false
+    },
+    contactChangeOTPAttempts: {
+      type: Number,
+      default: 0,
+      select: false
+    },
+
     // NEW FIELD: Which method user used to register (phone/email/google)
     registrationMethod: {
       type: String,

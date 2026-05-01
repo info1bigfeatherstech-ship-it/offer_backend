@@ -311,6 +311,36 @@ function getRefreshCookieOptions() {
   return options;
 }
 
+const REFRESH_COOKIE_BY_PORTAL = {
+  ecomm: 'refreshToken_ecomm',
+  wholesale: 'refreshToken_wholesale',
+  'admin-ecomm': 'refreshToken_admin_ecomm',
+  'admin-wholesale': 'refreshToken_admin_wholesale'
+};
+
+function resolveRefreshCookieName(portal) {
+  return REFRESH_COOKIE_BY_PORTAL[portal] || REFRESH_COOKIE_BY_PORTAL.ecomm;
+}
+
+function setRefreshTokenCookie(res, portal, refreshToken) {
+  const cookieName = resolveRefreshCookieName(portal);
+  const cookieOptions = getRefreshCookieOptions();
+  res.cookie(cookieName, refreshToken, cookieOptions);
+  if (cookieName !== 'refreshToken') {
+    // Cleanup legacy shared cookie to avoid cross-portal session bleed.
+    res.clearCookie('refreshToken', cookieOptions);
+  }
+}
+
+function authContractError(res, status, code, message, extras = {}) {
+  return res.status(status).json({
+    success: false,
+    code,
+    message,
+    ...extras
+  });
+}
+
 function sanitizePublicIdPart(value) {
   return String(value || '')
     .toLowerCase()
@@ -401,9 +431,9 @@ async function resolveWholesalerProofUrls(req, payload) {
   }
 }
 
-function generateAccessToken(userId, userType = 'user', role = 'user') {
+function generateAccessToken(userId, userType = 'user', role = 'user', portal = 'wholesale') {
   return jwt.sign(
-    { id: userId, type: 'access', userType, role },
+    { id: userId, type: 'access', userType, role, portal },
     process.env.JWT_SECRET,
     { expiresIn: ACCESS_EXPIRES }
   );
@@ -1112,20 +1142,24 @@ exports.sendWholesalerActivationOtp = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
+      return authContractError(res, 400, 'VALIDATION_FAILED', 'Validation failed', {
+        errors: errors.array()
+      });
     }
 
     const mobileNumber = normalizePhone(req.body.mobileNumber);
     if (!/^\d{10}$/.test(mobileNumber)) {
-      return res.status(400).json({ success: false, message: 'Valid 10-digit mobileNumber is required' });
+      return authContractError(res, 400, 'INVALID_MOBILE_NUMBER', 'Valid 10-digit mobileNumber is required');
     }
 
     const doc = await WholesalerDetails.findOne({ mobileNumber, status: 'approved' }).sort({ updatedAt: -1 });
     if (!doc) {
-      return res.status(404).json({
-        success: false,
-        message: 'No approved wholesaler request found for this mobile number'
-      });
+      return authContractError(
+        res,
+        404,
+        'WHOLESALER_APPROVAL_NOT_FOUND',
+        'No approved wholesaler request found for this mobile number'
+      );
     }
 
     const otp = generateOTP();
@@ -1143,7 +1177,7 @@ exports.sendWholesalerActivationOtp = async (req, res) => {
       mobileNumber: doc.mobileNumber
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Error sending activation OTP', error: error.message });
+    return authContractError(res, 500, 'WHOLESALER_ACTIVATION_OTP_SEND_FAILED', 'Error sending activation OTP');
   }
 };
 
@@ -1151,7 +1185,9 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
+      return authContractError(res, 400, 'VALIDATION_FAILED', 'Validation failed', {
+        errors: errors.array()
+      });
     }
 
     const mobileNumber = normalizePhone(req.body.mobileNumber);
@@ -1159,10 +1195,12 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
     const password = String(req.body.password || '');
 
     if (!/^\d{10}$/.test(mobileNumber) || !otp || password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: 'mobileNumber, otp and password (min 6 chars) are required'
-      });
+      return authContractError(
+        res,
+        400,
+        'INVALID_ACTIVATION_PAYLOAD',
+        'mobileNumber, otp and password (min 6 chars) are required'
+      );
     }
 
     const doc = await WholesalerDetails.findOne({ mobileNumber, status: 'approved' })
@@ -1170,25 +1208,27 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       .select('+activationOtpHash');
 
     if (!doc) {
-      return res.status(404).json({
-        success: false,
-        message: 'No approved request found for this mobile number'
-      });
+      return authContractError(
+        res,
+        404,
+        'WHOLESALER_APPROVAL_NOT_FOUND',
+        'No approved request found for this mobile number'
+      );
     }
 
     if (!doc.activationOtpHash || !doc.activationOtpExpiresAt || new Date() > doc.activationOtpExpiresAt) {
-      return res.status(400).json({ success: false, message: 'OTP expired or not requested' });
+      return authContractError(res, 400, 'OTP_EXPIRED_OR_MISSING', 'OTP expired or not requested');
     }
 
     if (doc.activationOtpAttempts >= MAX_OTP_ATTEMPTS) {
-      return res.status(429).json({ success: false, message: 'Too many invalid attempts. Request OTP again.' });
+      return authContractError(res, 429, 'OTP_MAX_ATTEMPTS_EXCEEDED', 'Too many invalid attempts. Request OTP again.');
     }
 
     const incomingHash = hashString(otp);
     if (incomingHash !== doc.activationOtpHash) {
       doc.activationOtpAttempts += 1;
       await doc.save();
-      return res.status(400).json({ success: false, message: 'Invalid OTP' });
+      return authContractError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
     let user = await User.findOne({
@@ -1227,7 +1267,7 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       user.lastLoginMethod = 'otp';
     }
 
-    const accessToken = generateAccessToken(user._id, user.userType, user.role);
+    const accessToken = generateAccessToken(user._id, user.userType, user.role, 'wholesale');
     const refreshToken = generateRefreshToken(user._id);
     const hashedRefreshToken = hashString(refreshToken);
 
@@ -1249,7 +1289,7 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
     doc.activationOtpAttempts = 0;
     await doc.save();
 
-    res.cookie('refreshToken', refreshToken, getRefreshCookieOptions());
+    setRefreshTokenCookie(res, 'wholesale', refreshToken);
 
     return res.status(200).json({
       success: true,
@@ -1265,6 +1305,6 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       }
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Error verifying activation OTP', error: error.message });
+    return authContractError(res, 500, 'WHOLESALER_ACTIVATION_VERIFY_FAILED', 'Error verifying activation OTP');
   }
 };

@@ -1,6 +1,7 @@
 const Address = require('../models/Address');
 const Cart = require('../models/cart');
 const CheckoutQuote = require('../models/CheckoutQuote');
+const mongoose = require('mongoose');
 const {
   computeCheckoutTotals,
   roundMoney2,
@@ -23,6 +24,16 @@ const logger = require('../utils/logger');
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 
 const normalizePin = (p) => String(p || '').replace(/\D/g, '').slice(0, 6);
+const normalizeDecisionCode = (errorLike, fallback) =>
+  String(errorLike?.code || fallback || 'CHECKOUT_FLOW_ERROR').trim().toUpperCase();
+
+const respondCheckoutInputError = (res, status, code, message, extras = {}) =>
+  res.status(status).json({
+    success: false,
+    code,
+    message,
+    ...extras
+  });
 
 function allowDemoMockShipping(req) {
   if (req.body?.demoMockShipping !== true) return false;
@@ -112,29 +123,33 @@ exports.quoteCheckout = async (req, res) => {
     }
 
     if (!addressId) {
-      return res.status(400).json({ success: false, message: 'addressId is required' });
+      return respondCheckoutInputError(res, 400, 'ADDRESS_ID_REQUIRED', 'addressId is required');
+    }
+    if (!mongoose.Types.ObjectId.isValid(String(addressId))) {
+      return respondCheckoutInputError(res, 400, 'INVALID_ADDRESS_ID', 'Invalid addressId');
     }
 
     if (req.body?.demoMockShipping === true && !allowDemoMockShipping(req)) {
       return res.status(400).json({
         success: false,
+        code: 'DEMO_MOCK_SHIPPING_DISABLED',
         message: 'demoMockShipping is not enabled in this environment'
       });
     }
 
     const address = await Address.findById(addressId).lean();
     if (!address || String(address.userId) !== String(userId)) {
-      return res.status(404).json({ success: false, message: 'Address not found' });
+      return respondCheckoutInputError(res, 404, 'ADDRESS_NOT_FOUND', 'Address not found');
     }
 
     const pin = normalizePin(address.postalCode);
     if (pin.length !== 6) {
-      return res.status(400).json({ success: false, message: 'Address must have a valid 6-digit postal code' });
+      return respondCheckoutInputError(res, 400, 'INVALID_POSTAL_CODE', 'Address must have a valid 6-digit postal code');
     }
 
     const cartDoc = await Cart.findOne({ userId });
     if (!cartDoc?.items?.length) {
-      return res.status(400).json({ success: false, message: 'cart is empty' });
+      return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'cart is empty');
     }
 
     const finalTotals = await buildFinalTotals({
@@ -242,13 +257,22 @@ exports.quoteCheckout = async (req, res) => {
     });
   } catch (err) {
     if (err.statusCode) {
-      return sendCheckoutFlowError(res, err, 'Failed to build checkout quote');
+      logger.warn('quoteCheckout business rejection', buildRequestLogContext(req, {
+        code: normalizeDecisionCode(err, 'QUOTE_BUILD_REJECTED'),
+        reason: err?.details?.reason || null,
+        statusCode: err.statusCode
+      }));
+      return sendCheckoutFlowError(res, err, 'Failed to build checkout quote', 'QUOTE_BUILD_FAILED');
     }
     logger.error('quoteCheckout failed', buildRequestLogContext(req, {
       error: err.message,
       stack: err.stack
     }));
-    return res.status(500).json({ success: false, message: 'Failed to build checkout quote' });
+    return res.status(500).json({
+      success: false,
+      code: 'QUOTE_BUILD_FAILED',
+      message: 'Failed to build checkout quote'
+    });
   }
 };
 
@@ -264,7 +288,10 @@ exports.confirmCheckout = async (req, res) => {
     const { quoteId, paymentMethod, paymentPlan } = req.body || {};
 
     if (!quoteId) {
-      return res.status(400).json({ success: false, message: 'quoteId is required' });
+      return respondCheckoutInputError(res, 400, 'QUOTE_ID_REQUIRED', 'quoteId is required');
+    }
+    if (!mongoose.Types.ObjectId.isValid(String(quoteId))) {
+      return respondCheckoutInputError(res, 400, 'INVALID_QUOTE_ID', 'Invalid quoteId');
     }
 
     const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
@@ -275,7 +302,7 @@ exports.confirmCheckout = async (req, res) => {
 
     const quote = await CheckoutQuote.findOne({ _id: quoteId, userId, status: 'active' });
     if (!quote) {
-      return res.status(404).json({ success: false, message: 'Quote not found or inactive' });
+      return respondCheckoutInputError(res, 404, 'QUOTE_NOT_FOUND', 'Quote not found or inactive');
     }
 
     if (quote.quoteExpiresAt.getTime() <= Date.now()) {
@@ -286,17 +313,17 @@ exports.confirmCheckout = async (req, res) => {
 
     const address = await Address.findById(quote.addressId).lean();
     if (!address || String(address.userId) !== String(userId)) {
-      return res.status(400).json({ success: false, message: 'Address is no longer valid for this quote' });
+      return respondCheckoutInputError(res, 400, 'QUOTE_ADDRESS_INVALID', 'Address is no longer valid for this quote');
     }
 
     const pin = normalizePin(address.postalCode);
     if (pin.length !== 6 || pin !== quote.postalCode) {
-      return res.status(400).json({ success: false, message: 'Address pincode changed. Regenerate quote.' });
+      return respondCheckoutInputError(res, 400, 'QUOTE_POSTAL_CODE_CHANGED', 'Address pincode changed. Regenerate quote.');
     }
 
     const cartDoc = await Cart.findOne({ userId });
     if (!cartDoc?.items?.length) {
-      return res.status(400).json({ success: false, message: 'Cart is empty. Regenerate quote.' });
+      return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'Cart is empty. Regenerate quote.');
     }
 
     const fp = cartFingerprintFromItems(cartDoc.items);
@@ -387,12 +414,21 @@ exports.confirmCheckout = async (req, res) => {
     });
   } catch (err) {
     if (err.statusCode) {
-      return sendCheckoutFlowError(res, err, 'Failed to confirm checkout quote');
+      logger.warn('confirmCheckout business rejection', buildRequestLogContext(req, {
+        code: normalizeDecisionCode(err, 'QUOTE_CONFIRM_REJECTED'),
+        reason: err?.details?.reason || null,
+        statusCode: err.statusCode
+      }));
+      return sendCheckoutFlowError(res, err, 'Failed to confirm checkout quote', 'QUOTE_CONFIRM_FAILED');
     }
     logger.error('confirmCheckout failed', buildRequestLogContext(req, {
       error: err.message,
       stack: err.stack
     }));
-    return res.status(500).json({ success: false, message: 'Failed to confirm checkout quote' });
+    return res.status(500).json({
+      success: false,
+      code: 'QUOTE_CONFIRM_FAILED',
+      message: 'Failed to confirm checkout quote'
+    });
   }
 };

@@ -61,7 +61,7 @@ const createQuoteStaleError = (reason, overrides = {}) =>
     }
   });
 
-const sendCheckoutFlowError = (res, error, fallbackMessage) => {
+const sendCheckoutFlowError = (res, error, fallbackMessage, fallbackCode = null) => {
   const statusCode = error?.statusCode || 500;
   const payload = {
     success: false,
@@ -70,6 +70,8 @@ const sendCheckoutFlowError = (res, error, fallbackMessage) => {
 
   if (error?.code) {
     payload.code = error.code;
+  } else if (fallbackCode) {
+    payload.code = fallbackCode;
   }
 
   if (error?.details !== undefined) {

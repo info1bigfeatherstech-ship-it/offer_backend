@@ -1,5 +1,6 @@
 // models/Order.js
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const orderItemSchema = new mongoose.Schema(
   {
@@ -107,7 +108,11 @@ const orderSchema = new mongoose.Schema(
 // Generate order ID before saving
 orderSchema.pre('save', function() {
   if (!this.orderId) {
-    this.orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+    if (typeof crypto.randomUUID === 'function') {
+      this.orderId = `ORD-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
+    } else {
+      this.orderId = `ORD-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+    }
   }
 });
 

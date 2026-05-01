@@ -10,6 +10,8 @@ const {
     logout, 
     me, 
     updateProfile, 
+    requestContactChangeOTP,
+    verifyContactChangeOTP,
     changePassword,
     sendPasswordResetOTP,
     verifyPasswordResetOTP,
@@ -192,6 +194,34 @@ router.post('/logout', verifyToken, logout);   //done
 
 router.get('/me', verifyToken, me);     //done
 router.put('/profile', verifyToken, updateProfile);   //done
+router.post(
+    '/profile/contact-change/request-otp',
+    verifyToken,
+    [
+        body('field')
+            .trim()
+            .notEmpty()
+            .withMessage('field is required')
+            .isIn(['email', 'phone'])
+            .withMessage('field must be one of: email, phone'),
+        body('newValue')
+            .trim()
+            .notEmpty()
+            .withMessage('newValue is required')
+    ],
+    requestContactChangeOTP
+);
+router.post(
+    '/profile/contact-change/verify-otp',
+    verifyToken,
+    [
+        body('otp')
+            .trim()
+            .notEmpty()
+            .withMessage('otp is required')
+    ],
+    verifyContactChangeOTP
+);
 
 
 // =============================================

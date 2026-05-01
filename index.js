@@ -5,6 +5,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 require('dotenv').config();
 
 // Import services
@@ -47,6 +48,69 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const app = express();
 let server = null;
+
+function parseBoolEnv(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function validateStartupConfig() {
+  const warnings = [];
+  const errors = [];
+  const isProd = NODE_ENV === 'production';
+
+  const jwtSecret = String(process.env.JWT_SECRET || '').trim();
+  const refreshSecret = String(process.env.REFRESH_TOKEN_SECRET || '').trim();
+  const mongoUri = String(process.env.MONGO_DB_URI || process.env.MONGO_URI || '').trim();
+  const razorpayKeyId = String(process.env.RAZORPAY_KEY_ID || '').trim();
+  const razorpayKeySecret = String(process.env.RAZORPAY_KEY_SECRET || '').trim();
+  const webhookSecret = String(process.env.RAZORPAY_WEBHOOK_SECRET || '').trim();
+  const cookieDomain = String(process.env.COOKIE_DOMAIN || '').trim();
+  const corsAllowedOrigins = parseOriginsCsv(process.env.CORS_ALLOWED_ORIGINS);
+  const ownerReviewOrigins = parseOriginsCsv(process.env.OWNER_REVIEW_ALLOWED_ORIGINS);
+  const demoMockShippingEnabled = parseBoolEnv(process.env.ALLOW_DEMO_MOCK_SHIPPING);
+
+  if (!jwtSecret) errors.push('JWT_SECRET is required');
+  if (!refreshSecret) errors.push('REFRESH_TOKEN_SECRET is required');
+  if (!mongoUri) errors.push('MONGO_DB_URI (or MONGO_URI) is required');
+
+  if (isProd) {
+    if (!cookieDomain) {
+      warnings.push('COOKIE_DOMAIN is not set in production; cross-subdomain cookie behavior may be inconsistent');
+    }
+    if (corsAllowedOrigins.length === 0) {
+      warnings.push('CORS_ALLOWED_ORIGINS is empty in production; verify allowed origin defaults match deployment frontends');
+    }
+    if (!razorpayKeyId || !razorpayKeySecret) {
+      warnings.push('RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET missing; online payment flows will fail');
+    }
+    if (!webhookSecret) {
+      warnings.push('RAZORPAY_WEBHOOK_SECRET missing; webhook signature verification cannot be enforced');
+    }
+    if (demoMockShippingEnabled) {
+      warnings.push('ALLOW_DEMO_MOCK_SHIPPING is enabled in production; this should normally be disabled');
+    }
+  }
+
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+    warnings.push('EMAIL_USER or EMAIL_PASSWORD missing; OTP/email workflows may fail');
+  }
+
+  if (ownerReviewOrigins.length === 0) {
+    warnings.push('OWNER_REVIEW_ALLOWED_ORIGINS not configured; owner review access relies only on default origin set');
+  }
+
+  if (errors.length) {
+    for (const issue of errors) {
+      logger.error(`[Config] ${issue}`);
+    }
+    throw new Error('Startup configuration validation failed');
+  }
+
+  for (const issue of warnings) {
+    logger.warn(`[Config] ${issue}`);
+  }
+}
 
 // ============================================================================
 // Security & Middleware Setup
@@ -183,12 +247,33 @@ app.use(resolveStorefrontMiddleware);
 // ✅ Apply userType middleware (GLOBAL - for all routes)
 app.use(optionalAuth);
 
-// Request ID middleware
+function buildRequestId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function sanitizeIncomingRequestId(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) return '';
+  if (candidate.length > 128) return '';
+  return /^[A-Za-z0-9._:-]+$/.test(candidate) ? candidate : '';
+}
+
+// Request ID middleware (honors trusted inbound ID, otherwise generates one)
 app.use((req, res, next) => {
-  req.id = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+  const incomingId = sanitizeIncomingRequestId(req.headers['x-request-id']);
+  req.id = incomingId || buildRequestId();
   res.setHeader('X-Request-ID', req.id);
   next();
 });
+
+function setOperationalNoCacheHeaders(res) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+}
 
 // ============================================================================
 // RATE LIMITING (Different limits for different routes)
@@ -230,10 +315,14 @@ app.use('/api/admin', limiters.admin);
 // ============================================================================
 
 app.get('/health', async (req, res) => {
+  setOperationalNoCacheHeaders(res);
   const healthStatus = {
+    success: true,
+    code: 'SERVICE_HEALTH_STATUS',
     status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    requestId: req.id,
     environment: NODE_ENV,
     services: {
       mongodb: 'unknown',
@@ -276,8 +365,13 @@ app.get('/health', async (req, res) => {
     healthStatus.cache = cacheService.getStats();
 
     const statusCode = healthStatus.status === 'healthy' ? 200 : 503;
+    if (statusCode !== 200) {
+      healthStatus.code = 'SERVICE_HEALTH_DEGRADED';
+    }
     res.status(statusCode).json(healthStatus);
   } catch (error) {
+    healthStatus.success = false;
+    healthStatus.code = 'SERVICE_HEALTH_CHECK_FAILED';
     healthStatus.status = 'unhealthy';
     healthStatus.error = error.message;
     res.status(503).json(healthStatus);
@@ -285,40 +379,77 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/health/ready', async (req, res) => {
+  setOperationalNoCacheHeaders(res);
   if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({ status: 'not_ready', reason: 'database_not_connected' });
+    return res.status(503).json({
+      success: false,
+      code: 'SERVICE_NOT_READY',
+      status: 'not_ready',
+      reason: 'database_not_connected',
+      requestId: req.id
+    });
   }
 
   if (!redisManager.isReady() && NODE_ENV === 'production') {
-    return res.status(503).json({ status: 'not_ready', reason: 'cache_not_connected' });
+    return res.status(503).json({
+      success: false,
+      code: 'SERVICE_NOT_READY',
+      status: 'not_ready',
+      reason: 'cache_not_connected',
+      requestId: req.id
+    });
   }
 
-  res.status(200).json({ status: 'ready', timestamp: new Date().toISOString() });
+  res.status(200).json({
+    success: true,
+    code: 'SERVICE_READY',
+    status: 'ready',
+    timestamp: new Date().toISOString(),
+    requestId: req.id
+  });
 });
 
 app.get('/health/live', (req, res) => {
-  res.status(200).json({ status: 'alive', timestamp: new Date().toISOString() });
+  setOperationalNoCacheHeaders(res);
+  res.status(200).json({
+    success: true,
+    code: 'SERVICE_ALIVE',
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    requestId: req.id
+  });
 });
 
 // Cache stats endpoint (for monitoring)
 app.get('/api/cache/stats', async (req, res) => {
+  setOperationalNoCacheHeaders(res);
   const cacheService = require('./services/cache.service');
   res.json({
     success: true,
+    code: 'CACHE_STATS',
+    requestId: req.id,
     stats: cacheService.getStats()
   });
 });
 
 /** Public Razorpay key_id for hosted Checkout (never expose key_secret). */
 app.get('/api/public/razorpay-key', (req, res) => {
+  setOperationalNoCacheHeaders(res);
   const keyId = String(process.env.RAZORPAY_KEY_ID || '').trim();
   if (!keyId) {
     return res.status(503).json({
       success: false,
+      code: 'RAZORPAY_KEY_NOT_CONFIGURED',
+      requestId: req.id,
       message: 'RAZORPAY_KEY_ID is not set on the server'
     });
   }
-  return res.json({ success: true, keyId: String(keyId).trim() });
+  return res.json({
+    success: true,
+    code: 'RAZORPAY_KEY_OK',
+    requestId: req.id,
+    keyId: String(keyId).trim()
+  });
 });
 
 // Helper function to get event loop lag
@@ -337,10 +468,13 @@ function getEventLoopLag() {
 // ============================================================================
 
 app.get('/api', (req, res) => {
+  setOperationalNoCacheHeaders(res);
   res.json({
     success: true,
+    code: 'API_INFO',
     message: 'E-Commerce Platform API v1.0',
     status: 'running',
+    requestId: req.id,
     version: '1.0.0',
     environment: NODE_ENV,
     userType: req.userType,
@@ -390,6 +524,7 @@ app.use('/api/wholesaler', wholesalerRoutes);
 app.use((req, res) => {
   res.status(404).json({
     success: false,
+    code: 'ROUTE_NOT_FOUND',
     error: 'Not Found',
     message: `Cannot ${req.method} ${req.path}`,
     timestamp: new Date().toISOString(),
@@ -412,6 +547,7 @@ app.use((err, req, res, next) => {
 
   res.status(statusCode).json({
     success: false,
+    code: err.code || (statusCode === 500 ? 'INTERNAL_SERVER_ERROR' : 'REQUEST_FAILED'),
     error: err.name || 'Error',
     message,
     timestamp: new Date().toISOString(),
@@ -427,6 +563,7 @@ async function startApplication() {
   try {
     logger.info(`Starting application in ${NODE_ENV} mode`);
     logger.info(`Node Version: ${process.version}`);
+    validateStartupConfig();
 
     // Initialize services
     initCloudinary();

@@ -1,7 +1,7 @@
 // controllers/coupon.controller.js
 const Coupon = require('../models/Coupon');
-const cart = require('../models/cart');
-const { evaluatecartForCheckout, couponUserEligible } = require('../services/checkoutComputation.service');
+const Cart = require('../models/cart');
+const { evaluateCartForCheckout, couponUserEligible } = require('../services/checkoutComputation.service');
 
 // ==================== ADMIN FUNCTIONS ====================
 
@@ -258,14 +258,14 @@ const validateCoupon = async (req, res) => {
 
         let effectiveSubtotal = Number(subtotal);
         if (useServercart || subtotal === undefined || subtotal === null) {
-            const cart = await cart.findOne({ userId });
-            if (!cart?.items?.length) {
+            const cartDoc = await Cart.findOne({ userId });
+            if (!cartDoc?.items?.length) {
                 return res.status(400).json({
                     success: false,
                     message: 'cart is empty — add items before applying a coupon'
                 });
             }
-            const ev = await evaluatecartForCheckout(cart, finalUserType, null);
+            const ev = await evaluateCartForCheckout(cartDoc, finalUserType, null, req.storefront || 'ecomm');
             effectiveSubtotal = ev.subtotal;
         }
 

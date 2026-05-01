@@ -219,7 +219,9 @@ async function resolveCouponDiscount(couponCode, subtotal, finalUserType, sessio
   const isExpired = coupon.expiryDate && coupon.expiryDate < new Date();
   const meetsMinOrder = !coupon.minOrderValue || subtotal >= coupon.minOrderValue;
   const isUserEligible = couponUserEligible(coupon, finalUserType);
-  const hasUsageLeft = !coupon.usageLimit || coupon.usedCount < coupon.usageLimit;
+  const usageLimit = Number(coupon.usageLimit);
+  const isUsageLimited = Number.isFinite(usageLimit) && usageLimit > 0;
+  const hasUsageLeft = !isUsageLimited || Number(coupon.usedCount || 0) < usageLimit;
 
   if (!isExpired && meetsMinOrder && isUserEligible && hasUsageLeft) {
     if (coupon.discountType === 'percentage') {
@@ -234,9 +236,20 @@ async function resolveCouponDiscount(couponCode, subtotal, finalUserType, sessio
     appliedCouponCode = coupon.code;
 
     if (consumeUsage) {
-      let uq = Coupon.updateOne({ _id: coupon._id }, { $inc: { usedCount: 1 } });
+      const usageFilter = { _id: coupon._id };
+      if (isUsageLimited) {
+        usageFilter.usedCount = { $lt: usageLimit };
+      }
+
+      let uq = Coupon.updateOne(usageFilter, { $inc: { usedCount: 1 } });
       if (session) uq = uq.session(session);
-      await uq;
+      const usageResult = await uq;
+      if (usageResult.modifiedCount !== 1) {
+        const err = new Error('Coupon usage limit has been reached');
+        err.statusCode = 409;
+        err.code = 'COUPON_USAGE_EXHAUSTED';
+        throw err;
+      }
     }
   }
 
