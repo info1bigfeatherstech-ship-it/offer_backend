@@ -373,12 +373,12 @@ exports.createOrder = async (req, res) => {
             throw createInvalidPaymentMethodError();
         }
         const normalizedOnlinePaymentMode = normalizePaymentPlan(onlinePaymentMode);
-        const hasAdvancePercentInput =
+        const hasAdvancePercentInputInRequest =
             paymentAdvancePercent !== undefined &&
             paymentAdvancePercent !== null &&
             String(paymentAdvancePercent).trim() !== '';
         const normalizedAdvancePercent = normalizeAdvancePaymentPercent(paymentAdvancePercent);
-        if (normalizedOnlinePaymentMode === 'advance' && hasAdvancePercentInput && normalizedAdvancePercent == null) {
+        if (normalizedOnlinePaymentMode === 'advance' && hasAdvancePercentInputInRequest && normalizedAdvancePercent == null) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
                 await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
@@ -519,6 +519,35 @@ exports.createOrder = async (req, res) => {
                 message: 'Coupon changed after quote confirmation. Please refresh quote before proceeding.'
             });
         }
+        const quoteHasPaymentLock = Boolean(String(quote.confirmedPaymentMethod || '').trim());
+        const confirmedPaymentMethod = quoteHasPaymentLock
+            ? normalizePaymentMethod(quote.confirmedPaymentMethod)
+            : normalizedPaymentMethod;
+        const confirmedPaymentPlan = quoteHasPaymentLock
+            ? normalizePaymentPlan(quote.confirmedPaymentPlan || 'full')
+            : normalizedOnlinePaymentMode;
+        const confirmedAdvancePercentRaw = normalizeAdvancePaymentPercent(quote.confirmedAdvancePercent);
+        const defaultAdvancePercent = resolveDefaultAdvancePercent();
+        const requestedAdvancePercent = normalizedAdvancePercent || defaultAdvancePercent;
+        const confirmedAdvancePercent = confirmedPaymentPlan === 'advance'
+            ? (confirmedAdvancePercentRaw || defaultAdvancePercent)
+            : null;
+
+        if (confirmedPaymentMethod !== normalizedPaymentMethod) {
+            throw createQuoteStaleError('payment_method_changed', {
+                message: 'Payment method changed after quote confirmation. Please reconfirm checkout.'
+            });
+        }
+        if (confirmedPaymentPlan !== normalizedOnlinePaymentMode) {
+            throw createQuoteStaleError('payment_plan_changed', {
+                message: 'Payment plan changed after quote confirmation. Please reconfirm checkout.'
+            });
+        }
+        if (confirmedPaymentPlan === 'advance' && hasAdvancePercentInputInRequest && requestedAdvancePercent !== confirmedAdvancePercent) {
+            throw createQuoteStaleError('advance_percent_changed', {
+                message: 'Advance percent changed after quote confirmation. Please reconfirm checkout.'
+            });
+        }
         if (normalizedPaymentMethod === 'cod' && quote.shippingMeta?.codAvailable === false) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
@@ -607,14 +636,13 @@ exports.createOrder = async (req, res) => {
 
         await reserveInventoryAtomically(lines, session);
 
-        const defaultAdvancePercent = resolveDefaultAdvancePercent();
-        const advancePercent = normalizedAdvancePercent || defaultAdvancePercent;
+        const advancePercent = confirmedAdvancePercent || defaultAdvancePercent;
         let razorpayChargePaise = Math.round(roundMoney2(totalAmount) * 100);
         let splitMode = 'full';
         let balanceDueInr = 0;
         let amountPaidInr = 0;
 
-        if (normalizedPaymentMethod === 'online' && String(normalizedOnlinePaymentMode).toLowerCase() === 'advance') {
+        if (normalizedPaymentMethod === 'online' && String(confirmedPaymentPlan).toLowerCase() === 'advance') {
             const totalInr = roundMoney2(totalAmount);
             const advInrRaw = roundMoney2((totalInr * advancePercent) / 100);
             const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));

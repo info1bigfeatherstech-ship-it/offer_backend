@@ -393,12 +393,18 @@ exports.confirmCheckout = async (req, res) => {
     quote.lastValidatedAt = new Date();
     quote.status = 'confirmed';
     quote.confirmedAt = new Date();
+    quote.confirmedPaymentMethod = normalizedPaymentMethod;
+    quote.confirmedPaymentPlan = normalizedPaymentPlan;
+    quote.confirmedAdvancePercent = normalizedPaymentPlan === 'advance'
+      ? (normalizedAdvancePercent ?? null)
+      : null;
     await quote.save();
 
     logger.info('Checkout quote confirmed', buildRequestLogContext(req, {
       quoteId: String(quote._id),
       paymentMethod: normalizedPaymentMethod,
-      paymentPlan: normalizedPaymentPlan
+      paymentPlan: normalizedPaymentPlan,
+      paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? (normalizedAdvancePercent ?? null) : null
     }));
 
     return res.json({
