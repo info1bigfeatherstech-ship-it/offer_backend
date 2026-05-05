@@ -21,6 +21,9 @@ const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service'
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
+    ALLOWED_ADVANCE_PAYMENT_PERCENTS,
+    normalizeAdvancePaymentPercent,
+    resolveDefaultAdvancePercent,
     normalizeIdempotencyKey,
     createInvalidPaymentMethodError,
     createQuoteExpiredError,
@@ -195,6 +198,7 @@ function buildOrderResponsePayload(order, {
     normalizedPaymentMethod,
     discount,
     splitMode,
+    advancePercent = null,
     appliedCouponCode,
     razorpayOrder = null,
     idempotentReplay = false
@@ -211,7 +215,11 @@ function buildOrderResponsePayload(order, {
             orderStatus: order.orderStatus,
             paymentStatus: order.paymentStatus,
             balanceDueInr: order.balanceDueInr,
-            onlinePaymentMode: splitMode || order.paymentInfo?.splitMode || 'full'
+            onlinePaymentMode: splitMode || order.paymentInfo?.splitMode || 'full',
+            paymentAdvancePercent:
+                advancePercent ??
+                order.paymentInfo?.advancePercent ??
+                null
         },
         appliedCoupon: appliedCouponCode ?? order.appliedCoupon?.code ?? null,
         razorpayOrder: razorpayOrder ? {
@@ -235,6 +243,7 @@ async function resolveIdempotencyRecord({ req, body }) {
         paymentMethod: body.paymentMethod || null,
         couponCode: body.couponCode || null,
         onlinePaymentMode: body.onlinePaymentMode || 'full',
+        paymentAdvancePercent: body.paymentAdvancePercent || null,
         quoteId: body.quoteId || null
     });
 
@@ -330,7 +339,7 @@ exports.createOrder = async (req, res) => {
 
     try {
         // Never trust client totals — only address, payment channel, user type, coupon code, Razorpay split mode
-        const { addressId, paymentMethod, couponCode, onlinePaymentMode = 'full', quoteId } = req.body || {};
+        const { addressId, paymentMethod, couponCode, onlinePaymentMode = 'full', paymentAdvancePercent, quoteId } = req.body || {};
         const idempotency = await resolveIdempotencyRecord({ req, body: req.body || {} });
         if (idempotency.existingOrder) {
             logger.info('Replaying existing order for idempotent request', buildRequestLogContext(req, {
@@ -342,6 +351,7 @@ exports.createOrder = async (req, res) => {
                     normalizedPaymentMethod: idempotency.existingOrder.paymentInfo?.method || 'online',
                     discount: idempotency.existingOrder.discount,
                     splitMode: idempotency.existingOrder.paymentInfo?.splitMode,
+                    advancePercent: idempotency.existingOrder.paymentInfo?.advancePercent ?? null,
                     appliedCouponCode: idempotency.existingOrder.appliedCoupon?.code || null,
                     razorpayOrder: idempotency.existingOrder.paymentInfo?.razorpayOrderId
                         ? {
@@ -363,6 +373,22 @@ exports.createOrder = async (req, res) => {
             throw createInvalidPaymentMethodError();
         }
         const normalizedOnlinePaymentMode = normalizePaymentPlan(onlinePaymentMode);
+        const hasAdvancePercentInput =
+            paymentAdvancePercent !== undefined &&
+            paymentAdvancePercent !== null &&
+            String(paymentAdvancePercent).trim() !== '';
+        const normalizedAdvancePercent = normalizeAdvancePaymentPercent(paymentAdvancePercent);
+        if (normalizedOnlinePaymentMode === 'advance' && hasAdvancePercentInput && normalizedAdvancePercent == null) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_ADVANCE_PERCENT',
+                message: `paymentAdvancePercent must be one of: ${ALLOWED_ADVANCE_PAYMENT_PERCENTS.join(', ')}`
+            });
+        }
 
         if (!quoteId) {
             await abortTransactionSafely(session);
@@ -581,7 +607,8 @@ exports.createOrder = async (req, res) => {
 
         await reserveInventoryAtomically(lines, session);
 
-        const advancePercent = Math.min(90, Math.max(1, Number(process.env.CHECKOUT_ADVANCE_PERCENT) || 25));
+        const defaultAdvancePercent = resolveDefaultAdvancePercent();
+        const advancePercent = normalizedAdvancePercent || defaultAdvancePercent;
         let razorpayChargePaise = Math.round(roundMoney2(totalAmount) * 100);
         let splitMode = 'full';
         let balanceDueInr = 0;
@@ -621,6 +648,7 @@ exports.createOrder = async (req, res) => {
                 status: 'initiated',
                 amountPaise: razorpayChargePaise,
                 splitMode,
+                advancePercent: splitMode === 'advance' ? advancePercent : null,
                 fullOrderAmountPaise: Math.round(roundMoney2(totalAmount) * 100),
                 quoteId: String(quote._id),
                 sessions: []
@@ -774,6 +802,7 @@ exports.createOrder = async (req, res) => {
                 normalizedPaymentMethod,
                 discount,
                 splitMode,
+                advancePercent: splitMode === 'advance' ? advancePercent : null,
                 appliedCouponCode,
                 razorpayOrder
             })

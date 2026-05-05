@@ -13,6 +13,8 @@ const {
 const {
   normalizePaymentMethod,
   normalizePaymentPlan,
+  ALLOWED_ADVANCE_PAYMENT_PERCENTS,
+  normalizeAdvancePaymentPercent,
   createInvalidPaymentMethodError,
   createQuoteExpiredError,
   createQuoteStaleError,
@@ -285,7 +287,7 @@ exports.confirmCheckout = async (req, res) => {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
-    const { quoteId, paymentMethod, paymentPlan } = req.body || {};
+    const { quoteId, paymentMethod, paymentPlan, paymentAdvancePercent } = req.body || {};
 
     if (!quoteId) {
       return respondCheckoutInputError(res, 400, 'QUOTE_ID_REQUIRED', 'quoteId is required');
@@ -299,6 +301,19 @@ exports.confirmCheckout = async (req, res) => {
       throw createInvalidPaymentMethodError();
     }
     const normalizedPaymentPlan = normalizePaymentPlan(paymentPlan);
+    const hasAdvancePercentInput =
+      paymentAdvancePercent !== undefined &&
+      paymentAdvancePercent !== null &&
+      String(paymentAdvancePercent).trim() !== '';
+    const normalizedAdvancePercent = normalizeAdvancePaymentPercent(paymentAdvancePercent);
+    if (normalizedPaymentPlan === 'advance' && hasAdvancePercentInput && normalizedAdvancePercent == null) {
+      return respondCheckoutInputError(
+        res,
+        400,
+        'INVALID_ADVANCE_PERCENT',
+        `paymentAdvancePercent must be one of: ${ALLOWED_ADVANCE_PAYMENT_PERCENTS.join(', ')}`
+      );
+    }
 
     const quote = await CheckoutQuote.findOne({ _id: quoteId, userId, status: 'active' });
     if (!quote) {
@@ -407,6 +422,7 @@ exports.confirmCheckout = async (req, res) => {
           addressId: String(quote.addressId),
           paymentMethod: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
           onlinePaymentMode: normalizedPaymentPlan,
+          paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? normalizedAdvancePercent : undefined,
           couponCode: quote.couponCodeUpper || undefined,
           quoteId: String(quote._id)
         }

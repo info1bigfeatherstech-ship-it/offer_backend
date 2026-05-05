@@ -13,6 +13,24 @@ const normalizePaymentPlan = (value) => {
   return 'full';
 };
 
+const ALLOWED_ADVANCE_PAYMENT_PERCENTS = Object.freeze([20, 50, 75]);
+
+const normalizeAdvancePaymentPercent = (value, { allowNull = true } = {}) => {
+  if (value === null || value === undefined || value === '') {
+    return allowNull ? null : ALLOWED_ADVANCE_PAYMENT_PERCENTS[0];
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const rounded = Math.round(numeric);
+  if (!ALLOWED_ADVANCE_PAYMENT_PERCENTS.includes(rounded)) return null;
+  return rounded;
+};
+
+const resolveDefaultAdvancePercent = () => {
+  const fromEnv = normalizeAdvancePaymentPercent(process.env.CHECKOUT_ADVANCE_PERCENT);
+  return fromEnv || 25;
+};
+
 const normalizeIdempotencyKey = (value) => {
   const normalized = String(value || '').trim();
   if (!normalized) return null;
@@ -96,6 +114,9 @@ module.exports = {
   STALE_QUOTE_HTTP_STATUS,
   normalizePaymentMethod,
   normalizePaymentPlan,
+  ALLOWED_ADVANCE_PAYMENT_PERCENTS,
+  normalizeAdvancePaymentPercent,
+  resolveDefaultAdvancePercent,
   normalizeIdempotencyKey,
   createCheckoutFlowError,
   createInvalidPaymentMethodError,
