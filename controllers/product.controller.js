@@ -74,6 +74,47 @@ function parseBoolean(value) {
   return false;
 }
 
+function parsePositiveNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num;
+}
+
+function validateRequiredShippingFields(rawShipping) {
+  const shipping = rawShipping && typeof rawShipping === "object" ? rawShipping : {};
+  const dimensions =
+    shipping.dimensions && typeof shipping.dimensions === "object"
+      ? shipping.dimensions
+      : {};
+
+  const weight = parsePositiveNumber(shipping.weight);
+  const length = parsePositiveNumber(dimensions.length);
+  const width = parsePositiveNumber(dimensions.width);
+  const height = parsePositiveNumber(dimensions.height);
+
+  if (weight == null) {
+    return {
+      valid: false,
+      message: "Shipping weight is required and must be greater than 0"
+    };
+  }
+  if (length == null || width == null || height == null) {
+    return {
+      valid: false,
+      message: "Shipping dimensions (length, width, height) are required and must be greater than 0"
+    };
+  }
+
+  return {
+    valid: true,
+    shipping: {
+      weight,
+      dimensions: { length, width, height }
+    }
+  };
+}
+
 function hasActiveWholesaleVariantForCatalog(doc) {
   if (!doc || !Array.isArray(doc.variants)) return false;
   return doc.variants.some((v) => {
@@ -178,6 +219,19 @@ function parseProductCodeParts(productCode, contextLabel = 'productCode', { requ
   throw new Error(
     `${contextLabel}: invalid productCode "${normalized}". Use BASE (single variant) or BASE-XX (multi-variant).`
   );
+}
+
+/**
+ * Multipart / legacy clients may send productCode or ProductCode on each variant object.
+ * @returns {string} trimmed raw code or empty string
+ */
+function getIncomingVariantProductCode(variant) {
+  if (!variant || typeof variant !== 'object') return '';
+  const raw =
+    variant.productCode !== undefined && variant.productCode !== null
+      ? variant.productCode
+      : variant.ProductCode;
+  return String(raw ?? '').trim();
 }
 
 function assertVariantCodeSeries(codes, contextLabel = 'variants') {
@@ -630,7 +684,15 @@ const createProduct = async (req, res) => {
 
     let variantsInput = variantsRaw;
     if (typeof variantsRaw === "string") {
-      variantsInput = JSON.parse(variantsRaw);
+      try {
+        variantsInput = JSON.parse(variantsRaw);
+      } catch {
+        return res.status(400).json({
+          success: false,
+          code: "VARIANTS_JSON_INVALID",
+          message: "Invalid JSON in variants field"
+        });
+      }
     }
 
     if (!Array.isArray(variantsInput) || variantsInput.length === 0) {
@@ -640,24 +702,30 @@ const createProduct = async (req, res) => {
       });
     }
 
-    // Validate productCode format + series at form level before heavy processing (uploads etc.)
+    // Validate productCode format + series before uploads. Same rules as addVariant: BASE-XX only,
+    // shared base, continuous 01..N. Accept productCode or ProductCode on each row.
     const normalizedCodes = [];
     for (let i = 0; i < variantsInput.length; i++) {
-      const codeRaw = variantsInput[i]?.productCode;
+      const codeRaw = getIncomingVariantProductCode(variantsInput[i]);
       if (!codeRaw) {
         return res.status(400).json({
           success: false,
+          code: "PRODUCT_CODE_REQUIRED",
           message: `productCode is required for variant ${i}`
         });
       }
       try {
-        const parsed = parseProductCodeParts(codeRaw, `variant ${i}`);
+        const parsed = parseProductCodeParts(codeRaw, `variant ${i} productCode`, { requireSuffix: true });
         normalizedCodes.push(parsed.normalized);
         variantsInput[i].productCode = parsed.normalized;
+        if (Object.prototype.hasOwnProperty.call(variantsInput[i], "ProductCode")) {
+          delete variantsInput[i].ProductCode;
+        }
       } catch (err) {
         return res.status(400).json({
           success: false,
-          message: err.message
+          code: "PRODUCT_CODE_INVALID",
+          message: err.message || "Invalid productCode"
         });
       }
     }
@@ -667,7 +735,8 @@ const createProduct = async (req, res) => {
     } catch (err) {
       return res.status(400).json({
         success: false,
-        message: err.message
+        code: "PRODUCT_CODE_SERIES_INVALID",
+        message: err.message || "Invalid productCode series for create"
       });
     }
 
@@ -834,6 +903,16 @@ const createProduct = async (req, res) => {
       });
     }
 
+    const shippingValidation = validateRequiredShippingFields(parsedShipping);
+    if (!shippingValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "SHIPPING_FIELDS_REQUIRED",
+        message: shippingValidation.message
+      });
+    }
+    const normalizedShipping = shippingValidation.shipping;
+
     // =============================
     //  VALIDATE HSN CODE (Optional)
     // =============================
@@ -893,10 +972,7 @@ const createProduct = async (req, res) => {
       isFeatured,
       soldInfo: parsedSoldInfo || { enabled: false, count: 0 },
       fomo: parsedFomo || { enabled: false, type: "viewing_now", viewingNow: 0 },
-      shipping: parsedShipping || {
-        weight: 0,
-        dimensions: { length: 0, width: 0, height: 0 }
-      },
+      shipping: normalizedShipping,
       attributes: parsedAttributes || [],
       variants,
       price: {
@@ -3436,7 +3512,7 @@ const updateProduct = async (req, res) => {
     if (updates.shipping !== undefined) {
       const parsed = parseIfString(updates.shipping, {});
       doc.shipping = {
-        ...doc.shipping.toObject(),
+        ...(doc.shipping?.toObject ? doc.shipping.toObject() : {}),
         ...parsed,
         weight: Number(parsed.weight ?? 0),
         dimensions: {
@@ -3446,6 +3522,16 @@ const updateProduct = async (req, res) => {
         }
       };
     }
+
+    const updatedShippingValidation = validateRequiredShippingFields(doc.shipping);
+    if (!updatedShippingValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "SHIPPING_FIELDS_REQUIRED",
+        message: updatedShippingValidation.message
+      });
+    }
+    doc.shipping = updatedShippingValidation.shipping;
 
     // Product-level attributes (skip when this request targets a variant and sends variant attrs in `attributes`)
     if (updates.attributes !== undefined && !targetProductCode) {
