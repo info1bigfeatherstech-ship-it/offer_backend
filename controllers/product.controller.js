@@ -4713,53 +4713,118 @@ const bulkHardDelete = async (req, res) => {
 
 
 //get All prodcuts or admin with limits and q 
+// const getAllProductsAdmin = async (req, res) => {
+//   try {
+//     let { page = 1, limit = 20 } = req.query;
+
+//     page = Number(page);
+//     // limit = Number(limit);
+//     limit = Math.min(100, Math.max(1, Number(limit))); // max 10
+
+//     const skip = (page - 1) * limit;
+
+//     const query = {};
+
+//     const products = await Product.find(query)
+//       .populate('category', 'name slug status')
+//       .sort({ createdAt: -1 }) // latest first
+//       .skip(skip)
+//       .limit(limit)
+//       .lean({ virtuals: true });
+
+//     const enrichedProducts = products.map((product) => {
+//       const variants = Array.isArray(product.variants) ? product.variants : [];
+//       const variantsWithAvailability = variants.map((variant) => ({
+//         ...variant,
+//         availability: getVariantAvailabilityByStorefront(variant)
+//       }));
+//       return {
+//         ...product,
+//         variants: variantsWithAvailability
+//       };
+//     });
+
+//     const totalProducts = await Product.countDocuments();
+
+//     return res.status(200).json({
+//       success: true,
+//        totalProducts,
+//       totalPages: Math.ceil(totalProducts / limit),
+//       currentPage: page,
+//       products: enrichedProducts
+//     });
+
+//   } catch (error) {
+//     console.error("Get all products error:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Error fetching products",
+//       error: error.message
+//     });
+//   }
+// };
 const getAllProductsAdmin = async (req, res) => {
   try {
     let { page = 1, limit = 20 } = req.query;
 
     page = Number(page);
-    // limit = Number(limit);
-    limit = Math.min(100, Math.max(1, Number(limit))); // max 10
+    limit = Math.min(100, Math.max(1, Number(limit)));
 
     const skip = (page - 1) * limit;
 
-    const query = {};
+    const [products, totalProducts] = await Promise.all([
+      Product.find({})
+        .populate("category", "name slug status")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean({ virtuals: true }),
 
-    const products = await Product.find(query)
-      .populate('category', 'name slug status')
-      .sort({ createdAt: -1 }) // latest first
-      .skip(skip)
-      .limit(limit)
-      .lean({ virtuals: true });
+      Product.countDocuments({}),
+    ]);
 
-    const enrichedProducts = products.map((product) => {
+    // get ids
+    const productIds = products.map((p) => p._id);
+
+    // fetch tags
+    const productTags = await ProductTag.find({
+      product: { $in: productIds },
+    }).lean();
+
+    // make tag map
+    const tagMap = {};
+    productTags.forEach((item) => {
+      tagMap[item.product.toString()] = item.tags || [];
+    });
+
+    // merge tags + variants availability
+    const finalProducts = products.map((product) => {
       const variants = Array.isArray(product.variants) ? product.variants : [];
-      const variantsWithAvailability = variants.map((variant) => ({
-        ...variant,
-        availability: getVariantAvailabilityByStorefront(variant)
-      }));
+
       return {
         ...product,
-        variants: variantsWithAvailability
+        tags: tagMap[product._id.toString()] || [],
+        variants: variants.map((variant) => ({
+          ...variant,
+          availability: getVariantAvailabilityByStorefront(variant),
+        })),
       };
     });
 
-    const totalProducts = await Product.countDocuments();
-
     return res.status(200).json({
       success: true,
-       totalProducts,
+      totalProducts,
       totalPages: Math.ceil(totalProducts / limit),
       currentPage: page,
-      products: enrichedProducts
+      products: finalProducts, // <- THIS
     });
-
   } catch (error) {
     console.error("Get all products error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Error fetching products",
-      error: error.message
+      error: error.message,
     });
   }
 };
