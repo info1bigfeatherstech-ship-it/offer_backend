@@ -3413,6 +3413,7 @@ const updateProduct = async (req, res) => {
 
     const variant =
       variantIndex >= 0 ? doc.variants[variantIndex] : null;
+    const isVariantScopedUpdate = Boolean(targetProductCode);
 
     // -------- HSN / GST / fragile (product) --------
     if (updates.hsnCode !== undefined) {
@@ -3523,15 +3524,22 @@ const updateProduct = async (req, res) => {
       };
     }
 
-    const updatedShippingValidation = validateRequiredShippingFields(doc.shipping);
-    if (!updatedShippingValidation.valid) {
-      return res.status(400).json({
-        success: false,
-        code: "SHIPPING_FIELDS_REQUIRED",
-        message: updatedShippingValidation.message
-      });
+    // Enforce required shipping fields for product-level updates.
+    // Variant-only updates use the same endpoint (targeted by productCode), so do not
+    // block them unless shipping payload is explicitly being changed in that request.
+    const shouldValidateShippingForRequest =
+      !isVariantScopedUpdate || updates.shipping !== undefined;
+    if (shouldValidateShippingForRequest) {
+      const updatedShippingValidation = validateRequiredShippingFields(doc.shipping);
+      if (!updatedShippingValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          code: "SHIPPING_FIELDS_REQUIRED",
+          message: updatedShippingValidation.message
+        });
+      }
+      doc.shipping = updatedShippingValidation.shipping;
     }
-    doc.shipping = updatedShippingValidation.shipping;
 
     // Product-level attributes (skip when this request targets a variant and sends variant attrs in `attributes`)
     if (updates.attributes !== undefined && !targetProductCode) {
