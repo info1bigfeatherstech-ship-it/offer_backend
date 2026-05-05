@@ -1,7 +1,7 @@
 // controllers/user-product.controller.js
 const Product = require('../models/Product');
 const Category = require('../models/Category');
-
+const ProductTag = require('../models/ProductTag');
 const cacheService = require('../services/cache.service');
 const cacheConfig = require('../config/cache.config');
 const { setApiCacheHeaders } = require('../utils/apiCacheHeaders');

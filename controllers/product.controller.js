@@ -1,5 +1,6 @@
 const Product = require('../models/Product');
 const Category = require('../models/Category');
+const ProductTag = require('../models/ProductTag');
 const mongoose = require('mongoose');
 const slugify = require('slugify');
 const { generateSlug, generateSku } = require('../utils/productUtils');
