@@ -12,9 +12,8 @@ const {
 } = require('../services/checkoutComputation.service');
 const {
   normalizePaymentMethod,
-  normalizePaymentPlan,
   ALLOWED_ADVANCE_PAYMENT_PERCENTS,
-  normalizeAdvancePaymentPercent,
+  resolveAdvancePaymentSelection,
   createInvalidPaymentMethodError,
   createQuoteExpiredError,
   createQuoteStaleError,
@@ -300,13 +299,16 @@ exports.confirmCheckout = async (req, res) => {
     if (!normalizedPaymentMethod) {
       throw createInvalidPaymentMethodError();
     }
-    const normalizedPaymentPlan = normalizePaymentPlan(paymentPlan);
-    const hasAdvancePercentInput =
-      paymentAdvancePercent !== undefined &&
-      paymentAdvancePercent !== null &&
-      String(paymentAdvancePercent).trim() !== '';
-    const normalizedAdvancePercent = normalizeAdvancePaymentPercent(paymentAdvancePercent);
-    if (normalizedPaymentPlan === 'advance' && hasAdvancePercentInput && normalizedAdvancePercent == null) {
+    const {
+      normalizedPaymentPlan,
+      hasAdvancePercentInput,
+      normalizedAdvancePercentInput,
+      effectiveAdvancePercent
+    } = resolveAdvancePaymentSelection({
+      paymentPlan,
+      paymentAdvancePercent
+    });
+    if (normalizedPaymentPlan === 'advance' && hasAdvancePercentInput && normalizedAdvancePercentInput == null) {
       return respondCheckoutInputError(
         res,
         400,
@@ -396,7 +398,7 @@ exports.confirmCheckout = async (req, res) => {
     quote.confirmedPaymentMethod = normalizedPaymentMethod;
     quote.confirmedPaymentPlan = normalizedPaymentPlan;
     quote.confirmedAdvancePercent = normalizedPaymentPlan === 'advance'
-      ? (normalizedAdvancePercent ?? null)
+      ? effectiveAdvancePercent
       : null;
     await quote.save();
 
@@ -404,7 +406,7 @@ exports.confirmCheckout = async (req, res) => {
       quoteId: String(quote._id),
       paymentMethod: normalizedPaymentMethod,
       paymentPlan: normalizedPaymentPlan,
-      paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? (normalizedAdvancePercent ?? null) : null
+      paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? effectiveAdvancePercent : null
     }));
 
     return res.json({
@@ -428,7 +430,7 @@ exports.confirmCheckout = async (req, res) => {
           addressId: String(quote.addressId),
           paymentMethod: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
           onlinePaymentMode: normalizedPaymentPlan,
-          paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? normalizedAdvancePercent : undefined,
+          paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? effectiveAdvancePercent : undefined,
           couponCode: quote.couponCodeUpper || undefined,
           quoteId: String(quote._id)
         }

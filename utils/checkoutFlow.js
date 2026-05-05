@@ -9,11 +9,18 @@ const normalizePaymentMethod = (value) => {
 
 const normalizePaymentPlan = (value) => {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'partial' || normalized === 'advance') return 'advance';
+  if (normalized === 'partial' || normalized === 'advance' || normalized === 'half' || normalized === 'seventy') return 'advance';
   return 'full';
 };
 
-const ALLOWED_ADVANCE_PAYMENT_PERCENTS = Object.freeze([20, 50, 75]);
+const ALLOWED_ADVANCE_PAYMENT_PERCENTS = Object.freeze([25, 50, 75]);
+
+const inferAdvancePercentFromPlanAlias = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'half') return 50;
+  if (normalized === 'seventy') return 75;
+  return null;
+};
 
 const normalizeAdvancePaymentPercent = (value, { allowNull = true } = {}) => {
   if (value === null || value === undefined || value === '') {
@@ -29,6 +36,31 @@ const normalizeAdvancePaymentPercent = (value, { allowNull = true } = {}) => {
 const resolveDefaultAdvancePercent = () => {
   const fromEnv = normalizeAdvancePaymentPercent(process.env.CHECKOUT_ADVANCE_PERCENT);
   return fromEnv || 25;
+};
+
+const resolveAdvancePaymentSelection = ({
+  paymentPlan,
+  paymentAdvancePercent
+} = {}) => {
+  const normalizedPaymentPlan = normalizePaymentPlan(paymentPlan);
+  const hasAdvancePercentInput =
+    paymentAdvancePercent !== undefined &&
+    paymentAdvancePercent !== null &&
+    String(paymentAdvancePercent).trim() !== '';
+  const normalizedAdvancePercentInput = normalizeAdvancePaymentPercent(paymentAdvancePercent);
+
+  return {
+    normalizedPaymentPlan,
+    hasAdvancePercentInput,
+    normalizedAdvancePercentInput,
+    effectiveAdvancePercent: normalizedPaymentPlan === 'advance'
+      ? (
+          normalizedAdvancePercentInput ??
+          inferAdvancePercentFromPlanAlias(paymentPlan) ??
+          resolveDefaultAdvancePercent()
+        )
+      : null
+  };
 };
 
 const normalizeIdempotencyKey = (value) => {
@@ -116,7 +148,9 @@ module.exports = {
   normalizePaymentPlan,
   ALLOWED_ADVANCE_PAYMENT_PERCENTS,
   normalizeAdvancePaymentPercent,
+  inferAdvancePercentFromPlanAlias,
   resolveDefaultAdvancePercent,
+  resolveAdvancePaymentSelection,
   normalizeIdempotencyKey,
   createCheckoutFlowError,
   createInvalidPaymentMethodError,

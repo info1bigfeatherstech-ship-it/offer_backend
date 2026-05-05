@@ -24,6 +24,7 @@ const {
     ALLOWED_ADVANCE_PAYMENT_PERCENTS,
     normalizeAdvancePaymentPercent,
     resolveDefaultAdvancePercent,
+    resolveAdvancePaymentSelection,
     normalizeIdempotencyKey,
     createInvalidPaymentMethodError,
     createQuoteExpiredError,
@@ -372,12 +373,15 @@ exports.createOrder = async (req, res) => {
         if (!normalizedPaymentMethod) {
             throw createInvalidPaymentMethodError();
         }
-        const normalizedOnlinePaymentMode = normalizePaymentPlan(onlinePaymentMode);
-        const hasAdvancePercentInputInRequest =
-            paymentAdvancePercent !== undefined &&
-            paymentAdvancePercent !== null &&
-            String(paymentAdvancePercent).trim() !== '';
-        const normalizedAdvancePercent = normalizeAdvancePaymentPercent(paymentAdvancePercent);
+        const {
+            normalizedPaymentPlan: normalizedOnlinePaymentMode,
+            hasAdvancePercentInput: hasAdvancePercentInputInRequest,
+            normalizedAdvancePercentInput: normalizedAdvancePercent,
+            effectiveAdvancePercent
+        } = resolveAdvancePaymentSelection({
+            paymentPlan: onlinePaymentMode,
+            paymentAdvancePercent
+        });
         if (normalizedOnlinePaymentMode === 'advance' && hasAdvancePercentInputInRequest && normalizedAdvancePercent == null) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
@@ -528,7 +532,7 @@ exports.createOrder = async (req, res) => {
             : normalizedOnlinePaymentMode;
         const confirmedAdvancePercentRaw = normalizeAdvancePaymentPercent(quote.confirmedAdvancePercent);
         const defaultAdvancePercent = resolveDefaultAdvancePercent();
-        const requestedAdvancePercent = normalizedAdvancePercent || defaultAdvancePercent;
+        const requestedAdvancePercent = effectiveAdvancePercent || defaultAdvancePercent;
         const confirmedAdvancePercent = confirmedPaymentPlan === 'advance'
             ? (confirmedAdvancePercentRaw || defaultAdvancePercent)
             : null;
