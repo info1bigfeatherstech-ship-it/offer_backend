@@ -147,7 +147,7 @@ const { verifyToken } = require('../middlewares/auth.middleware');
 const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
 const { uploadProductImages, uploadCSVFile, uploadBulkNewProductFiles } = require('../middlewares/upload.middleware');
 const productController = require('../controllers/product.controller');
-
+const updateProductTagController = require('../controllers/updateProductTag.controller');
 // Validation middleware to check for rejected fields
 const rejectSlugSku = (req, res, next) => {
   if ('slug' in req.body || 'sku' in req.body) {
@@ -210,6 +210,7 @@ router.get('/all', productController.getAllProductsAdmin);
 router.delete('/bulk-hard-delete', productController.bulkHardDelete);
 router.get('/active', productController.getAllActiveProducts);
             
+router.put("/updateFlags", updateProductTagController);
 // =============================================
 // SINGLE PRODUCT ACTIONS (with :slug, :productCode)
 // =============================================
