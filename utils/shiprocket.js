@@ -373,15 +373,132 @@ class ShiprocketService {
       return {
         success: true,
         shipmentId: data.shipment_id,
-        trackingNumber: data.awb_code || data.tracking_number,
+        awbCode: data.awb_code || data.tracking_number || null,
+        trackingNumber: data.awb_code || data.tracking_number || null,
         courier: data.courier_name,
         labelUrl: data.label_url,
+        providerStatus: data.status || null,
+        raw: data,
         mock: false
       };
     } catch (err) {
       logger.error('[Shiprocket] createShipment failed:', err.response?.data || err.message);
       return { success: false, error: err.response?.data || err.message };
     }
+  }
+
+  normalizeTrackingResponse(rawData) {
+    const root = rawData?.tracking_data || rawData?.data || rawData || {};
+    const shipmentTrack = root?.shipment_track || [];
+    const shipmentTrackItem = Array.isArray(shipmentTrack) ? shipmentTrack[0] : shipmentTrack;
+    const activities = root?.shipment_track_activities || root?.activities || [];
+    const events = Array.isArray(activities)
+      ? activities.map((entry) => ({
+          status: entry?.sr_status_label || entry?.status || entry?.activity || entry?.message || null,
+          code: entry?.sr_status || entry?.status_code || null,
+          location: entry?.location || entry?.city || null,
+          description: entry?.activity || entry?.message || entry?.status || null,
+          at: entry?.date || entry?.datetime || entry?.time || null,
+          raw: entry
+        }))
+      : [];
+
+    return {
+      success: true,
+      awbCode:
+        root?.awb_code ||
+        shipmentTrackItem?.awb_code ||
+        shipmentTrackItem?.awb ||
+        null,
+      shipmentId:
+        root?.shipment_id ||
+        shipmentTrackItem?.shipment_id ||
+        null,
+      courier:
+        shipmentTrackItem?.courier_name ||
+        shipmentTrackItem?.courier ||
+        root?.courier_name ||
+        null,
+      currentStatus:
+        root?.current_status ||
+        shipmentTrackItem?.current_status ||
+        shipmentTrackItem?.status ||
+        null,
+      estimatedDelivery:
+        shipmentTrackItem?.etd ||
+        root?.etd ||
+        null,
+      events,
+      raw: rawData
+    };
+  }
+
+  async getTrackingByAwb(awbCode) {
+    const awb = String(awbCode || '').trim();
+    if (!awb) {
+      return { success: false, code: 'TRACKING_AWB_REQUIRED', message: 'awbCode is required' };
+    }
+    if (!this.enabled) {
+      return { success: false, code: 'SHIPROCKET_DISABLED', message: 'Shiprocket is disabled' };
+    }
+
+    try {
+      const data = await this.requestWithAuth({
+        method: 'get',
+        url: `${this.baseURL}/external/courier/track/awb/${encodeURIComponent(awb)}`,
+        timeout: 20000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      return this.normalizeTrackingResponse(data);
+    } catch (err) {
+      logger.error('[Shiprocket] getTrackingByAwb failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'SHIPROCKET_TRACK_FAILED',
+        message: err.response?.data?.message || err.message || 'Failed to fetch tracking by AWB'
+      };
+    }
+  }
+
+  async getTrackingByShipmentId(shipmentId) {
+    const normalized = String(shipmentId || '').trim();
+    if (!normalized) {
+      return { success: false, code: 'TRACKING_SHIPMENT_ID_REQUIRED', message: 'shipmentId is required' };
+    }
+    if (!this.enabled) {
+      return { success: false, code: 'SHIPROCKET_DISABLED', message: 'Shiprocket is disabled' };
+    }
+
+    try {
+      const data = await this.requestWithAuth({
+        method: 'get',
+        url: `${this.baseURL}/external/courier/track/shipment/${encodeURIComponent(normalized)}`,
+        timeout: 20000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      return this.normalizeTrackingResponse(data);
+    } catch (err) {
+      logger.error('[Shiprocket] getTrackingByShipmentId failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'SHIPROCKET_TRACK_FAILED',
+        message: err.response?.data?.message || err.message || 'Failed to fetch tracking by shipment id'
+      };
+    }
+  }
+
+  async getTracking({ awbCode, shipmentId } = {}) {
+    if (awbCode) {
+      return this.getTrackingByAwb(awbCode);
+    }
+    if (shipmentId) {
+      return this.getTrackingByShipmentId(shipmentId);
+    }
+    return { success: false, code: 'TRACKING_REFERENCE_MISSING', message: 'awbCode or shipmentId is required' };
   }
 }
 

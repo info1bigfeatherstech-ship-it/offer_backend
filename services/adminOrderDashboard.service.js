@@ -217,6 +217,18 @@ function roundMoney(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
 
+function normalizeFinancialView(o) {
+  const orderStatus = String(o?.orderStatus || '').toLowerCase();
+  const paymentStatus = String(o?.paymentStatus || '').toLowerCase();
+  const amountPaidInr = roundMoney(Number(o?.amountPaidInr) || 0);
+  const balanceDueInrRaw = roundMoney(Number(o?.balanceDueInr) || 0);
+  const isTerminal = ['cancelled', 'payment_failed'].includes(orderStatus) || paymentStatus === 'failed';
+  if (isTerminal && amountPaidInr <= 0.01) {
+    return { amountPaidInr: 0, balanceDueInr: 0 };
+  }
+  return { amountPaidInr, balanceDueInr: balanceDueInrRaw };
+}
+
 /**
  * @param {import('mongoose').Document | object} order
  */
@@ -229,7 +241,9 @@ function mapOrderRow(order) {
     '';
   const itemCount = Array.isArray(o.items) ? o.items.length : 0;
   const bucketKey = fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
-
+  const financials = normalizeFinancialView(o);
+  
+        
   return {
     orderId: o.orderId,
     orderIdDisplay: `#${String(o.orderId).replace(/^#/, '')}`,
@@ -244,8 +258,8 @@ function mapOrderRow(order) {
     itemCount,
     paymentStatus: o.paymentStatus,
     paymentLabel: paymentLabelForUi(o.paymentStatus),
-    balanceDueInr: roundMoney(Number(o.balanceDueInr) || 0),
-    amountPaidInr: roundMoney(Number(o.amountPaidInr) || 0)
+    balanceDueInr: financials.balanceDueInr,
+    amountPaidInr: financials.amountPaidInr
   };
 }
 

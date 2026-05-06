@@ -111,6 +111,8 @@ class PaymentHoldExpiryService {
 
           order.orderStatus = 'cancelled';
           order.paymentStatus = 'failed';
+          order.amountPaidInr = 0;
+          order.balanceDueInr = 0;
           order.paymentInfo = order.paymentInfo || {};
           order.paymentInfo.status = 'expired';
           order.paymentInfo.cancellationReason = 'payment_timeout';

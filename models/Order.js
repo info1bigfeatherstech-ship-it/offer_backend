@@ -83,10 +83,21 @@ const orderSchema = new mongoose.Schema(
     
     // For shipment (future use)
     shipmentInfo: {
+      shipmentId: String,
+      awbCode: String,
       trackingNumber: String,
       courier: String,
+      providerStatus: String,
+      estimatedDelivery: String,
+      labelUrl: String,
       shippedAt: Date,
-      deliveredAt: Date
+      outForDeliveryAt: Date,
+      deliveredAt: Date,
+      lastSyncAt: Date,
+      lastSyncSource: String,
+      lastError: String,
+      createAttemptCount: { type: Number, default: 0 },
+      rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] }
     },
     
     // For returns

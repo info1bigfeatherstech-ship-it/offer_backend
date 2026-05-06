@@ -195,6 +195,158 @@ function canViewOrderForRequest(req, order, isOrderStaff) {
     return Boolean(requesterId && ownerId === requesterId);
 }
 
+function isTerminalUnpaidOrder(orderLike) {
+    const orderStatus = String(orderLike?.orderStatus || '').toLowerCase();
+    const paymentStatus = String(orderLike?.paymentStatus || '').toLowerCase();
+    const paid = Number(orderLike?.amountPaidInr || 0);
+    const isTerminal = ['cancelled', 'payment_failed'].includes(orderStatus) || paymentStatus === 'failed';
+    return isTerminal && paid <= 0.01;
+}
+
+function normalizeTerminalUnpaidFinancials(orderLike) {
+    if (!isTerminalUnpaidOrder(orderLike)) {
+        return false;
+    }
+    orderLike.amountPaidInr = 0;
+    orderLike.balanceDueInr = 0;
+    return true;
+}
+
+function mapExternalShipmentStatusToOrderStatus(rawStatus) {
+    const status = String(rawStatus || '').trim().toLowerCase();
+    if (!status) return null;
+
+    const shippedKeywords = ['ship', 'pickup', 'manifest', 'awb assigned', 'in transit', 'transit', 'booked'];
+    const outForDeliveryKeywords = ['out for delivery', 'ofd'];
+    const deliveredKeywords = ['deliver', 'completed'];
+    const cancelledKeywords = ['cancel', 'undelivered', 'rto', 'return to origin', 'reverse'];
+
+    if (deliveredKeywords.some((keyword) => status.includes(keyword))) return 'delivered';
+    if (outForDeliveryKeywords.some((keyword) => status.includes(keyword))) return 'out_for_delivery';
+    if (cancelledKeywords.some((keyword) => status.includes(keyword))) return 'cancelled';
+    if (shippedKeywords.some((keyword) => status.includes(keyword))) return 'shipped';
+    return null;
+}
+
+function normalizeShipmentEventTimestamp(value) {
+    if (!value) return null;
+    const dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+async function upsertShipmentInfo({
+    order,
+    shipmentPayload,
+    trigger,
+    allowOrderStatusUpdate = true
+}) {
+    if (!order || !shipmentPayload) return false;
+    const nextShipmentInfo = {
+        ...(order.shipmentInfo || {})
+    };
+
+    const awbCode = shipmentPayload.awbCode || shipmentPayload.trackingNumber || null;
+    if (awbCode) {
+        nextShipmentInfo.trackingNumber = String(awbCode);
+        nextShipmentInfo.awbCode = String(awbCode);
+    }
+    if (shipmentPayload.shipmentId != null) {
+        nextShipmentInfo.shipmentId = String(shipmentPayload.shipmentId);
+    }
+    if (shipmentPayload.courier) {
+        nextShipmentInfo.courier = shipmentPayload.courier;
+    }
+    if (shipmentPayload.labelUrl) {
+        nextShipmentInfo.labelUrl = shipmentPayload.labelUrl;
+    }
+    if (shipmentPayload.estimatedDelivery) {
+        nextShipmentInfo.estimatedDelivery = shipmentPayload.estimatedDelivery;
+    }
+
+    const providerStatus = shipmentPayload.providerStatus || shipmentPayload.currentStatus || null;
+    if (providerStatus) {
+        nextShipmentInfo.providerStatus = String(providerStatus);
+    }
+    nextShipmentInfo.lastSyncAt = new Date();
+    nextShipmentInfo.lastSyncSource = trigger || 'system';
+    nextShipmentInfo.lastError = null;
+
+    if (Array.isArray(shipmentPayload.events) && shipmentPayload.events.length > 0) {
+        nextShipmentInfo.rawEvents = shipmentPayload.events.slice(0, 50);
+    }
+
+    if (
+        allowOrderStatusUpdate &&
+        (!order.orderStatus || ['confirmed', 'processing', 'shipped', 'out_for_delivery'].includes(order.orderStatus))
+    ) {
+        const mappedOrderStatus = mapExternalShipmentStatusToOrderStatus(providerStatus);
+        if (mappedOrderStatus) {
+            order.orderStatus = mappedOrderStatus;
+            if (mappedOrderStatus === 'shipped' && !nextShipmentInfo.shippedAt) {
+                nextShipmentInfo.shippedAt = new Date();
+            }
+            if (mappedOrderStatus === 'out_for_delivery' && !nextShipmentInfo.outForDeliveryAt) {
+                nextShipmentInfo.outForDeliveryAt = new Date();
+            }
+            if (mappedOrderStatus === 'delivered' && !nextShipmentInfo.deliveredAt) {
+                nextShipmentInfo.deliveredAt = new Date();
+            }
+        }
+    }
+
+    order.shipmentInfo = nextShipmentInfo;
+    order.markModified('shipmentInfo');
+    await order.save();
+    return true;
+}
+
+async function markShipmentSyncFailure({ order, error, trigger }) {
+    if (!order) return;
+    order.shipmentInfo = {
+        ...(order.shipmentInfo || {}),
+        lastSyncAt: new Date(),
+        lastSyncSource: trigger || 'system',
+        lastError: String(error?.message || error || 'Shipment sync failed'),
+        createAttemptCount: Number(order.shipmentInfo?.createAttemptCount || 0) + 1
+    };
+    order.markModified('shipmentInfo');
+    await order.save();
+}
+
+async function ensureShipmentForOrder({ order, trigger }) {
+    if (!order) return { success: false, code: 'ORDER_REQUIRED' };
+    const paymentMethod = String(order.paymentInfo?.method || '').toLowerCase();
+    const canCreateShipment = paymentMethod === 'cod' || order.paymentStatus === 'paid';
+    if (!canCreateShipment) {
+        return { success: false, code: 'SHIPMENT_NOT_ELIGIBLE' };
+    }
+    if (order.shipmentInfo?.trackingNumber) {
+        return { success: true, alreadyExists: true };
+    }
+
+    const result = await ShiprocketService.createShipment(order);
+    if (!result?.success) {
+        await markShipmentSyncFailure({ order, error: result?.error || 'createShipment failed', trigger });
+        return {
+            success: false,
+            code: 'SHIPMENT_CREATE_FAILED',
+            message: 'Shipment creation failed',
+            details: result?.error || null
+        };
+    }
+
+    await upsertShipmentInfo({
+        order,
+        shipmentPayload: {
+            ...result,
+            providerStatus: result.providerStatus || 'shipment_created'
+        },
+        trigger,
+        allowOrderStatusUpdate: true
+    });
+    return { success: true, shipment: result };
+}
+
 function buildOrderResponsePayload(order, {
     normalizedPaymentMethod,
     discount,
@@ -822,6 +974,18 @@ exports.createOrder = async (req, res) => {
                 });
             }
         }
+
+        if (normalizedPaymentMethod === 'cod') {
+            ensureShipmentForOrder({
+                order,
+                trigger: 'cod_order_created'
+            }).catch((shipmentError) => {
+                logger.error('COD shipment enqueue failed', buildRequestLogContext(req, {
+                    orderId: order.orderId,
+                    error: shipmentError?.message || String(shipmentError)
+                }));
+            });
+        }
         
         logger.info('Order created successfully', buildRequestLogContext(req, {
             orderId: order.orderId,
@@ -1039,8 +1203,14 @@ exports.verifyPayment = async (req, res) => {
         await order.save();
 
         if (order.paymentStatus === 'paid' && !order.shipmentInfo?.trackingNumber) {
-            ShiprocketService.createShipment(order).catch((err) => {
-                console.error('Shipment creation failed:', err);
+            ensureShipmentForOrder({
+                order,
+                trigger: 'payment_verified'
+            }).catch((shipmentError) => {
+                logger.error('Shipment creation failed after payment verification', {
+                    orderId: order.orderId,
+                    error: shipmentError?.message || String(shipmentError)
+                });
             });
         }
 
@@ -1156,8 +1326,14 @@ exports.razorpayWebhook = async (req, res) => {
                 await order.save();
 
                 if (order.paymentStatus === 'paid' && !order.shipmentInfo?.trackingNumber) {
-                    ShiprocketService.createShipment(order).catch((err) => {
-                        console.error('Shipment creation failed:', err);
+                    ensureShipmentForOrder({
+                        order,
+                        trigger: 'razorpay_webhook_payment_captured'
+                    }).catch((shipmentError) => {
+                        logger.error('Shipment creation failed after webhook capture', {
+                            orderId: order.orderId,
+                            error: shipmentError?.message || String(shipmentError)
+                        });
                     });
                 }
                 break;
@@ -1174,6 +1350,7 @@ exports.razorpayWebhook = async (req, res) => {
                 if (failedOrder && failedOrder.paymentStatus === 'pending') {
                     failedOrder.paymentStatus = 'failed';
                     failedOrder.orderStatus = 'payment_failed';
+                    normalizeTerminalUnpaidFinancials(failedOrder);
                     failedOrder.paymentInfo = failedOrder.paymentInfo || {};
                     failedOrder.paymentInfo.status = 'failed';
                     failedOrder.paymentInfo.failureReason =
@@ -1203,6 +1380,76 @@ exports.razorpayWebhook = async (req, res) => {
     } catch (error) {
         console.error('Webhook error:', error);
         return respondOrderError(res, 500, 'WEBHOOK_PROCESSING_FAILED', 'Webhook processing failed');
+    }
+};
+
+// ========== SHIPROCKET WEBHOOK ==========
+exports.shiprocketWebhook = async (req, res) => {
+    try {
+        const configuredToken = String(process.env.SHIPROCKET_WEBHOOK_TOKEN || '').trim();
+        const incomingToken = String(req.headers['x-shiprocket-token'] || req.headers['x-webhook-token'] || '').trim();
+        if (configuredToken && incomingToken !== configuredToken) {
+            return respondOrderError(res, 401, 'SHIPROCKET_WEBHOOK_UNAUTHORIZED', 'Invalid Shiprocket webhook token');
+        }
+
+        const payload = req.body || {};
+        const sourceOrderId = payload.order_id || payload.orderId || payload.order_reference_id || payload.reference_id;
+        if (!sourceOrderId) {
+            return respondOrderError(res, 400, 'SHIPROCKET_WEBHOOK_ORDER_ID_REQUIRED', 'order_id is required in webhook payload');
+        }
+
+        const order = await Order.findOne({ orderId: String(sourceOrderId).trim() });
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found for webhook payload');
+        }
+
+        const providerStatus =
+            payload.current_status ||
+            payload.shipment_status ||
+            payload.status ||
+            payload.current_status_description ||
+            null;
+
+        const eventTimestamp = normalizeShipmentEventTimestamp(
+            payload.event_time ||
+            payload.updated_at ||
+            payload.status_date ||
+            payload.timestamp
+        ) || new Date();
+
+        const nextEvents = Array.isArray(order.shipmentInfo?.rawEvents)
+            ? [...order.shipmentInfo.rawEvents]
+            : [];
+        nextEvents.push({
+            status: providerStatus || 'Shipment Update',
+            code: payload.status_code || payload.current_status_code || null,
+            location: payload.location || payload.city || null,
+            description: payload.remark || payload.comment || payload.message || null,
+            at: eventTimestamp,
+            raw: payload
+        });
+
+        await upsertShipmentInfo({
+            order,
+            shipmentPayload: {
+                awbCode: payload.awb_code || payload.awb || order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber,
+                shipmentId: payload.shipment_id || order.shipmentInfo?.shipmentId || null,
+                courier: payload.courier_name || payload.courier || order.shipmentInfo?.courier || null,
+                providerStatus,
+                events: nextEvents.slice(-50),
+                estimatedDelivery: payload.estimated_delivery_date || order.shipmentInfo?.estimatedDelivery || null
+            },
+            trigger: 'shiprocket_webhook',
+            allowOrderStatusUpdate: true
+        });
+
+        return res.json({ success: true });
+    } catch (error) {
+        logger.error('Shiprocket webhook error', {
+            message: error.message,
+            stack: error.stack
+        });
+        return respondOrderError(res, 500, 'SHIPROCKET_WEBHOOK_FAILED', 'Failed to process Shiprocket webhook');
     }
 };
 
@@ -1446,6 +1693,7 @@ exports.getOrder = async (req, res) => {
         }
 
         const transformedOrder = order.toObject();
+        normalizeTerminalUnpaidFinancials(transformedOrder);
 
         transformedOrder.items = transformedOrder.items.map((item) => {
             const product = item.productId;
@@ -1501,11 +1749,16 @@ exports.getUserOrders = async (req, res) => {
             .select(
                 'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo'
             );
+        const normalizedOrders = orders.map((doc) => {
+            const plain = doc.toObject();
+            normalizeTerminalUnpaidFinancials(plain);
+            return plain;
+        });
 
         return res.json({
             success: true,
-            count: orders.length,
-            orders: orders
+            count: normalizedOrders.length,
+            orders: normalizedOrders
         });
 
     } catch (error) {
@@ -1543,6 +1796,10 @@ exports.cancelOrder = async (req, res) => {
         const canInitiateRefund = wasPaid && Boolean(order.paymentInfo?.razorpayPaymentId);
 
         order.orderStatus = 'cancelled';
+        if (!wasPaid && String(order.paymentInfo?.method || '').toLowerCase() === 'online') {
+            order.paymentStatus = 'failed';
+        }
+        normalizeTerminalUnpaidFinancials(order);
         order.paymentInfo = order.paymentInfo || {};
         order.paymentInfo.cancellationReason = 'user_cancelled';
         order.paymentInfo.cancelledAt = new Date();
@@ -1736,6 +1993,63 @@ exports.generateInvoice = async (req, res) => {
     }
 };
 
+function buildDefaultOrderTimeline(order) {
+    const timeline = {
+        pending: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Payment Pending', completed: false, timestamp: null }
+        ],
+        confirmed: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            { status: 'Processing', completed: false, timestamp: null }
+        ],
+        shipped: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
+            { status: 'Out for Delivery', completed: false, timestamp: null }
+        ],
+        out_for_delivery: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
+            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            { status: 'Delivered', completed: false, timestamp: null }
+        ],
+        delivered: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
+            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt || null }
+        ],
+        cancelled: [
+            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
+            { status: 'Cancelled', completed: true, timestamp: order.updatedAt }
+        ]
+    };
+    return timeline[order.orderStatus] || timeline.pending;
+}
+
+function buildLiveTimelineFromEvents(events, fallbackTimeline) {
+    if (!Array.isArray(events) || events.length === 0) {
+        return fallbackTimeline;
+    }
+    const normalized = events
+        .map((event) => ({
+            status: event?.status || event?.description || 'Shipment Update',
+            completed: true,
+            timestamp: normalizeShipmentEventTimestamp(event?.at),
+            location: event?.location || null,
+            description: event?.description || null
+        }))
+        .filter((event) => Boolean(event.timestamp))
+        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    return normalized.length > 0 ? normalized : fallbackTimeline;
+}
+
 // ========== TRACK ORDER ==========
 exports.trackOrder = async (req, res) => {
     try {
@@ -1750,54 +2064,52 @@ exports.trackOrder = async (req, res) => {
             return buildUnauthorizedOrderResponse(res);
         }
 
-        const timeline = {
-            'pending': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Payment Pending', completed: false, timestamp: null }
-            ],
-            'confirmed': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-                { status: 'Processing', completed: false, timestamp: null }
-            ],
-            'shipped': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-                { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt },
-                { status: 'Out for Delivery', completed: false, timestamp: null }
-            ],
-            'out_for_delivery': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-                { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt },
-                { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt },
-                { status: 'Delivered', completed: false, timestamp: null }
-            ],
-            'delivered': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-                { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt },
-                { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt },
-                { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt }
-            ],
-            'cancelled': [
-                { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-                { status: 'Cancelled', completed: true, timestamp: order.updatedAt }
-            ]
-        };
+        const fallbackTimeline = buildDefaultOrderTimeline(order);
+        let liveTracking = null;
+        let trackingSource = 'internal';
+
+        const awbCode = order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || null;
+        const shipmentId = order.shipmentInfo?.shipmentId || null;
+        if (awbCode || shipmentId) {
+            const trackingResult = await ShiprocketService.getTracking({
+                awbCode,
+                shipmentId
+            });
+            if (trackingResult?.success) {
+                liveTracking = trackingResult;
+                trackingSource = 'shiprocket';
+                await upsertShipmentInfo({
+                    order,
+                    shipmentPayload: {
+                        ...trackingResult,
+                        providerStatus: trackingResult.currentStatus
+                    },
+                    trigger: 'track_order_live_sync',
+                    allowOrderStatusUpdate: true
+                });
+            } else if (trackingResult?.message) {
+                logger.warn('Live tracking fallback to internal timeline', {
+                    orderId: order.orderId,
+                    reason: trackingResult.message
+                });
+            }
+        }
 
         const tracking = {
             orderId: order.orderId,
             currentStatus: order.orderStatus,
             trackingNumber: order.shipmentInfo?.trackingNumber || null,
             courier: order.shipmentInfo?.courier || null,
-            timeline: timeline[order.orderStatus] || timeline.pending,
-            estimatedDelivery: order.shipmentInfo?.estimatedDelivery || null
+            estimatedDelivery: order.shipmentInfo?.estimatedDelivery || null,
+            providerStatus: order.shipmentInfo?.providerStatus || null,
+            lastSyncedAt: order.shipmentInfo?.lastSyncAt || null,
+            source: trackingSource,
+            timeline: buildLiveTimelineFromEvents(liveTracking?.events, fallbackTimeline)
         };
 
         return res.json({
             success: true,
-            tracking: tracking
+            tracking
         });
 
     } catch (error) {
