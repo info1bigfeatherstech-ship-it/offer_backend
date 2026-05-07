@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../middlewares/auth.middleware');
 const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
+const { uploadReturnProofs } = require('../middlewares/upload.middleware');
 const {
   requireWholesaleUserForWholesaleStorefront
 } = require('../middlewares/storefront.middleware');
@@ -16,7 +17,12 @@ const {
   updateOrderStatus,
   generateInvoice,
   trackOrder,
-  refundOrderPayment
+  refundOrderPayment,
+  createReturnRequest,
+  listAdminReturnRequests,
+  getAdminReturnRequest,
+  adminDecideReturnRequest,
+  adminInitiateReturnRefund
 } = require('../controllers/order.controller');
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
@@ -28,6 +34,7 @@ router.post('/items/:orderId/pay-balance', verifyToken, requireWholesaleUserForW
 router.get('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, getUserOrders);
 router.get('/items/:orderId', verifyToken, requireWholesaleUserForWholesaleStorefront, getOrder);
 router.get('/items/:orderId/track', verifyToken, requireWholesaleUserForWholesaleStorefront, trackOrder);
+router.post('/items/:orderId/return-request', verifyToken, requireWholesaleUserForWholesaleStorefront, uploadReturnProofs, createReturnRequest);
 router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholesaleStorefront, generateInvoice);
 router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
 
@@ -43,6 +50,34 @@ router.put(
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
   updateOrderStatus
+);
+
+router.get(
+  '/admin/returns/requests',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  listAdminReturnRequests
+);
+
+router.get(
+  '/admin/returns/requests/:orderId',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  getAdminReturnRequest
+);
+
+router.post(
+  '/admin/returns/requests/:orderId/decision',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminDecideReturnRequest
+);
+
+router.post(
+  '/admin/returns/requests/:orderId/refund',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminInitiateReturnRefund
 );
 
 module.exports = router;

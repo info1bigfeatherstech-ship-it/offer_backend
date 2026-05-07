@@ -10,6 +10,8 @@ const logger = require('./logger');
 
 const DEFAULT_BASE = 'https://apiv2.shiprocket.in/v1';
 
+const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
 class ShiprocketService {
   constructor() {
     this.baseURL = String(process.env.SHIPROCKET_BASE_URL || DEFAULT_BASE).replace(/\/$/, '');
@@ -277,7 +279,15 @@ class ShiprocketService {
       };
     }
 
-    const pickupLocation = String(process.env.SHIPROCKET_PICKUP_LOCATION || process.env.PICKUP_LOCATION_NICKNAME || 'Primary').trim();
+    const pickupLocationRaw = String(process.env.SHIPROCKET_PICKUP_LOCATION || process.env.PICKUP_LOCATION_NICKNAME || '').trim();
+    if (!pickupLocationRaw) {
+      return {
+        success: false,
+        error:
+          'Shiprocket pickup location is not configured. Set SHIPROCKET_PICKUP_LOCATION (pickup nickname from Shiprocket panel) and restart the server.'
+      };
+    }
+    const pickupLocation = pickupLocationRaw;
 
     const orderItems = [];
     for (const item of order.items || []) {
@@ -328,6 +338,12 @@ class ShiprocketService {
     const maxB = Math.max(10, ...orderItems.map((i) => Number(i.breadth) || 0));
     const maxH = Math.max(10, ...orderItems.map((i) => Number(i.height) || 0));
 
+    const payMethod = String(order.paymentInfo?.method || '').toLowerCase();
+    const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
+    const splitAdv = String(order.paymentInfo?.splitMode || 'full').toLowerCase() === 'advance';
+    const useCodAtDoor =
+      payMethod === 'cod' || (payMethod === 'online' && balanceViaCod && splitAdv);
+
     const payload = {
       order_id: order.orderId,
       order_date: (order.createdAt || new Date()).toISOString().slice(0, 19).replace('T', ' '),
@@ -352,13 +368,21 @@ class ShiprocketService {
         tax: it.tax,
         hsn: it.hsn
       })),
-      payment_method: order.paymentInfo?.method === 'cod' ? 'COD' : 'Prepaid',
+      payment_method: useCodAtDoor ? 'COD' : 'Prepaid',
       sub_total: Number(order.subtotal) || 0,
+      shipping_charges: roundMoney2(Number(order.deliveryCharges) || 0),
       length: maxL,
       breadth: maxB,
       height: maxH,
       weight: Math.max(0.05, totalWeight)
     };
+
+    if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
+      const collect = roundMoney2(order.balanceDueInr);
+      if (collect > 0) {
+        payload.order_total = collect;
+      }
+    }
 
     try {
       const data = await this.requestWithAuth({
@@ -383,6 +407,68 @@ class ShiprocketService {
       };
     } catch (err) {
       logger.error('[Shiprocket] createShipment failed:', err.response?.data || err.message);
+      return { success: false, error: err.response?.data || err.message };
+    }
+  }
+
+  /**
+   * Create reverse pickup / return shipment.
+   * Note: Shiprocket account configurations vary; endpoint is overridable via env.
+   */
+  async createReturnPickup(order, returnInfo = {}) {
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        reverseTrackingNumber: `MOCK-RET-${order.orderId}`,
+        providerStatus: 'reverse_pickup_created'
+      };
+    }
+
+    const configuredEndpoint = String(process.env.SHIPROCKET_RETURN_CREATE_ENDPOINT || '').trim();
+    const endpointPath = configuredEndpoint || '/external/orders/create/return';
+    const endpoint = endpointPath.startsWith('http') ? endpointPath : `${this.baseURL}${endpointPath}`;
+
+    const payload = {
+      order_id: order.orderId,
+      shipment_id: order.shipmentInfo?.shipmentId || null,
+      awb_code: order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || null,
+      reason: returnInfo.reasonType || 'damaged',
+      remarks: returnInfo.reasonMessage || 'Return approved by admin',
+      pickup_name: order.addressSnapshot?.fullName || 'Customer',
+      pickup_phone: String(order.addressSnapshot?.phone || '').replace(/\D/g, '').slice(-10) || undefined,
+      pickup_address: order.addressSnapshot?.addressLine1 || order.addressSnapshot?.area || undefined,
+      pickup_address_2: order.addressSnapshot?.addressLine2 || undefined,
+      pickup_city: order.addressSnapshot?.city || undefined,
+      pickup_state: order.addressSnapshot?.state || undefined,
+      pickup_pincode: String(order.addressSnapshot?.postalCode || '').replace(/\D/g, '').slice(0, 6) || undefined,
+      pickup_country: order.addressSnapshot?.country || 'India'
+    };
+
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: endpoint,
+        data: payload,
+        timeout: 30000
+      });
+
+      if (!data) {
+        return { success: false, error: 'Shiprocket auth failed' };
+      }
+
+      return {
+        success: true,
+        reverseShipmentId: data.shipment_id || data.return_id || null,
+        reverseAwbCode: data.awb_code || data.tracking_number || null,
+        reverseTrackingNumber: data.tracking_number || data.awb_code || null,
+        reverseCourier: data.courier_name || null,
+        providerStatus: data.status || data.current_status || 'reverse_pickup_created',
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      logger.error('[Shiprocket] createReturnPickup failed:', err.response?.data || err.message);
       return { success: false, error: err.response?.data || err.message };
     }
   }

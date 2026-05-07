@@ -12,14 +12,15 @@ const {
 } = require('../services/checkoutComputation.service');
 const {
   normalizePaymentMethod,
-  ALLOWED_ADVANCE_PAYMENT_PERCENTS,
-  resolveAdvancePaymentSelection,
+  normalizeBalanceCollection,
+  resolveAdvancePaymentSelectionWithPolicy,
   createInvalidPaymentMethodError,
   createQuoteExpiredError,
   createQuoteStaleError,
   sendCheckoutFlowError,
   buildRequestLogContext
 } = require('../utils/checkoutFlow');
+const checkoutSettingsService = require('../services/checkoutSettings.service');
 const logger = require('../utils/logger');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -44,7 +45,21 @@ function allowDemoMockShipping(req) {
   return true;
 }
 
-async function buildFinalTotals({ cartDoc, pin, finalUserType, storefront, couponCode, paymentMethodHint, req }) {
+/**
+ * @param {'cod_full'|'online'|'advance_balance_cod'} shiprocketPricingMode — how Shiprocket COD amount is derived for quotes
+ * @param {number|null} advancePercentForBalanceCod — admin advance % when mode is advance_balance_cod
+ */
+async function buildFinalTotals({
+  cartDoc,
+  pin,
+  finalUserType,
+  storefront,
+  couponCode,
+  paymentMethodHint,
+  req,
+  shiprocketPricingMode = 'online',
+  advancePercentForBalanceCod = null
+}) {
   if (allowDemoMockShipping(req)) {
     const evaluated = await evaluateCartForCheckout(cartDoc, finalUserType, null, storefront);
     const { discount, appliedCouponCode } = await resolveCouponDiscount(
@@ -74,7 +89,6 @@ async function buildFinalTotals({ cartDoc, pin, finalUserType, storefront, coupo
     };
   }
 
-  const assumeCod = String(paymentMethodHint || '').toLowerCase() === 'cod';
   let last = await computeCheckoutTotals({
     cart: cartDoc,
     postalCode: pin,
@@ -86,8 +100,7 @@ async function buildFinalTotals({ cartDoc, pin, finalUserType, storefront, coupo
     codAmountForShiprocket: 0
   });
 
-  // COD: Shiprocket quote can depend on declared COD amount — two passes converge fee/totals (same math as before).
-  if (assumeCod) {
+  if (shiprocketPricingMode === 'cod_full') {
     for (let i = 0; i < 2; i++) {
       const codVal = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
       last = await computeCheckoutTotals({
@@ -99,6 +112,30 @@ async function buildFinalTotals({ cartDoc, pin, finalUserType, storefront, coupo
         session: null,
         consumeCoupon: false,
         codAmountForShiprocket: codVal
+      });
+    }
+  } else if (shiprocketPricingMode === 'advance_balance_cod') {
+    const pct = Number(advancePercentForBalanceCod);
+    if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
+      const err = new Error('Invalid advance percent for hybrid COD quote');
+      err.statusCode = 500;
+      err.code = 'CHECKOUT_POLICY_INVALID';
+      throw err;
+    }
+    for (let i = 0; i < 2; i++) {
+      const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+      const advInrRaw = roundMoney2((totalInr * pct) / 100);
+      const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
+      const balanceCod = roundMoney2(totalInr - advInr);
+      last = await computeCheckoutTotals({
+        cart: cartDoc,
+        postalCode: pin,
+        finalUserType,
+        storefront,
+        couponCode,
+        session: null,
+        consumeCoupon: false,
+        codAmountForShiprocket: balanceCod
       });
     }
   }
@@ -114,14 +151,71 @@ exports.quoteCheckout = async (req, res) => {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
-    const { addressId, couponCode, paymentMethodHint } = req.body || {};
+    const { addressId, couponCode, paymentMethodHint, paymentPlan, paymentAdvancePercent, balanceCollection } =
+      req.body || {};
 
-    if (paymentMethodHint !== undefined && paymentMethodHint !== null && paymentMethodHint !== '') {
-      const normalizedPaymentMethodHint = normalizePaymentMethod(paymentMethodHint);
-      if (!normalizedPaymentMethodHint) {
+    const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
+
+    let normalizedQuotePlan = 'full';
+    try {
+      const sel = resolveAdvancePaymentSelectionWithPolicy({
+        paymentPlan,
+        paymentAdvancePercent,
+        policy: checkoutPolicy
+      });
+      normalizedQuotePlan = sel.normalizedPaymentPlan;
+    } catch (policyErr) {
+      if (policyErr?.statusCode && policyErr?.code) {
+        return sendCheckoutFlowError(res, policyErr, policyErr.message, policyErr.code);
+      }
+      throw policyErr;
+    }
+
+    const normalizedBalanceCollection = normalizeBalanceCollection(balanceCollection);
+
+    let hintedMethod = null;
+    if (paymentMethodHint !== undefined && paymentMethodHint !== null && String(paymentMethodHint).trim() !== '') {
+      hintedMethod = normalizePaymentMethod(paymentMethodHint);
+      if (!hintedMethod) {
         throw createInvalidPaymentMethodError();
       }
+      if (hintedMethod === 'cod' && !checkoutPolicy.codEnabled) {
+        return respondCheckoutInputError(
+          res,
+          400,
+          'COD_DISABLED_BY_STORE',
+          'Cash on delivery is not available at the moment.'
+        );
+      }
     }
+
+    const isAdvanceBalanceCod =
+      hintedMethod === 'online' &&
+      normalizedQuotePlan === 'advance' &&
+      normalizedBalanceCollection === 'cod';
+
+    if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
+      return respondCheckoutInputError(
+        res,
+        400,
+        'COD_DISABLED_BY_STORE',
+        'Cash on delivery is not available for the remaining balance at the moment.'
+      );
+    }
+
+    let shiprocketPricingMode = 'online';
+    if (hintedMethod === 'cod') {
+      shiprocketPricingMode = 'cod_full';
+    } else if (isAdvanceBalanceCod) {
+      shiprocketPricingMode = 'advance_balance_cod';
+    }
+
+    const advancePctForSr =
+      isAdvanceBalanceCod && checkoutPolicy.partialPaymentPercent != null
+        ? Number(checkoutPolicy.partialPaymentPercent)
+        : isAdvanceBalanceCod
+          ? 25
+          : null;
 
     if (!addressId) {
       return respondCheckoutInputError(res, 400, 'ADDRESS_ID_REQUIRED', 'addressId is required');
@@ -160,7 +254,9 @@ exports.quoteCheckout = async (req, res) => {
       storefront,
       couponCode,
       paymentMethodHint,
-      req
+      req,
+      shiprocketPricingMode,
+      advancePercentForBalanceCod: advancePctForSr
     });
 
     const fp = cartFingerprintFromItems(cartDoc.items);
@@ -240,7 +336,8 @@ exports.quoteCheckout = async (req, res) => {
       success: true,
       quoteId: quote._id,
       isDeliverable: true,
-      codAvailable: quote.shippingMeta.codAvailable,
+      codAvailable: quote.shippingMeta.codAvailable && checkoutPolicy.codEnabled,
+      checkoutPolicy,
       deliveryEstimate: eta,
       courierName: finalTotals.deliveryMeta?.courierName || null,
       pincode: pin,
@@ -286,7 +383,7 @@ exports.confirmCheckout = async (req, res) => {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
-    const { quoteId, paymentMethod, paymentPlan, paymentAdvancePercent } = req.body || {};
+    const { quoteId, paymentMethod, paymentPlan, paymentAdvancePercent, balanceCollection } = req.body || {};
 
     if (!quoteId) {
       return respondCheckoutInputError(res, 400, 'QUOTE_ID_REQUIRED', 'quoteId is required');
@@ -299,21 +396,56 @@ exports.confirmCheckout = async (req, res) => {
     if (!normalizedPaymentMethod) {
       throw createInvalidPaymentMethodError();
     }
-    const {
-      normalizedPaymentPlan,
-      hasAdvancePercentInput,
-      normalizedAdvancePercentInput,
-      effectiveAdvancePercent
-    } = resolveAdvancePaymentSelection({
-      paymentPlan,
-      paymentAdvancePercent
-    });
-    if (normalizedPaymentPlan === 'advance' && hasAdvancePercentInput && normalizedAdvancePercentInput == null) {
+
+    const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
+
+    if (normalizedPaymentMethod === 'cod' && !checkoutPolicy.codEnabled) {
       return respondCheckoutInputError(
         res,
         400,
-        'INVALID_ADVANCE_PERCENT',
-        `paymentAdvancePercent must be one of: ${ALLOWED_ADVANCE_PAYMENT_PERCENTS.join(', ')}`
+        'COD_DISABLED_BY_STORE',
+        'Cash on delivery is not available at the moment.'
+      );
+    }
+
+    let normalizedPaymentPlan;
+    let effectiveAdvancePercent;
+    try {
+      const sel = resolveAdvancePaymentSelectionWithPolicy({
+        paymentPlan,
+        paymentAdvancePercent,
+        policy: checkoutPolicy
+      });
+      normalizedPaymentPlan = sel.normalizedPaymentPlan;
+      effectiveAdvancePercent = sel.effectiveAdvancePercent;
+    } catch (policyErr) {
+      if (policyErr?.statusCode && policyErr?.code) {
+        return sendCheckoutFlowError(res, policyErr, policyErr.message, policyErr.code);
+      }
+      throw policyErr;
+    }
+
+    const normalizedBalanceCollection = normalizeBalanceCollection(balanceCollection);
+    if (normalizedPaymentPlan !== 'advance' && normalizedBalanceCollection === 'cod') {
+      return respondCheckoutInputError(
+        res,
+        400,
+        'INVALID_BALANCE_COLLECTION',
+        'Pay on delivery for the balance applies only when using partial pay now.'
+      );
+    }
+
+    const isAdvanceBalanceCod =
+      normalizedPaymentMethod === 'online' &&
+      normalizedPaymentPlan === 'advance' &&
+      normalizedBalanceCollection === 'cod';
+
+    if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
+      return respondCheckoutInputError(
+        res,
+        400,
+        'COD_DISABLED_BY_STORE',
+        'Cash on delivery is not available for the remaining balance at the moment.'
       );
     }
 
@@ -351,6 +483,14 @@ exports.confirmCheckout = async (req, res) => {
     }
 
     const couponCode = quote.couponCodeUpper || null;
+
+    let shiprocketPricingMode = 'online';
+    if (normalizedPaymentMethod === 'cod') {
+      shiprocketPricingMode = 'cod_full';
+    } else if (isAdvanceBalanceCod) {
+      shiprocketPricingMode = 'advance_balance_cod';
+    }
+
     const recomputed = await buildFinalTotals({
       cartDoc,
       pin,
@@ -358,14 +498,21 @@ exports.confirmCheckout = async (req, res) => {
       storefront,
       couponCode,
       paymentMethodHint: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
-      req: { body: { demoMockShipping: Boolean(quote.shippingMeta?.mock) } }
+      req: { body: { demoMockShipping: Boolean(quote.shippingMeta?.mock) } },
+      shiprocketPricingMode,
+      advancePercentForBalanceCod: isAdvanceBalanceCod ? effectiveAdvancePercent : null
     });
 
-    if (normalizedPaymentMethod === 'cod' && recomputed.deliveryMeta?.codAvailable === false) {
+    if (
+      (normalizedPaymentMethod === 'cod' || isAdvanceBalanceCod) &&
+      (!checkoutPolicy.codEnabled || recomputed.deliveryMeta?.codAvailable === false)
+    ) {
       return res.status(400).json({
         success: false,
-        code: 'COD_NOT_AVAILABLE',
-        message: 'COD is not available for this pincode and cart combination.'
+        code: !checkoutPolicy.codEnabled ? 'COD_DISABLED_BY_STORE' : 'COD_NOT_AVAILABLE',
+        message: !checkoutPolicy.codEnabled
+          ? 'Cash on delivery is not available at the moment.'
+          : 'COD is not available for this pincode and cart combination.'
       });
     }
 
@@ -400,6 +547,8 @@ exports.confirmCheckout = async (req, res) => {
     quote.confirmedAdvancePercent = normalizedPaymentPlan === 'advance'
       ? effectiveAdvancePercent
       : null;
+    quote.confirmedBalanceCollection =
+      normalizedPaymentPlan === 'advance' ? (isAdvanceBalanceCod ? 'cod' : 'online') : '';
     await quote.save();
 
     logger.info('Checkout quote confirmed', buildRequestLogContext(req, {
@@ -415,7 +564,8 @@ exports.confirmCheckout = async (req, res) => {
       validated: true,
       paymentMethod: normalizedPaymentMethod,
       paymentPlan: normalizedPaymentPlan,
-      codAvailable: recomputed.deliveryMeta?.codAvailable !== false,
+      checkoutPolicy,
+      codAvailable: recomputed.deliveryMeta?.codAvailable !== false && checkoutPolicy.codEnabled,
       totals: {
         itemCount: cartDoc.items.length,
         itemsSubtotal: recomputed.subtotal,
@@ -431,6 +581,10 @@ exports.confirmCheckout = async (req, res) => {
           paymentMethod: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
           onlinePaymentMode: normalizedPaymentPlan,
           paymentAdvancePercent: normalizedPaymentPlan === 'advance' ? effectiveAdvancePercent : undefined,
+          balanceCollection:
+            normalizedPaymentPlan === 'advance'
+              ? (isAdvanceBalanceCod ? 'cod' : 'online')
+              : undefined,
           couponCode: quote.couponCodeUpper || undefined,
           quoteId: String(quote._id)
         }

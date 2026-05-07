@@ -102,8 +102,37 @@ const orderSchema = new mongoose.Schema(
     
     // For returns
     returnInfo: {
+      reasonType: {
+        type: String,
+        enum: ['damaged', 'wrong_item', null],
+        default: null
+      },
+      reasonMessage: { type: String, default: null },
+      proofs: {
+        type: [
+          {
+            kind: { type: String, enum: ['image', 'video'], required: true },
+            url: { type: String, required: true },
+            publicId: { type: String, default: null }
+          }
+        ],
+        default: []
+      },
       requestedAt: Date,
       approvedAt: Date,
+      approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rejectedAt: Date,
+      rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      decisionReason: { type: String, default: null },
+      reverseShipmentId: { type: String, default: null },
+      reverseAwbCode: { type: String, default: null },
+      reverseTrackingNumber: { type: String, default: null },
+      reverseCourier: { type: String, default: null },
+      reverseProviderStatus: { type: String, default: null },
+      reverseEvents: { type: [mongoose.Schema.Types.Mixed], default: [] },
+      reverseLastSyncAt: Date,
+      reverseLastError: { type: String, default: null },
+      refundInitiatedAt: Date,
       refundAmount: Number,
       refundId: String,
       status: String

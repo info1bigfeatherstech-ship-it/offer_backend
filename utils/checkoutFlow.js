@@ -13,6 +13,13 @@ const normalizePaymentPlan = (value) => {
   return 'full';
 };
 
+/** How the post-advance balance is settled: online (Razorpay) or COD at delivery. */
+const normalizeBalanceCollection = (value) => {
+  const s = String(value || '').trim().toLowerCase();
+  if (s === 'cod' || s === 'cash_on_delivery' || s === 'delivery') return 'cod';
+  return 'online';
+};
+
 const ALLOWED_ADVANCE_PAYMENT_PERCENTS = Object.freeze([25, 50, 75]);
 
 const inferAdvancePercentFromPlanAlias = (value) => {
@@ -31,6 +38,16 @@ const normalizeAdvancePaymentPercent = (value, { allowNull = true } = {}) => {
   const rounded = Math.round(numeric);
   if (!ALLOWED_ADVANCE_PAYMENT_PERCENTS.includes(rounded)) return null;
   return rounded;
+};
+
+/** Read advance % locked on a confirmed quote (admin policy allows 1–100, not only 25/50/75). */
+const parseQuoteLockedAdvancePercent = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const r = Math.round(n * 100) / 100;
+  if (r < 1 || r > 100) return null;
+  return r;
 };
 
 const resolveDefaultAdvancePercent = () => {
@@ -60,6 +77,57 @@ const resolveAdvancePaymentSelection = ({
           resolveDefaultAdvancePercent()
         )
       : null
+  };
+};
+
+/**
+ * Applies server checkout policy: advance % always comes from admin when partial is enabled.
+ * Client-sent paymentAdvancePercent is ignored for charging (prevents tampering).
+ */
+const resolveAdvancePaymentSelectionWithPolicy = ({
+  paymentPlan,
+  paymentAdvancePercent,
+  policy
+} = {}) => {
+  const base = resolveAdvancePaymentSelection({ paymentPlan, paymentAdvancePercent });
+  if (base.normalizedPaymentPlan !== 'advance') {
+    return {
+      ...base,
+      policyDrivenAdvance: false
+    };
+  }
+
+  if (!policy || !policy.partialPaymentEnabled) {
+    const err = createCheckoutFlowError({
+      statusCode: 400,
+      code: 'PARTIAL_PAYMENT_DISABLED',
+      message: 'Partial payment is not available. Choose full payment or another method.'
+    });
+    err.checkoutPolicyBlock = true;
+    throw err;
+  }
+
+  let pct = Number(policy.partialPaymentPercent);
+  if (!Number.isFinite(pct)) {
+    pct = resolveDefaultAdvancePercent();
+  }
+  pct = Math.round(pct * 100) / 100;
+  if (pct < 1 || pct > 100) {
+    const err = createCheckoutFlowError({
+      statusCode: 500,
+      code: 'CHECKOUT_POLICY_INVALID',
+      message: 'Checkout partial payment is misconfigured. Contact support.'
+    });
+    err.checkoutPolicyBlock = true;
+    throw err;
+  }
+
+  return {
+    normalizedPaymentPlan: base.normalizedPaymentPlan,
+    hasAdvancePercentInput: false,
+    normalizedAdvancePercentInput: null,
+    effectiveAdvancePercent: pct,
+    policyDrivenAdvance: true
   };
 };
 
@@ -146,8 +214,10 @@ module.exports = {
   STALE_QUOTE_HTTP_STATUS,
   normalizePaymentMethod,
   normalizePaymentPlan,
+  normalizeBalanceCollection,
   ALLOWED_ADVANCE_PAYMENT_PERCENTS,
   normalizeAdvancePaymentPercent,
+  parseQuoteLockedAdvancePercent,
   inferAdvancePercentFromPlanAlias,
   resolveDefaultAdvancePercent,
   resolveAdvancePaymentSelection,
@@ -158,5 +228,6 @@ module.exports = {
   createQuoteStaleError,
   sendCheckoutFlowError,
   isOrderStaffRequest,
-  buildRequestLogContext
+  buildRequestLogContext,
+  resolveAdvancePaymentSelectionWithPolicy
 };

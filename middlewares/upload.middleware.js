@@ -135,11 +135,45 @@ const uploadWholesalerProofs = proofUpload.fields([
   { name: 'businessAddressProofFile', maxCount: 1 }
 ]);
 
+// ===============================
+// RETURN REQUEST PROOFS (VIDEO + IMAGES)
+// ===============================
+const returnProofUpload = multer({
+  storage: multer.memoryStorage(),
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/jpg',
+      'video/mp4',
+      'video/quicktime',
+      'video/x-matroska',
+      'video/webm'
+    ];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Only JPG/JPEG/PNG/WEBP images and MP4/MOV/MKV/WEBM videos are allowed'), false);
+  },
+  limits: {
+    files: 4,
+    fileSize: 60 * 1024 * 1024
+  }
+});
+
+const uploadReturnProofs = returnProofUpload.fields([
+  { name: 'proofVideo', maxCount: 1 },
+  { name: 'proofImages', maxCount: 3 }
+]);
+
 
 module.exports = {
   uploadProductImages,
   uploadSingleImage,
   uploadCSVFile,
   uploadBulkNewProductFiles,
-  uploadWholesalerProofs
+  uploadWholesalerProofs,
+  uploadReturnProofs
 };

@@ -17,6 +17,8 @@ const cleanupService = require('./services/cleanup.service');
 const paymentHoldExpiryService = require('./services/paymentHoldExpiry.service');
 const logger = require('./utils/logger');
 const { CORS_STOREFRONT_ALLOWED_HEADERS } = require('./constants/storefrontHeaders');
+const Coupon = require('./models/Coupon');
+const Order = require('./models/Order');
 
 // Import middleware
 const { optionalAuth } = require('./middlewares/user-type-optional.middleware');
@@ -48,6 +50,19 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const app = express();
 let server = null;
+const FIRST_ORDER_COUPON_CODE = 'WELC01';
+
+const normalizeCouponCode = (code) => String(code || '').trim().toUpperCase();
+const isFirstOrderCoupon = (coupon) => normalizeCouponCode(coupon?.code) === FIRST_ORDER_COUPON_CODE;
+
+async function hasPlacedAnyOrder(userId) {
+  if (!userId) return false;
+  const placedOrderCount = await Order.countDocuments({
+    userId,
+    orderStatus: { $ne: 'payment_failed' }
+  });
+  return placedOrderCount > 0;
+}
 
 function parseBoolEnv(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -456,6 +471,44 @@ app.get('/api/public/razorpay-key', (req, res) => {
     requestId: req.id,
     keyId: String(keyId).trim()
   });
+});
+
+/** Public active coupons for marketing surfaces (PDP/home banners). */
+app.get('/api/public/coupons', async (req, res) => {
+  try {
+    setOperationalNoCacheHeaders(res);
+    const now = new Date();
+    let coupons = await Coupon.find({
+      isActive: true,
+      expiryDate: { $gt: now },
+      applicableUsers: { $in: ['user'] }
+    })
+      .sort({ expiryDate: 1, createdAt: -1 })
+      .select('code name description discountType discountValue minOrderValue maxDiscountAmount expiryDate')
+      .lean();
+
+    const alreadyPlacedOrder = await hasPlacedAnyOrder(req.userId);
+    if (alreadyPlacedOrder) {
+      coupons = coupons.filter((coupon) => !isFirstOrderCoupon(coupon));
+    } else {
+      coupons.sort((a, b) => Number(isFirstOrderCoupon(b)) - Number(isFirstOrderCoupon(a)));
+    }
+
+    return res.json({
+      success: true,
+      code: 'PUBLIC_COUPONS_OK',
+      requestId: req.id,
+      coupons
+    });
+  } catch (error) {
+    logger.error('public coupons fetch failed', { message: error.message, stack: error.stack });
+    return res.status(500).json({
+      success: false,
+      code: 'PUBLIC_COUPONS_FAILED',
+      requestId: req.id,
+      message: 'Failed to load coupons'
+    });
+  }
 });
 
 // Helper function to get event loop lag

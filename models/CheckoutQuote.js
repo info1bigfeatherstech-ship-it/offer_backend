@@ -53,6 +53,12 @@ const checkoutQuoteSchema = new mongoose.Schema(
       type: Number,
       default: null
     },
+    /** When plan is advance: balance collected online vs COD at delivery */
+    confirmedBalanceCollection: {
+      type: String,
+      enum: ['', 'online', 'cod'],
+      default: ''
+    },
     quoteExpiresAt: { type: Date, required: true },
     confirmedAt: { type: Date, default: null },
     lastValidatedAt: { type: Date, default: null }

@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const ShiprocketService = require('../utils/shiprocket');
 const logger = require('../utils/logger');
+const { cloudinary } = require('../config/cloudinary.config');
 const {
     computeCheckoutTotals,
     cartFingerprintFromItems,
@@ -18,13 +19,14 @@ const {
 } = require('../services/checkoutComputation.service');
 const { releaseReservedInventoryForOrder } = require('../services/orderInventory.service');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
+const checkoutSettingsService = require('../services/checkoutSettings.service');
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
-    ALLOWED_ADVANCE_PAYMENT_PERCENTS,
-    normalizeAdvancePaymentPercent,
+    normalizeBalanceCollection,
+    parseQuoteLockedAdvancePercent,
     resolveDefaultAdvancePercent,
-    resolveAdvancePaymentSelection,
+    resolveAdvancePaymentSelectionWithPolicy,
     normalizeIdempotencyKey,
     createInvalidPaymentMethodError,
     createQuoteExpiredError,
@@ -43,6 +45,115 @@ const razorpay = new Razorpay({
     key_id: String(process.env.RAZORPAY_KEY_ID || '').trim(),
     key_secret: String(process.env.RAZORPAY_KEY_SECRET || '').trim()
 });
+
+const RETURN_REASON_TYPES = new Set(['damaged', 'wrong_item']);
+const RETURN_REQUEST_WINDOW_DAYS = (() => {
+    const raw = String(process.env.RETURN_REQUEST_WINDOW_DAYS || '').trim();
+    if (!raw) return null; // disabled unless explicitly configured
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        logger.warn('Invalid RETURN_REQUEST_WINDOW_DAYS. Return window check disabled.', { value: raw });
+        return null;
+    }
+    return Math.floor(parsed);
+})();
+
+function normalizeReturnReasonType(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!RETURN_REASON_TYPES.has(normalized)) return null;
+    return normalized;
+}
+
+function normalizeReturnReasonMessage(value) {
+    const msg = String(value || '').trim();
+    if (!msg) return null;
+    return msg.slice(0, 500);
+}
+
+function evaluateReturnRequestWindow(order) {
+    if (!RETURN_REQUEST_WINDOW_DAYS) {
+        return { enabled: false, expired: false };
+    }
+    const deliveredAtRaw = order?.shipmentInfo?.deliveredAt || null;
+    if (!deliveredAtRaw) {
+        // Preserve existing behavior for legacy orders with missing delivered timestamp.
+        logger.warn('Delivered order missing deliveredAt; skipping return window validation', {
+            orderId: order?.orderId
+        });
+        return { enabled: true, skipped: true, expired: false };
+    }
+    const deliveredAt = new Date(deliveredAtRaw);
+    if (Number.isNaN(deliveredAt.getTime())) {
+        logger.warn('Invalid deliveredAt; skipping return window validation', {
+            orderId: order?.orderId,
+            deliveredAtRaw
+        });
+        return { enabled: true, skipped: true, expired: false };
+    }
+    const deadlineAt = new Date(deliveredAt.getTime() + RETURN_REQUEST_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    const now = new Date();
+    const expired = now > deadlineAt;
+    return {
+        enabled: true,
+        skipped: false,
+        expired,
+        days: RETURN_REQUEST_WINDOW_DAYS,
+        deliveredAt,
+        deadlineAt
+    };
+}
+
+function mapReturnCarrierStatus(rawStatus) {
+    const status = String(rawStatus || '').trim().toLowerCase();
+    if (!status) return null;
+    if (status.includes('cancel')) return 'reverse_cancelled';
+    if (status.includes('deliver') || status.includes('received')) return 'received';
+    if (status.includes('out for pickup') || status.includes('pickup')) return 'pickup_in_progress';
+    if (status.includes('in transit') || status.includes('transit')) return 'in_transit_to_warehouse';
+    if (status.includes('created') || status.includes('booked')) return 'reverse_pickup_created';
+    return null;
+}
+
+function isReturnRefundEligible(order) {
+    const status = String(order?.returnInfo?.status || '').toLowerCase();
+    return ['received', 'qc_passed', 'refund_pending'].includes(status);
+}
+
+function buildReturnProofUploadError(message, extras = {}) {
+    const err = new Error(message);
+    err.statusCode = 400;
+    err.code = 'RETURN_PROOF_INVALID';
+    Object.assign(err, extras);
+    return err;
+}
+
+function uploadReturnProofToCloudinary(file, orderId) {
+    const isVideo = String(file.mimetype || '').startsWith('video/');
+    const resourceType = isVideo ? 'video' : 'image';
+    return new Promise((resolve, reject) => {
+        const uploadOptions = {
+            folder: `returns/${orderId}`,
+            resource_type: resourceType,
+            public_id: `${isVideo ? 'video' : 'image'}-${Date.now()}`
+        };
+        if (!isVideo) {
+            uploadOptions.format = 'webp';
+            uploadOptions.transformation = [{ quality: 'auto' }];
+        }
+        const stream = cloudinary.uploader.upload_stream(uploadOptions, (error, result) => {
+            if (error) {
+                reject(new Error(`Proof upload failed: ${error.message}`));
+                return;
+            }
+            resolve({
+                kind: isVideo ? 'video' : 'image',
+                url: result.secure_url,
+                publicId: result.public_id
+            });
+        });
+        stream.end(file.buffer);
+    });
+}
 
 async function applyRefundEntryToOrder(order, refundEntity) {
     if (!order || !refundEntity) return;
@@ -216,7 +327,11 @@ function mapExternalShipmentStatusToOrderStatus(rawStatus) {
     const status = String(rawStatus || '').trim().toLowerCase();
     if (!status) return null;
 
-    const shippedKeywords = ['ship', 'pickup', 'manifest', 'awb assigned', 'in transit', 'transit', 'booked'];
+    // Guard: "created" states are NOT shipped.
+    if (['shipment_created', 'order_created', 'created', 'new'].includes(status)) return null;
+
+    // Avoid overly-broad "ship" substring matching (e.g. "shipment_created").
+    const shippedKeywords = ['shipped', 'picked up', 'pickup', 'manifest', 'awb assigned', 'in transit', 'transit', 'booked'];
     const outForDeliveryKeywords = ['out for delivery', 'ofd'];
     const deliveredKeywords = ['deliver', 'completed'];
     const cancelledKeywords = ['cancel', 'undelivered', 'rto', 'return to origin', 'reverse'];
@@ -316,7 +431,15 @@ async function markShipmentSyncFailure({ order, error, trigger }) {
 async function ensureShipmentForOrder({ order, trigger }) {
     if (!order) return { success: false, code: 'ORDER_REQUIRED' };
     const paymentMethod = String(order.paymentInfo?.method || '').toLowerCase();
-    const canCreateShipment = paymentMethod === 'cod' || order.paymentStatus === 'paid';
+    const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
+    const advancePaid =
+        balanceViaCod &&
+        order.paymentStatus === 'partially_paid' &&
+        Number(order.amountPaidInr || 0) > 0.01;
+    const canCreateShipment =
+        paymentMethod === 'cod' ||
+        order.paymentStatus === 'paid' ||
+        advancePaid;
     if (!canCreateShipment) {
         return { success: false, code: 'SHIPMENT_NOT_ELIGIBLE' };
     }
@@ -335,14 +458,32 @@ async function ensureShipmentForOrder({ order, trigger }) {
         };
     }
 
+    // Shiprocket "success" must include a tangible reference; otherwise treat as failure.
+    const hasTrackingRef = Boolean(result?.awbCode || result?.trackingNumber || result?.shipmentId);
+    if (!hasTrackingRef && !result?.mock) {
+        await markShipmentSyncFailure({
+            order,
+            error: result?.raw || result?.providerStatus || 'Shiprocket returned success without AWB/shipmentId',
+            trigger
+        });
+        return {
+            success: false,
+            code: 'SHIPMENT_CREATE_INCOMPLETE',
+            message: 'Shipment creation incomplete',
+            details: result?.raw || null
+        };
+    }
+
     await upsertShipmentInfo({
         order,
         shipmentPayload: {
             ...result,
-            providerStatus: result.providerStatus || 'shipment_created'
+            // Do NOT force a "shipped-like" status here; let Shiprocket/tracking drive state.
+            providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null)
         },
         trigger,
-        allowOrderStatusUpdate: true
+        // Never advance order status to shipped unless we have a tracking reference.
+        allowOrderStatusUpdate: hasTrackingRef
     });
     return { success: true, shipment: result };
 }
@@ -492,7 +633,15 @@ exports.createOrder = async (req, res) => {
 
     try {
         // Never trust client totals — only address, payment channel, user type, coupon code, Razorpay split mode
-        const { addressId, paymentMethod, couponCode, onlinePaymentMode = 'full', paymentAdvancePercent, quoteId } = req.body || {};
+        const {
+            addressId,
+            paymentMethod,
+            couponCode,
+            onlinePaymentMode = 'full',
+            paymentAdvancePercent,
+            balanceCollection,
+            quoteId
+        } = req.body || {};
         const idempotency = await resolveIdempotencyRecord({ req, body: req.body || {} });
         if (idempotency.existingOrder) {
             logger.info('Replaying existing order for idempotent request', buildRequestLogContext(req, {
@@ -525,25 +674,44 @@ exports.createOrder = async (req, res) => {
         if (!normalizedPaymentMethod) {
             throw createInvalidPaymentMethodError();
         }
-        const {
-            normalizedPaymentPlan: normalizedOnlinePaymentMode,
-            hasAdvancePercentInput: hasAdvancePercentInputInRequest,
-            normalizedAdvancePercentInput: normalizedAdvancePercent,
-            effectiveAdvancePercent
-        } = resolveAdvancePaymentSelection({
-            paymentPlan: onlinePaymentMode,
-            paymentAdvancePercent
-        });
-        if (normalizedOnlinePaymentMode === 'advance' && hasAdvancePercentInputInRequest && normalizedAdvancePercent == null) {
+
+        const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
+        if (normalizedPaymentMethod === 'cod' && !checkoutPolicy.codEnabled) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
                 await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
             }
             return res.status(400).json({
                 success: false,
-                code: 'INVALID_ADVANCE_PERCENT',
-                message: `paymentAdvancePercent must be one of: ${ALLOWED_ADVANCE_PAYMENT_PERCENTS.join(', ')}`
+                code: 'COD_DISABLED_BY_STORE',
+                message: 'Cash on delivery is not available at the moment.'
             });
+        }
+
+        let normalizedOnlinePaymentMode;
+        let effectiveAdvancePercent;
+        try {
+            const sel = resolveAdvancePaymentSelectionWithPolicy({
+                paymentPlan: onlinePaymentMode,
+                paymentAdvancePercent,
+                policy: checkoutPolicy
+            });
+            normalizedOnlinePaymentMode = sel.normalizedPaymentPlan;
+            effectiveAdvancePercent = sel.effectiveAdvancePercent;
+        } catch (policyErr) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            if (policyErr?.statusCode) {
+                return sendCheckoutFlowError(
+                    res,
+                    policyErr,
+                    'Checkout validation failed',
+                    'ORDER_CHECKOUT_VALIDATION_FAILED'
+                );
+            }
+            throw policyErr;
         }
 
         if (!quoteId) {
@@ -682,12 +850,19 @@ exports.createOrder = async (req, res) => {
         const confirmedPaymentPlan = quoteHasPaymentLock
             ? normalizePaymentPlan(quote.confirmedPaymentPlan || 'full')
             : normalizedOnlinePaymentMode;
-        const confirmedAdvancePercentRaw = normalizeAdvancePaymentPercent(quote.confirmedAdvancePercent);
+        const confirmedAdvancePercentRaw = parseQuoteLockedAdvancePercent(quote.confirmedAdvancePercent);
         const defaultAdvancePercent = resolveDefaultAdvancePercent();
-        const requestedAdvancePercent = effectiveAdvancePercent || defaultAdvancePercent;
-        const confirmedAdvancePercent = confirmedPaymentPlan === 'advance'
-            ? (confirmedAdvancePercentRaw || defaultAdvancePercent)
-            : null;
+        const policyAdvancePercent =
+            confirmedPaymentPlan === 'advance' && effectiveAdvancePercent != null
+                ? roundMoney2(effectiveAdvancePercent)
+                : null;
+        if (confirmedPaymentPlan === 'advance' && confirmedAdvancePercentRaw == null) {
+            throw createQuoteStaleError('quote_advance_missing', {
+                message: 'Checkout quote is missing advance payment details. Please reconfirm checkout.'
+            });
+        }
+        const confirmedAdvancePercent =
+            confirmedPaymentPlan === 'advance' ? confirmedAdvancePercentRaw : null;
 
         if (confirmedPaymentMethod !== normalizedPaymentMethod) {
             throw createQuoteStaleError('payment_method_changed', {
@@ -699,12 +874,57 @@ exports.createOrder = async (req, res) => {
                 message: 'Payment plan changed after quote confirmation. Please reconfirm checkout.'
             });
         }
-        if (confirmedPaymentPlan === 'advance' && hasAdvancePercentInputInRequest && requestedAdvancePercent !== confirmedAdvancePercent) {
+        if (
+            confirmedPaymentPlan === 'advance' &&
+            policyAdvancePercent != null &&
+            confirmedAdvancePercent != null &&
+            roundMoney2(policyAdvancePercent) !== roundMoney2(confirmedAdvancePercent)
+        ) {
             throw createQuoteStaleError('advance_percent_changed', {
                 message: 'Advance percent changed after quote confirmation. Please reconfirm checkout.'
             });
         }
+
+        const quoteBalanceLocked =
+            confirmedPaymentPlan === 'advance'
+                ? (String(quote.confirmedBalanceCollection || '') === 'cod' ? 'cod' : 'online')
+                : 'online';
+        const requestBalance = normalizeBalanceCollection(balanceCollection);
+        if (confirmedPaymentPlan === 'advance' && quoteBalanceLocked !== requestBalance) {
+            throw createQuoteStaleError('balance_collection_changed', {
+                message: 'Balance payment method changed after quote confirmation. Please reconfirm checkout.'
+            });
+        }
+
+        const isAdvanceBalanceCod =
+            normalizedPaymentMethod === 'online' &&
+            confirmedPaymentPlan === 'advance' &&
+            quoteBalanceLocked === 'cod';
+
+        if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(400).json({
+                success: false,
+                code: 'COD_DISABLED_BY_STORE',
+                message: 'Cash on delivery is not available for the remaining balance at the moment.'
+            });
+        }
+
         if (normalizedPaymentMethod === 'cod' && quote.shippingMeta?.codAvailable === false) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(400).json({
+                success: false,
+                code: 'COD_NOT_AVAILABLE',
+                message: 'COD is not available for this quote'
+            });
+        }
+        if (isAdvanceBalanceCod && quote.shippingMeta?.codAvailable === false) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
                 await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
@@ -741,6 +961,9 @@ exports.createOrder = async (req, res) => {
                 deliveryMetaOverride: deliveryOverride ? deliveryOverride.meta : null
             });
 
+        const advancePercent =
+            confirmedAdvancePercent != null ? confirmedAdvancePercent : defaultAdvancePercent;
+
         let last;
         let priced;
         try {
@@ -750,16 +973,28 @@ exports.createOrder = async (req, res) => {
                     const codVal = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
                     last = await buildTotals(false, codVal);
                 }
+                priced = await buildTotals(
+                    true,
+                    roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges)
+                );
+            } else if (isAdvanceBalanceCod) {
+                last = await buildTotals(false, 0);
+                for (let i = 0; i < 2; i++) {
+                    const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+                    const advInrRaw = roundMoney2((totalInr * advancePercent) / 100);
+                    const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
+                    const balanceCod = roundMoney2(totalInr - advInr);
+                    last = await buildTotals(false, balanceCod);
+                }
+                const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+                const advInrRaw = roundMoney2((totalInr * advancePercent) / 100);
+                const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
+                const finalBalanceCod = roundMoney2(totalInr - advInr);
+                priced = await buildTotals(true, finalBalanceCod);
             } else {
                 last = await buildTotals(false, 0);
+                priced = await buildTotals(true, 0);
             }
-
-            priced = await buildTotals(
-                true,
-                normalizedPaymentMethod === 'cod'
-                    ? roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges)
-                    : 0
-            );
         } catch (e) {
             await abortTransactionSafely(session);
             session.endSession();
@@ -792,7 +1027,6 @@ exports.createOrder = async (req, res) => {
 
         await reserveInventoryAtomically(lines, session);
 
-        const advancePercent = confirmedAdvancePercent || defaultAdvancePercent;
         let razorpayChargePaise = Math.round(roundMoney2(totalAmount) * 100);
         let splitMode = 'full';
         let balanceDueInr = 0;
@@ -833,6 +1067,8 @@ exports.createOrder = async (req, res) => {
                 amountPaise: razorpayChargePaise,
                 splitMode,
                 advancePercent: splitMode === 'advance' ? advancePercent : null,
+                balanceCollectionMethod:
+                    splitMode === 'advance' ? (isAdvanceBalanceCod ? 'cod' : 'online') : 'online',
                 fullOrderAmountPaise: Math.round(roundMoney2(totalAmount) * 100),
                 quoteId: String(quote._id),
                 sessions: []
@@ -1202,7 +1438,12 @@ exports.verifyPayment = async (req, res) => {
         order.markModified('paymentInfo');
         await order.save();
 
-        if (order.paymentStatus === 'paid' && !order.shipmentInfo?.trackingNumber) {
+        const shouldEnqueueShipmentAfterVerify =
+            !order.shipmentInfo?.trackingNumber &&
+            (order.paymentStatus === 'paid' ||
+                (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
+                    order.paymentStatus === 'partially_paid'));
+        if (shouldEnqueueShipmentAfterVerify) {
             ensureShipmentForOrder({
                 order,
                 trigger: 'payment_verified'
@@ -1325,7 +1566,12 @@ exports.razorpayWebhook = async (req, res) => {
                 order.markModified('paymentInfo');
                 await order.save();
 
-                if (order.paymentStatus === 'paid' && !order.shipmentInfo?.trackingNumber) {
+                const shouldEnqueueShipmentAfterWebhook =
+                    !order.shipmentInfo?.trackingNumber &&
+                    (order.paymentStatus === 'paid' ||
+                        (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
+                            order.paymentStatus === 'partially_paid'));
+                if (shouldEnqueueShipmentAfterWebhook) {
                     ensureShipmentForOrder({
                         order,
                         trigger: 'razorpay_webhook_payment_captured'
@@ -1409,6 +1655,7 @@ exports.shiprocketWebhook = async (req, res) => {
             payload.status ||
             payload.current_status_description ||
             null;
+        const mappedReturnStatus = mapReturnCarrierStatus(providerStatus);
 
         const eventTimestamp = normalizeShipmentEventTimestamp(
             payload.event_time ||
@@ -1443,6 +1690,26 @@ exports.shiprocketWebhook = async (req, res) => {
             allowOrderStatusUpdate: true
         });
 
+        if (mappedReturnStatus && order.returnInfo && String(order.returnInfo.status || '').trim()) {
+            const previousReturnStatus = String(order.returnInfo.status || '').toLowerCase();
+            order.returnInfo = {
+                ...(order.returnInfo || {}),
+                reverseProviderStatus: providerStatus || order.returnInfo?.reverseProviderStatus || null,
+                reverseLastSyncAt: new Date(),
+                reverseLastError: null,
+                status: mappedReturnStatus,
+                reverseEvents: nextEvents.slice(-50)
+            };
+            if (
+                mappedReturnStatus === 'received' &&
+                ['approved', 'reverse_pickup_created', 'pickup_in_progress', 'in_transit_to_warehouse'].includes(previousReturnStatus)
+            ) {
+                order.returnInfo.status = 'refund_pending';
+            }
+            order.markModified('returnInfo');
+            await order.save();
+        }
+
         return res.json({ success: true });
     } catch (error) {
         logger.error('Shiprocket webhook error', {
@@ -1463,6 +1730,14 @@ exports.payOrderBalance = async (req, res) => {
         }
         if (order.paymentStatus === 'paid') {
             return respondOrderError(res, 400, 'ORDER_ALREADY_PAID', 'Order is already fully paid');
+        }
+        if (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod') {
+            return respondOrderError(
+                res,
+                400,
+                'BALANCE_COD_AT_DELIVERY',
+                'The remaining balance is collected on delivery. Online balance payment is not available for this order.'
+            );
         }
         const due = roundMoney2(order.balanceDueInr || order.totalAmount - (order.amountPaidInr || 0));
         if (!Number.isFinite(due) || due <= 0.01) {
@@ -2117,6 +2392,356 @@ exports.trackOrder = async (req, res) => {
         return respondOrderError(res, 500, 'ORDER_TRACK_FAILED', 'Error tracking order', {
             error: error.message
         });
+    }
+};
+
+exports.createReturnRequest = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const order = await Order.findOne({ orderId, userId: req.userId });
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (String(order.orderStatus || '').toLowerCase() !== 'delivered') {
+            return respondOrderError(res, 400, 'RETURN_NOT_ELIGIBLE', 'Return request is allowed only for delivered orders');
+        }
+        const existingStatus = String(order.returnInfo?.status || '').toLowerCase();
+        if (existingStatus && !['rejected', 'closed'].includes(existingStatus)) {
+            return respondOrderError(res, 409, 'RETURN_REQUEST_EXISTS', 'Return request already exists for this order');
+        }
+        const windowEval = evaluateReturnRequestWindow(order);
+        if (windowEval.enabled && !windowEval.skipped && windowEval.expired) {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_WINDOW_EXPIRED',
+                `Return request window of ${windowEval.days} days has expired for this order`,
+                {
+                    deliveredAt: windowEval.deliveredAt.toISOString(),
+                    returnLastDate: windowEval.deadlineAt.toISOString(),
+                    returnWindowDays: windowEval.days
+                }
+            );
+        }
+
+        const reasonType = normalizeReturnReasonType(req.body?.reasonType);
+        if (!reasonType) {
+            return respondOrderError(res, 400, 'RETURN_REASON_INVALID', 'Return reason must be damaged or wrong_item');
+        }
+        const reasonMessage = normalizeReturnReasonMessage(req.body?.reasonMessage);
+        if (!reasonMessage) {
+            return respondOrderError(res, 400, 'RETURN_MESSAGE_REQUIRED', 'Please describe the issue');
+        }
+
+        const files = req.files || {};
+        const proofVideo = Array.isArray(files.proofVideo) ? files.proofVideo[0] : null;
+        const proofImages = Array.isArray(files.proofImages) ? files.proofImages : [];
+        if (!proofVideo || proofImages.length === 0) {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_PROOF_REQUIRED',
+                'Please upload one proof video and at least one proof image'
+            );
+        }
+
+        if (!proofVideo.mimetype?.startsWith('video/')) {
+            throw buildReturnProofUploadError('proofVideo must be a video file');
+        }
+
+        const uploads = [
+            uploadReturnProofToCloudinary(proofVideo, order.orderId),
+            ...proofImages.map((image) => uploadReturnProofToCloudinary(image, order.orderId))
+        ];
+        const proofs = await Promise.all(uploads);
+
+        order.returnInfo = {
+            ...(order.returnInfo || {}),
+            reasonType,
+            reasonMessage,
+            proofs,
+            requestedAt: new Date(),
+            approvedAt: null,
+            approvedBy: null,
+            rejectedAt: null,
+            rejectedBy: null,
+            decisionReason: null,
+            status: 'requested',
+            reverseShipmentId: null,
+            reverseAwbCode: null,
+            reverseTrackingNumber: null,
+            reverseCourier: null,
+            reverseProviderStatus: null,
+            reverseEvents: [],
+            reverseLastSyncAt: null,
+            reverseLastError: null,
+            refundInitiatedAt: null
+        };
+        order.orderStatus = 'return_requested';
+        order.markModified('returnInfo');
+        await order.save();
+
+        return res.status(201).json({
+            success: true,
+            message: 'Return request submitted successfully',
+            returnRequest: {
+                orderId: order.orderId,
+                status: order.returnInfo.status,
+                reasonType: order.returnInfo.reasonType,
+                requestedAt: order.returnInfo.requestedAt
+            }
+        });
+    } catch (error) {
+        logger.error('createReturnRequest failed', { message: error.message, stack: error.stack });
+        const status = error.statusCode && Number.isFinite(error.statusCode) ? error.statusCode : 500;
+        return respondOrderError(res, status, error.code || 'RETURN_REQUEST_FAILED', error.message || 'Could not create return request');
+    }
+};
+
+exports.listAdminReturnRequests = async (req, res) => {
+    try {
+        const statusFilter = String(req.query?.status || '').trim().toLowerCase();
+        const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const filter = {
+            'returnInfo.requestedAt': { $ne: null }
+        };
+        if (statusFilter) {
+            filter['returnInfo.status'] = statusFilter;
+        }
+
+        const [rows, total] = await Promise.all([
+            Order.find(filter)
+                .sort({ 'returnInfo.requestedAt': -1 })
+                .skip(skip)
+                .limit(limit)
+                .select('orderId totalAmount paymentStatus orderStatus returnInfo addressSnapshot createdAt updatedAt')
+                .lean(),
+            Order.countDocuments(filter)
+        ]);
+
+        const data = rows.map((o) => ({
+            orderId: o.orderId,
+            createdAt: o.createdAt,
+            updatedAt: o.updatedAt,
+            totalAmount: o.totalAmount,
+            paymentStatus: o.paymentStatus,
+            orderStatus: o.orderStatus,
+            customerName: o.addressSnapshot?.fullName || null,
+            customerPhone: o.addressSnapshot?.phone || null,
+            returnInfo: {
+                status: o.returnInfo?.status || null,
+                reasonType: o.returnInfo?.reasonType || null,
+                requestedAt: o.returnInfo?.requestedAt || null,
+                approvedAt: o.returnInfo?.approvedAt || null,
+                rejectedAt: o.returnInfo?.rejectedAt || null,
+                reverseProviderStatus: o.returnInfo?.reverseProviderStatus || null
+            }
+        }));
+
+        return res.json({
+            success: true,
+            data,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit) || 0,
+                hasNextPage: page * limit < total,
+                hasPrevPage: page > 1
+            }
+        });
+    } catch (error) {
+        logger.error('listAdminReturnRequests failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'RETURN_REQUEST_LIST_FAILED', 'Could not load return requests');
+    }
+};
+
+exports.getAdminReturnRequest = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const order = await Order.findOne({ orderId })
+            .populate('items.productId', 'name slug')
+            .lean();
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (!order.returnInfo?.requestedAt) {
+            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No return request found for this order');
+        }
+        return res.json({
+            success: true,
+            order
+        });
+    } catch (error) {
+        logger.error('getAdminReturnRequest failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'RETURN_REQUEST_FETCH_FAILED', 'Could not load return request');
+    }
+};
+
+exports.adminDecideReturnRequest = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const decision = String(req.body?.decision || '').trim().toLowerCase();
+        const decisionReason = normalizeReturnReasonMessage(req.body?.decisionReason);
+        if (!['approve', 'reject'].includes(decision)) {
+            return respondOrderError(res, 400, 'RETURN_DECISION_INVALID', 'Decision must be approve or reject');
+        }
+
+        const order = await Order.findOne({ orderId });
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (String(order.returnInfo?.status || '').toLowerCase() !== 'requested') {
+            return respondOrderError(res, 409, 'RETURN_DECISION_NOT_ALLOWED', 'Only requested returns can be reviewed');
+        }
+
+        if (decision === 'reject') {
+            if (!decisionReason) {
+                return respondOrderError(res, 400, 'RETURN_REJECT_REASON_REQUIRED', 'Please provide rejection reason');
+            }
+            order.returnInfo = {
+                ...(order.returnInfo || {}),
+                status: 'rejected',
+                rejectedAt: new Date(),
+                rejectedBy: req.userId || null,
+                decisionReason
+            };
+            if (String(order.orderStatus || '').toLowerCase() === 'return_requested') {
+                order.orderStatus = 'delivered';
+            }
+            order.markModified('returnInfo');
+            await order.save();
+            return res.json({ success: true, message: 'Return request rejected', orderId: order.orderId });
+        }
+
+        const reverse = await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
+        if (!reverse?.success) {
+            order.returnInfo = {
+                ...(order.returnInfo || {}),
+                status: 'approval_failed',
+                reverseLastError: String(reverse?.error || 'Could not initiate reverse pickup')
+            };
+            order.markModified('returnInfo');
+            await order.save();
+            return respondOrderError(
+                res,
+                502,
+                'REVERSE_PICKUP_CREATE_FAILED',
+                'Return approved but reverse pickup initiation failed',
+                { details: reverse?.error || null }
+            );
+        }
+
+        order.returnInfo = {
+            ...(order.returnInfo || {}),
+            status: 'approved',
+            approvedAt: new Date(),
+            approvedBy: req.userId || null,
+            decisionReason: decisionReason || null,
+            reverseShipmentId: reverse.reverseShipmentId || null,
+            reverseAwbCode: reverse.reverseAwbCode || null,
+            reverseTrackingNumber: reverse.reverseTrackingNumber || null,
+            reverseCourier: reverse.reverseCourier || null,
+            reverseProviderStatus: reverse.providerStatus || 'reverse_pickup_created',
+            reverseLastSyncAt: new Date(),
+            reverseLastError: null
+        };
+        order.markModified('returnInfo');
+        await order.save();
+
+        return res.json({
+            success: true,
+            message: 'Return request approved and reverse pickup initiated',
+            orderId: order.orderId
+        });
+    } catch (error) {
+        logger.error('adminDecideReturnRequest failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'RETURN_DECISION_FAILED', 'Could not process return decision');
+    }
+};
+
+exports.adminInitiateReturnRefund = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const order = await Order.findOne({ orderId });
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (!order.returnInfo?.requestedAt) {
+            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No return request found for this order');
+        }
+        if (!isReturnRefundEligible(order)) {
+            return respondOrderError(
+                res,
+                409,
+                'RETURN_REFUND_NOT_ELIGIBLE',
+                'Refund can be initiated only after return is received/QC passed'
+            );
+        }
+        if (String(order.paymentInfo?.method || '').toLowerCase() !== 'online') {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_REFUND_NON_ONLINE',
+                'Automatic refund is available only for online payments'
+            );
+        }
+        if (!order.paymentInfo?.razorpayPaymentId) {
+            return respondOrderError(res, 400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment found on this order');
+        }
+        if (!['paid', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) {
+            return respondOrderError(res, 400, 'ORDER_NOT_REFUNDABLE', 'Order is not in refundable payment state');
+        }
+
+        const alreadyRefundedInr = roundMoney2(
+            (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
+        );
+        const remainingInr = roundMoney2(order.totalAmount - alreadyRefundedInr);
+        if (remainingInr <= 0) {
+            return respondOrderError(res, 400, 'REFUND_NOTHING_PENDING', 'Nothing left to refund');
+        }
+
+        const refund = await razorpay.payments.refund(order.paymentInfo.razorpayPaymentId, {
+            amount: Math.round(remainingInr * 100),
+            speed: 'normal',
+            notes: {
+                orderId: order.orderId,
+                reason: 'return_received_refund'
+            }
+        });
+
+        await applyRefundEntryToOrder(order, refund);
+        order.returnInfo = {
+            ...(order.returnInfo || {}),
+            status: 'refunded',
+            refundInitiatedAt: new Date(),
+            refundAmount: remainingInr,
+            refundId: refund.id
+        };
+        order.markModified('returnInfo');
+        await order.save();
+
+        return res.json({
+            success: true,
+            message: 'Refund initiated successfully',
+            orderId: order.orderId,
+            refund: {
+                id: refund.id,
+                amountInr: remainingInr,
+                status: refund.status
+            }
+        });
+    } catch (error) {
+        logger.error('adminInitiateReturnRefund failed', { message: error.message, stack: error.stack });
+        return respondOrderError(
+            res,
+            500,
+            'RETURN_REFUND_INIT_FAILED',
+            error.error?.description || error.message || 'Could not initiate refund'
+        );
     }
 };
 

@@ -1,7 +1,32 @@
 // controllers/coupon.controller.js
 const Coupon = require('../models/Coupon');
 const Cart = require('../models/cart');
+const Order = require('../models/Order');
 const { evaluateCartForCheckout, couponUserEligible } = require('../services/checkoutComputation.service');
+
+const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const FIRST_ORDER_COUPON_CODE = 'WELC01';
+
+const normalizeCouponCode = (code) => String(code || '').trim().toUpperCase();
+const isFirstOrderCoupon = (coupon) => normalizeCouponCode(coupon?.code) === FIRST_ORDER_COUPON_CODE;
+
+async function hasPlacedAnyOrder(userId) {
+    if (!userId) return false;
+    const placedOrderCount = await Order.countDocuments({
+        userId,
+        orderStatus: { $ne: 'payment_failed' }
+    });
+    return placedOrderCount > 0;
+}
+
+function couponError(res, statusCode, code, message, details = undefined) {
+    return res.status(statusCode).json({
+        success: false,
+        code,
+        message,
+        ...(details ? { details } : {})
+    });
+}
 
 // ==================== ADMIN FUNCTIONS ====================
 
@@ -250,30 +275,21 @@ const validateCoupon = async (req, res) => {
         const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
 
         if (!couponCode) {
-            return res.status(400).json({
-                success: false,
-                message: 'Coupon code is required'
-            });
+            return couponError(res, 400, 'COUPON_CODE_REQUIRED', 'Coupon code is required');
         }
 
         let effectiveSubtotal = Number(subtotal);
         if (useServercart || subtotal === undefined || subtotal === null) {
             const cartDoc = await Cart.findOne({ userId });
             if (!cartDoc?.items?.length) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'cart is empty — add items before applying a coupon'
-                });
+                return couponError(res, 400, 'CART_EMPTY', 'Cart is empty — add items before applying a coupon');
             }
             const ev = await evaluateCartForCheckout(cartDoc, finalUserType, null, req.storefront || 'ecomm');
             effectiveSubtotal = ev.subtotal;
         }
 
         if (!Number.isFinite(effectiveSubtotal) || effectiveSubtotal < 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid cart subtotal'
-            });
+            return couponError(res, 400, 'INVALID_CART_SUBTOTAL', 'Invalid cart subtotal');
         }
 
         const coupon = await Coupon.findOne({ 
@@ -282,42 +298,46 @@ const validateCoupon = async (req, res) => {
         });
 
         if (!coupon) {
-            return res.status(404).json({
-                success: false,
-                message: 'Invalid coupon code'
-            });
+            return couponError(res, 404, 'COUPON_NOT_FOUND', 'Invalid coupon code');
         }
 
         // Check expiry
         if (coupon.expiryDate < new Date()) {
-            return res.status(400).json({
-                success: false,
-                message: 'Coupon has expired'
-            });
+            return couponError(res, 400, 'COUPON_EXPIRED', 'Coupon has expired');
         }
 
         // Check user eligibility (align with checkout / orders)
         if (!couponUserEligible(coupon, finalUserType)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Coupon not applicable for your account type'
-            });
+            return couponError(res, 400, 'COUPON_NOT_ELIGIBLE', 'Coupon not applicable for your account type');
+        }
+
+        // First-order only coupon guard (admin-managed by code)
+        if (isFirstOrderCoupon(coupon)) {
+            const alreadyPlacedOrder = await hasPlacedAnyOrder(userId);
+            if (alreadyPlacedOrder) {
+                return couponError(res, 400, 'COUPON_FIRST_ORDER_ONLY', 'This coupon is only valid for first-time orders');
+            }
         }
 
         // Check minimum order value
         if (effectiveSubtotal < coupon.minOrderValue) {
-            return res.status(400).json({
-                success: false,
-                message: `Minimum order value of ₹${coupon.minOrderValue} required to use this coupon`
-            });
+            const shortfallInr = roundMoney2(Number(coupon.minOrderValue) - Number(effectiveSubtotal));
+            return couponError(
+                res,
+                400,
+                'COUPON_MIN_ORDER_NOT_MET',
+                `Minimum order value of ₹${coupon.minOrderValue} required to use this coupon`,
+                {
+                    minOrderValue: roundMoney2(coupon.minOrderValue),
+                    subtotal: roundMoney2(effectiveSubtotal),
+                    shortfallInr: Math.max(0, shortfallInr)
+                }
+            );
         }
 
         // Check usage limit
         if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit) {
-            return res.status(400).json({
-                success: false,
-                message: 'Coupon usage limit has been reached'
-            });
+            return couponError(res, 400, 'COUPON_USAGE_LIMIT_REACHED', 'Coupon usage limit has been reached');
         }
 
         // Check per user limit (you'll need a UserCouponUsage model for this)
@@ -353,11 +373,7 @@ const validateCoupon = async (req, res) => {
 
     } catch (error) {
         console.error('Validate coupon error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Error validating coupon',
-            error: error.message
-        });
+        return couponError(res, 500, 'COUPON_VALIDATE_FAILED', 'Error validating coupon');
     }
 };
 
@@ -372,11 +388,18 @@ const getAvailableCoupons = async (req, res) => {
                 ? { $in: ['wholesaler'] }
                 : { $in: ['user', 'normal'] };
 
-        const coupons = await Coupon.find({
+        let coupons = await Coupon.find({
             isActive: true,
             expiryDate: { $gt: now },
             applicableUsers: applicableFilter
         }).select('code name description discountType discountValue maxDiscountAmount minOrderValue expiryDate');
+
+        const alreadyPlacedOrder = await hasPlacedAnyOrder(req.userId);
+        if (alreadyPlacedOrder) {
+            coupons = coupons.filter((coupon) => !isFirstOrderCoupon(coupon));
+        } else {
+            coupons = coupons.sort((a, b) => Number(isFirstOrderCoupon(b)) - Number(isFirstOrderCoupon(a)));
+        }
 
         return res.json({
             success: true,
