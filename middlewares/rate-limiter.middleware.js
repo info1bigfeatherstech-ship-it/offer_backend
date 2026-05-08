@@ -1,6 +1,14 @@
 const rateLimit = require('express-rate-limit');
 const logger = require('../utils/logger');
 
+function resolveRateLimitKey(req, type) {
+  const userId = req?.user?._id || req?.user?.id || null;
+  if (userId) {
+    return `${type}:user:${String(userId)}`;
+  }
+  return `${type}:ip:${req.ip}`;
+}
+
 // Different limits for different endpoints (Industry standard)
 const rateLimits = {
   // Public read operations - HIGH limit (products, categories)
@@ -22,6 +30,34 @@ const rateLimits = {
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: 'Too many write operations'
+  },
+
+  // Cart updates can be frequent due to +/- controls.
+  cartWrite: {
+    windowMs: 15 * 60 * 1000,
+    max: 180,
+    message: 'Too many cart operations. Please slow down'
+  },
+
+  // Coupon validation/apply should be isolated from cart/checkout writes.
+  couponWrite: {
+    windowMs: 15 * 60 * 1000,
+    max: 80,
+    message: 'Too many coupon operations. Please wait and try again'
+  },
+
+  // Checkout quote is compute-heavy and should have its own bucket.
+  checkoutQuote: {
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    message: 'Too many checkout quote requests. Please wait a moment'
+  },
+
+  // Confirm endpoint is sensitive and should stay stricter than quote.
+  checkoutConfirm: {
+    windowMs: 15 * 60 * 1000,
+    max: 40,
+    message: 'Too many checkout confirmation attempts. Please retry shortly'
   },
   
   // Sensitive operations - VERY LOW limit (auth endpoints only — see index.js)
@@ -58,7 +94,8 @@ const createRateLimiter = (type, skipPaths = []) => {
     windowMs: config.windowMs,
     max: config.max,
     skip: (req) => skipPaths.includes(req.path),
-    // ✅ REMOVE keyGenerator line - library handles automatically
+    keyGenerator: (req) => resolveRateLimitKey(req, type),
+    // Prefer user-scoped limiting when authenticated; fallback to client IP.
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
@@ -82,6 +119,10 @@ const limiters = {
   categories: createRateLimiter('publicRead', ['/health', '/api/health']),
   search: createRateLimiter('search', ['/health', '/api/health']),
   write: createRateLimiter('write', ['/health', '/api/health']),
+  cartWrite: createRateLimiter('cartWrite', ['/health', '/api/health']),
+  couponWrite: createRateLimiter('couponWrite', ['/health', '/api/health']),
+  checkoutQuote: createRateLimiter('checkoutQuote', ['/health', '/api/health']),
+  checkoutConfirm: createRateLimiter('checkoutConfirm', ['/health', '/api/health']),
   sensitive: createRateLimiter('sensitive', ['/health', '/api/health']),
   orders: createRateLimiter('orders', ['/health', '/api/health']),
   admin: createRateLimiter('admin', ['/health', '/api/health'])

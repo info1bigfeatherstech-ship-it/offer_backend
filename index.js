@@ -69,6 +69,28 @@ function parseBoolEnv(value) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 }
 
+function resolveTrustProxySetting() {
+  const raw = String(process.env.EXPRESS_TRUST_PROXY || '').trim();
+  if (!raw) {
+    // Safe default: trust one upstream proxy in production, none in local/dev.
+    return NODE_ENV === 'production' ? 1 : false;
+  }
+
+  const normalized = raw.toLowerCase();
+  if (['true', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', 'no', 'off'].includes(normalized)) return false;
+  if (normalized === 'loopback' || normalized === 'linklocal' || normalized === 'uniquelocal') {
+    return normalized;
+  }
+  if (/^\d+$/.test(normalized)) {
+    return Number.parseInt(normalized, 10);
+  }
+  if (raw.includes(',')) {
+    return raw.split(',').map((part) => part.trim()).filter(Boolean);
+  }
+  return raw;
+}
+
 function validateStartupConfig() {
   const warnings = [];
   const errors = [];
@@ -183,6 +205,10 @@ const razorpayCspHosts = [
   'https://*.razorpay.com',
   'https://cdn.razorpay.com'
 ];
+
+const trustProxySetting = resolveTrustProxySetting();
+app.set('trust proxy', trustProxySetting);
+logger.info('[Config] Express trust proxy configured', { trustProxy: trustProxySetting });
 
 app.use(helmet({
   // Default COOP is `same-origin`, which breaks Razorpay netbanking/card popups
@@ -307,13 +333,14 @@ app.use('/api/categories', limiters.categories);
 // Search - MEDIUM limit
 app.use('/api/products/search', limiters.search);
 
-// Write operations - LOW limit (cart, wishlist, addresses)
-app.use('/api/cart', limiters.write);
+// Write operations - isolated buckets (prevents one noisy endpoint from blocking others)
+app.use('/api/cart', limiters.cartWrite);
 app.use('/api/wishlist', limiters.write);
 app.use('/api/addresses', limiters.write);
 app.use('/api/delivery', limiters.write);
-app.use('/api/checkout', limiters.write);
-app.use('/api/coupons', limiters.write);
+app.use('/api/checkout/quote', limiters.checkoutQuote);
+app.use('/api/checkout/confirm', limiters.checkoutConfirm);
+app.use('/api/coupons', limiters.couponWrite);
 
 // Sensitive operations - VERY LOW limit (auth)
 app.use('/api/auth/login', limiters.sensitive);
