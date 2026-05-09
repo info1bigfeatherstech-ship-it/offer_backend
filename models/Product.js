@@ -238,6 +238,12 @@ const productSchema = new mongoose.Schema(
         { _id: false }
       ),
       required: false
+    },
+
+    /** Denormalized from active ProductReview docs (customer + admin). */
+    rating: {
+      value: { type: Number, default: null },
+      count: { type: Number, default: 0, min: 0 }
     }
   },
   { timestamps: true }

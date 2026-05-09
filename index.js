@@ -43,6 +43,9 @@ const checkoutRoutes = require('./routes/checkout.route');
 const adminCouponRoutes = require('./routes/admin-coupons.route');
 const userCouponRoutes = require('./routes/user-coupons.route');
 const wholesalerRoutes = require('./routes/wholesaler.route');
+const productReviewPublicRoutes = require('./routes/product-review.public.route');
+const productReviewUserRoutes = require('./routes/product-review.user.route');
+const adminProductReviewRoutes = require('./routes/admin-product-review.route');
 
 // Configuration
 const PORT = process.env.PORT || 8081;
@@ -578,7 +581,10 @@ app.get('/api', (req, res) => {
       orders: '/api/orders',
       checkout: '/api/checkout',
       delivery: '/api/delivery',
-      coupons: '/api/coupons'
+      coupons: '/api/coupons',
+      productReviewsPublic: '/api/product-reviews/public/:productId',
+      productReviews: '/api/product-reviews',
+      adminProductReviews: '/api/admin/product-reviews'
     },
     health: '/health',
     cacheStats: '/api/cache/stats'
@@ -601,6 +607,9 @@ app.use('/api/checkout', checkoutRoutes);
 app.use('/api/delivery', deliveryRoutes);
 app.use('/api/admin/coupons', adminCouponRoutes);
 app.use('/api/coupons', userCouponRoutes);
+app.use('/api/product-reviews/public', limiters.products, productReviewPublicRoutes);
+app.use('/api/product-reviews', limiters.write, productReviewUserRoutes);
+app.use('/api/admin/product-reviews', limiters.admin, adminProductReviewRoutes);
 app.use('/api/wholesaler', wholesalerRoutes);
 
 // ============================================================================

@@ -151,10 +151,56 @@ function collectWholesaleInventoryWarnings(variants = []) {
   return warnings;
 }
 
-const PRODUCT_CODE_REGEX = /^([A-Z0-9]+)-(\d{2})$/;
+/**
+ * Multi-variant productCode: exactly one hyphen between BASE and numeric suffix.
+ *
+ * BASE (left of hyphen):
+ * - Any non-empty [A-Z0-9]+ as entered after trim + whole-string uppercase only.
+ * - Never parsed as a number — leading zeros and length are preserved (0001 ≠ 000001).
+ *
+ * Suffix (right of hyphen):
+ * - Positive integer; only the suffix is canonicalized (leading zeros dropped: …-01 → …-1).
+ */
+const SUFFIXED_PRODUCT_CODE_REGEX = /^([A-Z0-9]+)-(\d+)$/;
 
 function normalizeProductCode(value) {
-  return String(value || '').trim().toUpperCase();
+  const s = String(value ?? "").trim().toUpperCase();
+  if (!s) return "";
+  const m = s.match(SUFFIXED_PRODUCT_CODE_REGEX);
+  if (m) {
+    const baseToken = m[1];
+    const seq = Number(m[2]);
+    if (!Number.isFinite(seq)) return s;
+    return `${baseToken}-${seq}`;
+  }
+  return s;
+}
+
+/**
+ * Legacy DB rows may still store two-digit padding (e.g. 34354-01). Queries must match both forms.
+ */
+function getProductCodeStorageAliases(value) {
+  const canonical = normalizeProductCode(value);
+  if (!canonical) return [];
+  const out = new Set([canonical]);
+  try {
+    const p = parseProductCodeParts(canonical, "productCode", { requireSuffix: false });
+    if (p.sequence != null && p.sequence >= 1) {
+      const padded2 = `${p.base}-${String(p.sequence).padStart(2, "0")}`;
+      if (padded2 !== canonical) out.add(padded2);
+    }
+  } catch {
+    // bare code or non-standard — only canonical
+  }
+  return [...out];
+}
+
+/** Value for Mongo filter on variants.productCode (string or { $in: [...] }). */
+function productCodeToDbQuery(value) {
+  const aliases = getProductCodeStorageAliases(value);
+  if (aliases.length === 0) return normalizeProductCode(value);
+  if (aliases.length === 1) return aliases[0];
+  return { $in: aliases };
 }
 
 function normalizeKeyForAliasMatch(key) {
@@ -196,18 +242,25 @@ const BARE_PRODUCT_CODE_REGEX = /^[A-Z0-9]+$/;
 
 function parseProductCodeParts(productCode, contextLabel = 'productCode', { requireSuffix = false } = {}) {
   const normalized = normalizeProductCode(productCode);
-  const match = normalized.match(PRODUCT_CODE_REGEX);
+  const match = normalized.match(SUFFIXED_PRODUCT_CODE_REGEX);
   if (match) {
+    const seq = Number(match[2]);
+    if (!Number.isInteger(seq) || seq < 1) {
+      throw new Error(
+        `${contextLabel}: invalid productCode "${normalized}". Multi-variant suffix must be a whole number starting at 1.`
+      );
+    }
     return {
       normalized,
+      /** Literal BASE token; not numeric-coerced (leading zeros preserved). */
       base: match[1],
-      sequence: Number(match[2])
+      sequence: seq
     };
   }
 
   if (BARE_PRODUCT_CODE_REGEX.test(normalized)) {
     if (requireSuffix) {
-      throw new Error(`${contextLabel}: "${normalized}" must use BASE-XX format (example: 4321-01)`);
+      throw new Error(`${contextLabel}: "${normalized}" must use BASE-N format (example: 4321-1)`);
     }
     return {
       normalized,
@@ -217,7 +270,7 @@ function parseProductCodeParts(productCode, contextLabel = 'productCode', { requ
   }
 
   throw new Error(
-    `${contextLabel}: invalid productCode "${normalized}". Use BASE (single variant) or BASE-XX (multi-variant).`
+    `${contextLabel}: invalid productCode "${normalized}". Use BASE (single variant) or BASE-N (multi-variant, e.g. 4321-1).`
   );
 }
 
@@ -240,7 +293,7 @@ function assertVariantCodeSeries(codes, contextLabel = 'variants') {
     const first = parseProductCodeParts(codes[0], `${contextLabel}[0] productCode`, { requireSuffix: true });
     if (first.sequence !== 1) {
       throw new Error(
-        `First productCode for ${contextLabel} must be ${first.base}-01. Received ${first.normalized}.`
+        `First productCode for ${contextLabel} must be ${first.base}-1. Received ${first.normalized}.`
       );
     }
     return;
@@ -255,7 +308,7 @@ function assertVariantCodeSeries(codes, contextLabel = 'variants') {
 
   for (const p of parsed) {
     if (p.base !== base) {
-      throw new Error(`All ${contextLabel} productCodes must share same base. Expected ${base}-XX, got ${p.normalized}`);
+      throw new Error(`All ${contextLabel} productCodes must share same base. Expected ${base}-N, got ${p.normalized}`);
     }
     if (seen.has(p.normalized)) {
       throw new Error(`Duplicate productCode in ${contextLabel}: ${p.normalized}`);
@@ -269,7 +322,7 @@ function assertVariantCodeSeries(codes, contextLabel = 'variants') {
     const expected = i + 1;
     if (sequences[i] !== expected) {
       throw new Error(
-        `productCode sequence must be continuous from 01 to ${String(codes.length).padStart(2, '0')} for ${contextLabel}`
+        `productCode sequence must be continuous from 1 to ${codes.length} for ${contextLabel}`
       );
     }
   }
@@ -280,7 +333,7 @@ function deriveSequenceNumberFromParsedCode(parsedCode) {
 }
 
 function formatSequenceSuffix(n) {
-  return String(n).padStart(2, '0');
+  return String(n);
 }
 
 function alignIncomingCodeWithExistingSeries(rawCode, existingCodes = []) {
@@ -429,14 +482,35 @@ function getExistingSeriesInfo(productDoc, incomingCode) {
   };
 }
 
+function getProductCodeFolderLookupKeys(val) {
+  const keys = [];
+  const pushUnique = (k) => {
+    if (k && !keys.includes(k)) keys.push(k);
+  };
+  const canonical = normalizeProductCode(val);
+  if (!canonical) return keys;
+  pushUnique(canonical);
+  try {
+    const p = parseProductCodeParts(canonical, "folder", { requireSuffix: false });
+    if (p.sequence != null && p.sequence >= 1) {
+      const padded2 = `${p.base}-${String(p.sequence).padStart(2, "0")}`;
+      pushUnique(padded2);
+    }
+  } catch {
+    // bare code: folder name is usually the bare token only
+  }
+  return keys;
+}
+
 function getImageFolderCandidatesForRow(row) {
   const candidates = [];
-  const add = (val) => {
-    const normalized = normalizeProductCode(val);
-    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
+  const addVal = (val) => {
+    for (const k of getProductCodeFolderLookupKeys(val)) {
+      if (k && !candidates.includes(k)) candidates.push(k);
+    }
   };
-  add(row?.productCode);
-  add(row?._productCodeAdjustedFrom);
+  addVal(row?.productCode);
+  addVal(row?._productCodeAdjustedFrom);
   return candidates;
 }
 
@@ -484,7 +558,7 @@ function assertBulkSeriesAgainstExisting({
   for (const p of combined) {
     if (p.base !== base) {
       throw new Error(
-        `All ${contextLabel} productCodes must share same base. Expected ${base}-XX, got ${p.normalized}`
+        `All ${contextLabel} productCodes must share same base. Expected ${base}-N, got ${p.normalized}`
       );
     }
   }
@@ -507,7 +581,7 @@ function assertBulkSeriesAgainstExisting({
           (prev.sequence === 1 && p.sequence == null));
       if (!isToleratedBaseVs01) {
         throw new Error(
-          `${contextLabel}: conflicting productCodes detected around ${base}-${formatSequenceSuffix(seq)} (example: using both "${base}" and "${base}-01"). Use one consistent series format.`
+          `${contextLabel}: conflicting productCodes detected around ${base}-${formatSequenceSuffix(seq)} (example: using both "${base}" and "${base}-1"). Use one consistent series format.`
         );
       }
       continue;
@@ -523,7 +597,7 @@ function assertBulkSeriesAgainstExisting({
   const hasExplicit01 = [...dedupByCode.values()].some((p) => p.sequence === 1);
   if (hasBareCode && maxSeq > 1 && !hasExplicit01) {
     throw new Error(
-      `${contextLabel}: ${base} exists as a bare productCode, but suffixed variants are being added without ${base}-01. Use ${base}-01 before ${base}-${formatSequenceSuffix(maxSeq)}.`
+      `${contextLabel}: ${base} exists as a bare productCode, but suffixed variants are being added without ${base}-1. Use ${base}-1 before ${base}-${formatSequenceSuffix(maxSeq)}.`
     );
   }
 
@@ -614,7 +688,7 @@ async function ensureMissingVariantProductCodes(productDoc, preferredBase) {
 async function findExistingProductByProductCode(rawCode) {
   const normalized = normalizeProductCode(rawCode);
   if (!normalized) return null;
-  return Product.findOne({ "variants.productCode": normalized }).select(
+  return Product.findOne({ "variants.productCode": productCodeToDbQuery(normalized) }).select(
     "name slug variants.productCode"
   );
 }
@@ -702,7 +776,7 @@ const createProduct = async (req, res) => {
       });
     }
 
-    // Validate productCode format + series before uploads. Same rules as addVariant: BASE-XX only,
+    // Validate productCode format + series before uploads. Same rules as addVariant: BASE-N (suffix ≥ 1),
     // shared base, continuous 01..N. Accept productCode or ProductCode on each row.
     const normalizedCodes = [];
     for (let i = 0; i < variantsInput.length; i++) {
@@ -742,7 +816,7 @@ const createProduct = async (req, res) => {
 
     // Global uniqueness: no two variants across products can share productCode
     for (const code of normalizedCodes) {
-      const existingproductCode = await Product.findOne({ "variants.productCode": code }).select('_id name');
+      const existingproductCode = await Product.findOne({ "variants.productCode": productCodeToDbQuery(code) }).select('_id name');
       if (existingproductCode) {
         return res.status(400).json({
           success: false,
@@ -1180,7 +1254,7 @@ const importProductsFromCSV = async (req, res) => {
           try {
             const parsed = parseProductCodeParts(sampleCode, "productCode");
             if (parsed.sequence != null && parsed.sequence > 1) {
-              msg = `${msg} This looks like a new product; start from ${parsed.base} or ${parsed.base}-01.`;
+              msg = `${msg} This looks like a new product; start from ${parsed.base} or ${parsed.base}-1.`;
             }
           } catch {
             // keep original message
@@ -1435,7 +1509,7 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
           const parsedForNew = parseProductCodeParts(productCode, "productCode");
           if (parsedForNew.sequence != null && parsedForNew.sequence > 1) {
             variantWarnings.push(
-              `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-01 for first variant.`
+              `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-1 for first variant.`
             );
           }
         } catch {
@@ -1460,10 +1534,10 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
                 entered && entered !== productCode
                   ? seriesInfo?.hasSuffixed
                     ? `You entered ${entered}. It maps to existing series code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `You entered ${entered}. It maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                    : `You entered ${entered}. It maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                   : seriesInfo?.hasSuffixed
                     ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                    : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
               );
             }
           } else {
@@ -1472,7 +1546,7 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
               String(existingProduct.name || "").trim().toLowerCase() ===
                 String(existingProductWithCode.name || "").trim().toLowerCase();
             const sameProductHint = isExistingSameProductByName
-              ? ` It looks like this row is for the same product; use next variant code ${suggestNextVariantCodeForProduct(existingProduct, productCode) || "BASE-XX"}.`
+              ? ` It looks like this row is for the same product; use next variant code ${suggestNextVariantCodeForProduct(existingProduct, productCode) || "BASE-N"}.`
               : "";
             variantErrors.push(
               `productCode ${productCode} already exists on product "${existingProductWithCode.name}". Please change productCode.${sameProductHint}`
@@ -1714,7 +1788,7 @@ async function processProductWithRollback(productName, productRows, stats) {
       duplicateproductCodes.set(productCode, row.rowNumber);
       
       const existingProductWithproductCode = await Product.findOne({
-        'variants.productCode': productCode
+        'variants.productCode': productCodeToDbQuery(productCode)
       });
       
       if (existingProductWithproductCode) {
@@ -2263,7 +2337,7 @@ async function uploadVariantImages(imageFolder, productName, productCode, concur
 // HELPER: Build variant with complete validation
 // =============================================
 async function buildCompleteVariant(row, productName, images) {
-  // Validate productCode format (BASE-XX)
+  // Validate productCode format (BASE-N)
   const parsedCode = parseProductCodeParts(row.productCode, `CSV row for ${productName}`);
   const productCode = parsedCode.normalized;
   
@@ -2386,7 +2460,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     console.log(`📊 Total rows in CSV: ${rows.length}`);
 
     // Normalize and validate productCode series per product upfront.
-    // Example for 3 variants: 4321-01, 4321-02, 4321-03
+    // Example for 3 variants: 4321-1, 4321-2, 4321-3 (01, 02 also accepted on input)
     const rowsByProductName = new Map();
     for (const row of rows) {
       row.productCode = normalizeProductCode(row.productCode);
@@ -2420,7 +2494,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           try {
             const parsed = parseProductCodeParts(sampleCode, "productCode");
             if (parsed.sequence != null && parsed.sequence > 1) {
-              msg = `${msg} This looks like a new product; start from ${parsed.base} or ${parsed.base}-01.`;
+              msg = `${msg} This looks like a new product; start from ${parsed.base} or ${parsed.base}-1.`;
             }
           } catch {
             // keep original message
@@ -2476,7 +2550,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           }
 
           // Upload images from productCode folder.
-          // If code got auto-aligned (e.g. 83478 -> 83478-01), allow either folder name.
+          // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
           const folderCandidates = getImageFolderCandidatesForRow(row);
           const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
             rootFolder,
@@ -2520,7 +2594,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
                   const existingParts = parseProductCodeParts(existingCode, `existing variant of ${product.name}`);
                   if (parsedCode.base !== existingParts.base) {
                     throw new Error(
-                      `productCode base mismatch for "${row.name}". Expected ${existingParts.base}-XX, got ${productCode}`
+                      `productCode base mismatch for "${row.name}". Expected ${existingParts.base}-N, got ${productCode}`
                     );
                   }
                 } catch (_) {
@@ -2549,10 +2623,10 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
                 entered && entered !== productCode
                   ? seriesInfo?.hasSuffixed
                     ? `You entered ${entered}. This maps to existing code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `You entered ${entered}. This maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                    : `You entered ${entered}. This maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                   : seriesInfo?.hasSuffixed
                     ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                    : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
               );
             }
             
@@ -2572,7 +2646,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             stats.products.push({ name: row.name, productCode, action: 'updated' });
           } else {
             const existingProductWithCode = await Product.findOne({
-              "variants.productCode": productCode
+              "variants.productCode": productCodeToDbQuery(productCode)
             }).select("name");
             if (existingProductWithCode) {
               throw new Error(
@@ -2935,7 +3009,7 @@ const previewBulkUpload = async (req, res) => {
               const parsedForNew = parseProductCodeParts(productCode, "productCode");
               if (parsedForNew.sequence != null && parsedForNew.sequence > 1) {
                 variantWarnings.push(
-                  `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-01 for first variant.`
+                  `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-1 for first variant.`
                 );
               }
             } catch {
@@ -2946,14 +3020,14 @@ const previewBulkUpload = async (req, res) => {
             parseProductCodeParts(productCode, 'productCode');
           } catch (e) {
             variantErrors.push(
-              `Invalid productCode "${productCode}". Single variant: plain BASE (e.g. 87856) or BASE-01. Multiple variants: BASE-01, BASE-02, … same base.`
+              `Invalid productCode "${productCode}". Single variant: plain BASE (e.g. 87856). Multiple variants: same BASE with numeric suffix 1, 2, 3… (e.g. 87856-1 and 87856-2; leading zeros optional in input).`
             );
           }
           
           // Check if productCode already exists in DB (warning only)
           if (productCode) {
             const existingProduct = await Product.findOne({
-              'variants.productCode': productCode
+              'variants.productCode': productCodeToDbQuery(productCode)
             }).select('name variants.productCode');
             if (existingProduct) {
               const isSameProduct =
@@ -2967,10 +3041,10 @@ const previewBulkUpload = async (req, res) => {
                   entered && entered !== productCode
                     ? seriesInfo?.hasSuffixed
                       ? `You entered ${entered}. It maps to existing series code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
-                      : `You entered ${entered}. It maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                      : `You entered ${entered}. It maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                     : seriesInfo?.hasSuffixed
                       ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
-                      : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || `${productCode}-01`}.`
+                      : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                 );
               } else {
                 variantErrors.push(
@@ -3564,7 +3638,7 @@ const updateProduct = async (req, res) => {
           }
           const takenElsewhere = await Product.exists({
             _id: { $ne: doc._id },
-            "variants.productCode": newCode
+            "variants.productCode": productCodeToDbQuery(newCode)
           });
           if (takenElsewhere) {
             return res.status(400).json({
@@ -5015,7 +5089,7 @@ const addVariant = async (req, res) => {
         const nextCode = `${base}-${formatSequenceSuffix(maxSeq + 1)}`;
         return res.status(400).json({
           success: false,
-          message: `productCode base mismatch for this product. Expected base ${base}-XX. Use next code ${nextCode}.`
+          message: `productCode base mismatch for this product. Expected base ${base}-N. Use next code ${nextCode}.`
         });
       }
 
@@ -5034,7 +5108,7 @@ const addVariant = async (req, res) => {
 
     // 🔒 Global duplicate check
     const productCodeExists = await Product.exists({
-      "variants.productCode": productCodeNormalized
+      "variants.productCode": productCodeToDbQuery(productCodeNormalized)
     });
 
     if (productCodeExists) {
@@ -5306,8 +5380,9 @@ const getVariantByproductCode = async (req, res) => {
 
     // 🔍 Optimized query (returns only matched variant)
     const product = await Product.findOne(
-      { "variants.productCode": normalizedCode },
+      { "variants.productCode": productCodeToDbQuery(normalizedCode) },
       {
+        title: 1,
         name: 1,
         slug: 1,
         brand: 1,
@@ -5332,6 +5407,7 @@ const getVariantByproductCode = async (req, res) => {
       success: true,
       product: {
         _id: product._id,
+        title: product.title,
         name: product.name,
         slug: product.slug,
         brand: product.brand,
@@ -5342,7 +5418,8 @@ const getVariantByproductCode = async (req, res) => {
         gstRate: product.gstRate,
         isFragile: product.isFragile
       },
-      variant: product.variants[0] // matched variant
+      variant: product.variants[0], // matched variant
+      matchedProductCode: normalizedCode
     });
 
   } catch (error) {
