@@ -1,5 +1,6 @@
 const sharp = require('sharp');
 const { cloudinary } = require('../config/cloudinary.config');
+const { uploadBufferToR2, deleteFromR2ByKey } = require('./r2Storage');
 
 const DEFAULT_MAX_WIDTH = Math.min(
   4096,
@@ -173,14 +174,15 @@ async function optimizeProductImageBuffer(input, options = {}) {
   }
 }
 
-/**
- * Upload image buffer to Cloudinary
- * @param {Buffer} fileBuffer - Image file buffer from Multer
- * @param {String} folderPath - Cloudinary folder path (e.g., 'products')
- * @returns {Promise<{url: String, publicId: String}>}
- */
+function getDefaultMediaProvider() {
+  const mode = String(process.env.MEDIA_STORAGE_MODE || '').trim().toLowerCase();
+  const explicit = String(process.env.MEDIA_PROVIDER_DEFAULT || '').trim().toLowerCase();
+  if (explicit === 'r2' || explicit === 'cloudinary') return explicit;
+  if (mode === 'hybrid') return 'r2';
+  return 'cloudinary';
+}
 
-const uploadToCloudinary = async (fileBuffer, folderPath = 'products', publicIdName = null) => {
+function uploadImageToCloudinary(fileBuffer, folderPath = 'products', publicIdName = null) {
   return new Promise((resolve, reject) => {
     const opts = {
       folder: folderPath,
@@ -211,6 +213,31 @@ const uploadToCloudinary = async (fileBuffer, folderPath = 'products', publicIdN
 
     stream.end(fileBuffer);
   });
+}
+
+/**
+ * Backward-compatible uploader used by product/category controllers.
+ * In hybrid/default-r2 mode this stores to Cloudflare R2, otherwise Cloudinary.
+ * @returns {Promise<{url: String, publicId: String}>}
+ */
+const uploadToCloudinary = async (fileBuffer, folderPath = 'products', publicIdName = null) => {
+  const provider = getDefaultMediaProvider();
+
+  if (provider === 'r2') {
+    const upload = await uploadBufferToR2({
+      buffer: fileBuffer,
+      folderPath,
+      publicIdName: publicIdName || `img-${Date.now()}`,
+      contentType: 'image/webp',
+      extension: 'webp'
+    });
+    return {
+      url: upload.url,
+      publicId: `r2:${upload.key}`
+    };
+  }
+
+  return uploadImageToCloudinary(fileBuffer, folderPath, publicIdName);
 };
 
 
@@ -221,6 +248,11 @@ const uploadToCloudinary = async (fileBuffer, folderPath = 'products', publicIdN
  */
 const deleteFromCloudinary = async (publicId) => {
   try {
+    if (String(publicId || '').startsWith('r2:')) {
+      const key = String(publicId).slice(3);
+      await deleteFromR2ByKey(key);
+      return;
+    }
     await cloudinary.uploader.destroy(publicId);
   } catch (error) {
     console.error('Failed to delete image from Cloudinary:', error.message);

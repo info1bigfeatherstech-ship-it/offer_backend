@@ -109,6 +109,9 @@ function validateStartupConfig() {
   const corsAllowedOrigins = parseOriginsCsv(process.env.CORS_ALLOWED_ORIGINS);
   const ownerReviewOrigins = parseOriginsCsv(process.env.OWNER_REVIEW_ALLOWED_ORIGINS);
   const demoMockShippingEnabled = parseBoolEnv(process.env.ALLOW_DEMO_MOCK_SHIPPING);
+  const mediaMode = String(process.env.MEDIA_STORAGE_MODE || '').trim().toLowerCase();
+  const defaultMediaProvider = String(process.env.MEDIA_PROVIDER_DEFAULT || '').trim().toLowerCase();
+  const returnMediaProvider = String(process.env.MEDIA_PROVIDER_RETURNS || '').trim().toLowerCase();
 
   if (!jwtSecret) errors.push('JWT_SECRET is required');
   if (!refreshSecret) errors.push('REFRESH_TOKEN_SECRET is required');
@@ -140,6 +143,37 @@ function validateStartupConfig() {
     warnings.push('OWNER_REVIEW_ALLOWED_ORIGINS not configured; owner review access relies only on default origin set');
   }
 
+  const resolvedDefaultProvider = defaultMediaProvider || (mediaMode === 'hybrid' ? 'r2' : 'cloudinary');
+  const resolvedReturnProvider = returnMediaProvider || (mediaMode === 'hybrid' ? 'cloudinary' : resolvedDefaultProvider);
+
+  if (resolvedDefaultProvider === 'r2') {
+    const requiredR2Vars = [
+      'R2_BUCKET_NAME',
+      'R2_ACCESS_KEY_ID',
+      'R2_SECRET_ACCESS_KEY',
+      'R2_ENDPOINT',
+      'R2_PUBLIC_BASE_URL'
+    ];
+    for (const key of requiredR2Vars) {
+      if (!String(process.env[key] || '').trim()) {
+        errors.push(`${key} is required when MEDIA_PROVIDER_DEFAULT resolves to r2`);
+      }
+    }
+  }
+
+  if (resolvedReturnProvider === 'cloudinary') {
+    const requiredCloudinaryVars = [
+      'CLOUDINARY_CLOUD_NAME',
+      'CLOUDINARY_API_KEY',
+      'CLOUDINARY_API_SECRET'
+    ];
+    for (const key of requiredCloudinaryVars) {
+      if (!String(process.env[key] || '').trim()) {
+        errors.push(`${key} is required when MEDIA_PROVIDER_RETURNS resolves to cloudinary`);
+      }
+    }
+  }
+
   if (errors.length) {
     for (const issue of errors) {
       logger.error(`[Config] ${issue}`);
@@ -160,12 +194,21 @@ const sameServerOrigins = [
   `http://localhost:${PORT}`,
   `http://127.0.0.1:${PORT}`
 ];
+
+// Localhost browser origins are auto-allowed only in non-production environments.
+// In production, every allowed frontend MUST come from CORS_ALLOWED_ORIGINS env var.
+const devLocalhostOrigins = NODE_ENV !== 'production'
+  ? [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:5173'
+    ]
+  : [];
+
 const defaultAllowedOrigins = [
-  'https://offerwaalebaba.netlify.app',
-  'http://localhost:3000',
-  'http://localhost:5173',
-  'http://localhost:5174',
-  'http://127.0.0.1:5173',
+  ...devLocalhostOrigins,
   ...sameServerOrigins
 ];
 
@@ -684,11 +727,14 @@ async function startApplication() {
 
     // Create HTTP server
     server = app.listen(PORT, () => {
+      const publicBase = String(process.env.PUBLIC_API_BASE_URL || process.env.API_PUBLIC_BASE_URL || `http://localhost:${PORT}`)
+        .trim()
+        .replace(/\/$/, '');
       logger.info('='.repeat(70));
-      logger.info(`✓ Server running on port ${PORT}`);
-      logger.info(`✓ API Base URL: http://localhost:${PORT}/api`);
-      logger.info(`✓ Health Check: http://localhost:${PORT}/health`);
-      logger.info(`✓ Cache Stats: http://localhost:${PORT}/api/cache/stats`);
+      logger.info(`✓ Server running on port ${PORT} (${NODE_ENV})`);
+      logger.info(`✓ API Base URL: ${publicBase}/api`);
+      logger.info(`✓ Health Check: ${publicBase}/health`);
+      logger.info(`✓ Cache Stats: ${publicBase}/api/cache/stats`);
       logger.info('='.repeat(70));
       logger.info('Press CTRL+C to stop the server\n');
     });
