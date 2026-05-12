@@ -1,10 +1,40 @@
 // utils/seoUtils.js
 
 /**
+ * Resolve the public site origin used for canonical URLs / OG metadata.
+ * Returns a clean origin (no trailing slash) or empty string when not configured.
+ * Never falls back to a placeholder host — placeholders would poison SEO if
+ * accidentally shipped.
+ */
+const resolveFrontendOrigin = () => {
+    return String(process.env.FRONTEND_URL || '').trim().replace(/\/$/, '');
+};
+
+/**
+ * Build a canonical product URL from product data and a (possibly empty) origin.
+ * Returns null when origin is missing or no usable slug/name is available.
+ */
+const buildCanonicalProductUrl = (productData, baseUrl) => {
+    if (!baseUrl) return null;
+    if (productData?.slug) {
+        return `${baseUrl}/product/${productData.slug}`;
+    }
+    if (productData?.name) {
+        const fallbackSlug = String(productData.name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '');
+        if (fallbackSlug) return `${baseUrl}/product/${fallbackSlug}`;
+    }
+    return null;
+};
+
+/**
  * Auto-generate SEO data from product information
  * This runs automatically - no staff intervention needed
  */
 const generateSEOData = (productData) => {
+    const baseUrl = resolveFrontendOrigin();
     try {
         // Get clean description (remove HTML tags)
         const cleanDescription = productData.description 
@@ -77,23 +107,11 @@ const generateSEOData = (productData) => {
 
 
         // =============================================
-        // 7. CANONICAL URL (NEW - Added logic)
+        // 7. CANONICAL URL
         // =============================================
-        // Get base URL from environment or use default
-        const baseUrl = process.env.FRONTEND_URL || 'https://yourstore.com';
-        
-        // Build canonical URL using product slug
-        let canonicalUrl = null;
-        if (productData.slug) {
-            canonicalUrl = `${baseUrl}/product/${productData.slug}`;
-        } else if (productData.name) {
-            // If no slug, generate from name (fallback)
-            const fallbackSlug = productData.name
-                .toLowerCase()
-                .replace(/[^a-z0-9]+/g, '-')
-                .replace(/^-+|-+$/g, '');
-            canonicalUrl = `${baseUrl}/product/${fallbackSlug}`;
-        }
+        // Only emit canonical_url when FRONTEND_URL is configured.
+        // Never fall back to a placeholder host — Google would index a bogus domain.
+        const canonicalUrl = buildCanonicalProductUrl(productData, baseUrl);
         
         return {
             meta_title: metaTitle,
@@ -107,17 +125,16 @@ const generateSEOData = (productData) => {
         
     } catch (error) {
         console.error('Error generating SEO data:', error);
-        // Return default SEO if something fails
+        // Safe fallback — uses outer-scope baseUrl so this branch never
+        // throws on its own (avoids "baseUrl is not defined" ReferenceError).
         return {
-            meta_title: `${productData.name || 'Product'} | Buy Online | OfferWaleBaba`,
+            meta_title: `${productData?.name || 'Product'} | Buy Online | OfferWaleBaba`,
             meta_description: 'Shop now for best prices with free shipping and COD',
             meta_keywords: 'buy online, best price, shop now',
-            og_title: productData.name || 'Product',
+            og_title: productData?.name || 'Product',
             og_description: 'Shop now for best prices',
             og_image: null,
-            canonical_url:  productData.slug 
-                ? `${baseUrl}/product/${productData.slug}`
-                : null
+            canonical_url: buildCanonicalProductUrl(productData, baseUrl)
         };
     }
 };

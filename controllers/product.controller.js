@@ -514,14 +514,145 @@ function getImageFolderCandidatesForRow(row) {
   return candidates;
 }
 
+/**
+ * OS-level junk that gets bundled into zips on macOS/Windows. These entries
+ * must be ignored when deciding whether a zip is "wrapped" in a single folder
+ * or counted as real product folders.
+ *
+ * Examples we routinely see in production:
+ *   - __MACOSX/        (macOS resource forks)
+ *   - .DS_Store        (macOS Finder metadata)
+ *   - Thumbs.db        (Windows Explorer thumbnails)
+ *   - desktop.ini      (Windows folder customization)
+ *   - ._something      (macOS AppleDouble companion files)
+ */
+const ZIP_OS_JUNK_NAMES = new Set([
+  '__MACOSX',
+  '.DS_Store',
+  'Thumbs.db',
+  'desktop.ini',
+  '.localized'
+]);
+
+function isOsJunkEntryName(name) {
+  if (!name || typeof name !== 'string') return true;
+  if (ZIP_OS_JUNK_NAMES.has(name)) return true;
+  // Mac AppleDouble companions ("._filename")
+  if (name.startsWith('._')) return true;
+  // Generic hidden files (.git, .gitignore, .hidden, etc.) — never product folders.
+  if (name.startsWith('.')) return true;
+  return false;
+}
+
+/**
+ * Safely list real (non-junk) directory entries. Returns [] on any I/O error.
+ * Uses withFileTypes to avoid an extra statSync round-trip per entry.
+ */
+function listRealEntries(dirPath) {
+  if (!dirPath) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch (err) {
+    return [];
+  }
+  return entries.filter((e) => !isOsJunkEntryName(e.name));
+}
+
+/**
+ * Resolve the "real" content root of an extracted zip.
+ *
+ * Many archives wrap content in a single top-level folder (e.g. `imgz.zip`
+ * extracts to `imgz/<product-code>/...`). Some users zip with a deeper nesting
+ * (e.g. `imgz/inner/<product-code>/...`). And many archives include OS junk
+ * (`__MACOSX/`, `.DS_Store`) at the root that breaks naive "single child"
+ * detection.
+ *
+ * Strategy: starting at `extractPath`, while the only real child is a single
+ * directory, descend into it. Stop at the first directory that contains either
+ *   - multiple real entries, or
+ *   - one entry that is not a directory (i.e. actual content files), or
+ *   - nothing at all,
+ * and treat that level as the content root. Capped at `maxDepth` for safety.
+ */
+function resolveZipContentRoot(extractPath, { maxDepth = 5 } = {}) {
+  if (!extractPath) return extractPath;
+  let current = extractPath;
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const entries = listRealEntries(current);
+    if (entries.length === 1 && entries[0].isDirectory()) {
+      current = path.join(current, entries[0].name);
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+/**
+ * Resolve the product-image folder inside an extracted zip root.
+ *
+ * Match precedence:
+ *   1. Exact case-sensitive match against the supplied candidates.
+ *   2. Case-insensitive match (handles zips authored on case-insensitive
+ *      filesystems — Windows/macOS — then deployed on Linux servers where
+ *      directory names are case-sensitive).
+ *
+ * OS junk entries are ignored when scanning. Returns the matched folder path
+ * plus the exact on-disk folder name that matched (used for downstream logs
+ * and bookkeeping).
+ */
 function resolveImageFolderByCandidates(rootFolder, candidates = []) {
+  if (!rootFolder || !Array.isArray(candidates) || candidates.length === 0) {
+    return { folderPath: null, matchedCode: null };
+  }
+
+  // Fast path — exact case match.
   for (const code of candidates) {
+    if (!code) continue;
     const dir = path.join(rootFolder, String(code));
-    if (fs.existsSync(dir)) {
-      return { folderPath: dir, matchedCode: code };
+    try {
+      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+        return { folderPath: dir, matchedCode: String(code) };
+      }
+    } catch {
+      // ignore and continue to fallback
     }
   }
+
+  // Fallback — case-insensitive directory scan.
+  const realDirsByLower = new Map();
+  for (const entry of listRealEntries(rootFolder)) {
+    if (!entry.isDirectory()) continue;
+    const lower = entry.name.toLowerCase();
+    // First writer wins; preserve the on-disk casing.
+    if (!realDirsByLower.has(lower)) realDirsByLower.set(lower, entry.name);
+  }
+  for (const code of candidates) {
+    if (!code) continue;
+    const found = realDirsByLower.get(String(code).toLowerCase());
+    if (found) {
+      return { folderPath: path.join(rootFolder, found), matchedCode: found };
+    }
+  }
+
   return { folderPath: null, matchedCode: null };
+}
+
+/**
+ * Build a human-readable, length-capped sample of real subdirectories under
+ * `rootFolder`. Used only for error diagnostics so users can see exactly what
+ * the server "sees" inside their uploaded zip.
+ */
+function describeAvailableImageFolders(rootFolder, sampleSize = 8) {
+  const names = listRealEntries(rootFolder)
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+  if (names.length === 0) return 'none';
+  const head = names.slice(0, sampleSize).join(', ');
+  return names.length > sampleSize
+    ? `${head} (+${names.length - sampleSize} more)`
+    : head;
 }
 
 /**
@@ -2432,10 +2563,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     const zip = new AdmZip(zipPath);
     zip.extractAllTo(extractPath, true);
 
-    const extractedFolders = fs.readdirSync(extractPath);
-    const rootFolder = extractedFolders.length === 1 && fs.statSync(path.join(extractPath, extractedFolders[0])).isDirectory()
-      ? path.join(extractPath, extractedFolders[0])
-      : extractPath;
+    // Resolve the actual content root. Auto-descends through single-folder
+    // wrappers and ignores OS junk like __MACOSX/ and .DS_Store so that
+    // `imgz.zip → imgz/<product-code>/...` works the same as a flat zip.
+    const rootFolder = resolveZipContentRoot(extractPath);
+    console.log(
+      `📦 ZIP extracted. Content root: ${rootFolder === extractPath ? '(zip root)' : path.relative(extractPath, rootFolder)}. ` +
+      `Top-level folders: ${describeAvailableImageFolders(rootFolder)}`
+    );
 
     // Parse CSV
     const rows = [];
@@ -2558,7 +2693,9 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           );
           if (!imageFolder) {
             throw new Error(
-              `Image folder not found for productCode ${productCode}. Tried: ${folderCandidates.join(", ")}`
+              `Image folder not found for productCode ${productCode}. ` +
+              `Tried: ${folderCandidates.join(", ")}. ` +
+              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
             );
           }
           const variantImages = await uploadVariantImages(imageFolder, row.name, matchedCode || productCode);
@@ -2885,11 +3022,13 @@ const previewBulkUpload = async (req, res) => {
       
       const zip = new AdmZip(zipPath);
       zip.extractAllTo(extractPath, true);
-      
-      const extractedFolders = fs.readdirSync(extractPath);
-      rootFolder = extractedFolders.length === 1 && fs.statSync(path.join(extractPath, extractedFolders[0])).isDirectory()
-        ? path.join(extractPath, extractedFolders[0])
-        : extractPath;
+
+      // Same content-root resolution as the live import — see resolveZipContentRoot.
+      rootFolder = resolveZipContentRoot(extractPath);
+      console.log(
+        `📦 Preview ZIP extracted. Content root: ${rootFolder === extractPath ? '(zip root)' : path.relative(extractPath, rootFolder)}. ` +
+        `Top-level folders: ${describeAvailableImageFolders(rootFolder)}`
+      );
     }
 
     // =============================================
@@ -3024,31 +3163,40 @@ const previewBulkUpload = async (req, res) => {
             );
           }
           
-          // Check if productCode already exists in DB (warning only)
+          // Check if productCode already exists in DB.
+          // Preview must mirror real import behavior:
+          //   - ZIP import (`bulkUploadNewProductsWithImages`) throws an error
+          //     when an incoming productCode duplicates an existing variant on the
+          //     same product.
+          //   - URL import (`processProductWithRollback`) silently skips the row,
+          //     so the variant is still NOT inserted.
+          // In both cases the row will not produce a new variant, so we surface it
+          // as a blocking ERROR (not a warning) — otherwise admins see "✓ OK" in
+          // preview but get failed/skipped rows during the actual import.
           if (productCode) {
-            const existingProduct = await Product.findOne({
+            const existingProductWithCode = await Product.findOne({
               'variants.productCode': productCodeToDbQuery(productCode)
             }).select('name variants.productCode');
-            if (existingProduct) {
+            if (existingProductWithCode) {
               const isSameProduct =
-                String(existingProduct.name || "").trim().toLowerCase() ===
+                String(existingProductWithCode.name || "").trim().toLowerCase() ===
                 String(productName || "").trim().toLowerCase();
               if (isSameProduct) {
                 const suggested = nextCodeForSameProduct(productCode);
                 const entered = normalizeProductCode(row._productCodeAdjustedFrom);
-                const seriesInfo = getExistingSeriesInfo(existingProduct, productCode);
-                variantWarnings.push(
+                const seriesInfo = getExistingSeriesInfo(existingProductWithCode, productCode);
+                variantErrors.push(
                   entered && entered !== productCode
                     ? seriesInfo?.hasSuffixed
-                      ? `You entered ${entered}. It maps to existing series code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
-                      : `You entered ${entered}. It maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
+                      ? `You entered ${entered}. It maps to existing series code ${productCode} which already exists on this product. Variants already exist till ${seriesInfo.lastCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code"}.`
+                      : `You entered ${entered}. It maps to existing code ${productCode} which already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                     : seriesInfo?.hasSuffixed
-                      ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
+                      ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code"}.`
                       : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
                 );
               } else {
                 variantErrors.push(
-                  `productCode ${productCode} belongs to product "${existingProduct.name}". If this row is for "${productName}", use a different productCode.`
+                  `productCode ${productCode} belongs to product "${existingProductWithCode.name}". If this row is for "${productName}", use a different productCode.`
                 );
               }
             }
@@ -3091,7 +3239,9 @@ const previewBulkUpload = async (req, res) => {
             }
           } else {
             variantWarnings.push(
-              `Image folder not found for productCode ${productCode} (tried: ${folderCandidates.join(", ")})`
+              `Image folder not found for productCode ${productCode} ` +
+              `(tried: ${folderCandidates.join(", ")}; ` +
+              `available: ${describeAvailableImageFolders(rootFolder)})`
             );
             missingImagesCount++;
           }

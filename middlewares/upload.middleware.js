@@ -2,6 +2,9 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');  // ✅ ADD THIS - Required for file system operations
 
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const RETURN_PROOF_MAX_BYTES = 60 * 1024 * 1024;
+
 // ===============================
 // IMAGE UPLOAD (for products)
 // ===============================
@@ -13,20 +16,27 @@ const imageFileFilter = (req, file, cb) => {
     'image/png',
     'image/webp',
     'image/jpg',
-    'image/svg'
+    'image/svg',
+    'image/svg+xml',
+    'image/heic',
+    'image/heif',
+    'image/tiff',
+    'image/bmp',
+    'image/gif',
+    'image/avif'
   ];
 
   if (allowedMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('Only jpeg, jpg, png, webp, svg images are allowed'), false);
+    cb(new Error('Only JPG/JPEG/PNG/WEBP/SVG/HEIC/HEIF/TIFF/BMP/GIF/AVIF images are allowed'), false);
   }
 };
 
 const imageUpload = multer({
   storage: imageStorage,
   fileFilter: imageFileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 }
+  limits: { fileSize: MAX_IMAGE_BYTES }
 });
 
 const uploadProductImages = imageUpload.any();
@@ -110,20 +120,28 @@ const proofFileFilter = (req, file, cb) => {
     'image/jpeg',
     'image/png',
     'image/webp',
-    'image/jpg'
+    'image/jpg',
+    'image/svg',
+    'image/svg+xml',
+    'image/heic',
+    'image/heif',
+    'image/tiff',
+    'image/bmp',
+    'image/gif',
+    'image/avif'
   ];
 
   if (allowedMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('Only PDF, JPG, JPEG, PNG, WEBP files are allowed for proofs'), false);
+    cb(new Error('Only PDF and JPG/JPEG/PNG/WEBP/SVG/HEIC/HEIF/TIFF/BMP/GIF/AVIF files are allowed for proofs'), false);
   }
 };
 
 const proofUpload = multer({
   storage: proofStorage,
   fileFilter: proofFileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: MAX_IMAGE_BYTES }
 });
 
 const uploadWholesalerProofs = proofUpload.fields([
@@ -159,7 +177,7 @@ const returnProofUpload = multer({
   },
   limits: {
     files: 4,
-    fileSize: 60 * 1024 * 1024
+    fileSize: RETURN_PROOF_MAX_BYTES
   }
 });
 

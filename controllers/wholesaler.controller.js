@@ -7,8 +7,11 @@ const path = require('path');
 const WholesalerDetails = require('../models/WholesalerDetails');
 const User = require('../models/User');
 const { generateOTP, sendOTP } = require('../services/otp.service');
-const { cloudinary } = require('../config/cloudinary.config');
 const { buildWholesalerPdfPreviewUrl } = require('../utils/cloudinaryProofDelivery');
+const { uploadBufferToR2 } = require('../utils/r2Storage');
+const { optimizeProductImageBuffer } = require('../utils/cloudinaryHelper');
+const { deleteFromR2ByUrl } = require('../utils/r2Storage');
+const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 
 const OTP_TTL_MS = 10 * 60 * 1000;
 const MAX_OTP_ATTEMPTS = 5;
@@ -35,10 +38,14 @@ function rawDigitsToWaMePath(raw) {
 /**
  * Frontend URL where approved wholesalers complete activation (OTP + password).
  * Override per environment; server must be restarted after .env changes.
+ * In production this MUST be set — otherwise the email/SMS link would point to localhost.
  */
 function getWholesalerActivateAppUrl() {
   const raw = String(process.env.WHOLESALER_ACTIVATE_APP_URL || '').trim().replace(/\/$/, '');
   if (raw) return raw;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('WHOLESALER_ACTIVATE_APP_URL must be set in production');
+  }
   return 'http://localhost:5173/activate';
 }
 
@@ -191,6 +198,17 @@ function classifyWholesalerProof(raw, _options = {}) {
   };
 }
 
+async function cleanupWholesalerProofIfPresent(rawUrl) {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return;
+  try {
+    await deleteFromR2ByUrl(safeUrl);
+  } catch (error) {
+    // Legacy/non-R2 URLs may exist; cleanup failure must not crash request flow.
+    console.error('Wholesaler proof cleanup failed:', error.message);
+  }
+}
+
 function buildOwnerReviewTableRows(doc) {
   const rows = [
     ['Full name', doc.fullName],
@@ -296,21 +314,6 @@ function buildPublicApiBase(req) {
   return `${proto}://${host}`;
 }
 
-function getRefreshCookieOptions() {
-  const isProduction = process.env.NODE_ENV === 'production';
-  const options = {
-    httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? 'none' : 'lax',
-    path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000
-  };
-  if (isProduction && process.env.COOKIE_DOMAIN) {
-    options.domain = process.env.COOKIE_DOMAIN;
-  }
-  return options;
-}
-
 const REFRESH_COOKIE_BY_PORTAL = {
   ecomm: 'refreshToken_ecomm',
   wholesale: 'refreshToken_wholesale',
@@ -322,9 +325,9 @@ function resolveRefreshCookieName(portal) {
   return REFRESH_COOKIE_BY_PORTAL[portal] || REFRESH_COOKIE_BY_PORTAL.ecomm;
 }
 
-function setRefreshTokenCookie(res, portal, refreshToken) {
+function setRefreshTokenCookie(req, res, portal, refreshToken) {
   const cookieName = resolveRefreshCookieName(portal);
-  const cookieOptions = getRefreshCookieOptions();
+  const cookieOptions = getRefreshCookieOptions(req);
   res.cookie(cookieName, refreshToken, cookieOptions);
   if (cookieName !== 'refreshToken') {
     // Cleanup legacy shared cookie to avoid cross-portal session bleed.
@@ -350,39 +353,48 @@ function sanitizePublicIdPart(value) {
     .slice(0, 60) || 'proof';
 }
 
-function uploadProofBufferToCloudinary(file, folder, publicIdPrefix) {
-  return new Promise((resolve, reject) => {
-    const ext = path.extname(String(file.originalname || '')).toLowerCase();
-    const isPdf = file.mimetype === 'application/pdf' || ext === '.pdf';
-    // Cloudinary treats PDFs as `image` assets. `raw` delivery often uses a generic Content-Type
-    // (e.g. octet-stream), so Chrome's built-in PDF viewer fails even when the URL ends in .pdf.
-    const publicId = `${publicIdPrefix}-${Date.now()}`;
+async function uploadProofBufferToCloudinary(file, folder, publicIdPrefix) {
+  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0) {
+    throw new Error('Proof upload failed: empty or invalid file buffer');
+  }
+  if (file.buffer.length > 5 * 1024 * 1024) {
+    throw new Error('Proof upload failed: file exceeds max size limit of 5MB');
+  }
 
-    const uploadOptions = {
-      folder,
-      public_id: publicId,
-      resource_type: 'image',
-      access_mode: 'public'
-    };
+  const ext = path.extname(String(file.originalname || '')).toLowerCase();
+  const isPdf = file.mimetype === 'application/pdf' || ext === '.pdf';
+  const publicId = `${publicIdPrefix}-${Date.now()}`;
 
-    if (!isPdf) {
-      uploadOptions.format = 'webp';
-      uploadOptions.transformation = [{ quality: 'auto' }];
-    }
-
-    const stream = cloudinary.uploader.upload_stream(uploadOptions, (error, result) => {
-      if (error) {
-        return reject(new Error(`Proof upload failed: ${error.message}`));
-      }
-      return resolve({
-        url: result.secure_url,
-        publicId: result.public_id,
-        resourceType: result.resource_type
-      });
+  if (isPdf) {
+    const upload = await uploadBufferToR2({
+      buffer: file.buffer,
+      folderPath: folder,
+      publicIdName: publicId,
+      contentType: 'application/pdf',
+      extension: 'pdf',
+      cacheControl: 'public, max-age=31536000, immutable'
     });
+    return {
+      url: upload.url,
+      publicId: `r2:${upload.key}`,
+      resourceType: 'raw'
+    };
+  }
 
-    stream.end(file.buffer);
+  const optimizedBuffer = await optimizeProductImageBuffer(file.buffer);
+  const upload = await uploadBufferToR2({
+    buffer: optimizedBuffer,
+    folderPath: folder,
+    publicIdName: publicId,
+    contentType: 'image/webp',
+    extension: 'webp',
+    cacheControl: 'public, max-age=31536000, immutable'
   });
+  return {
+    url: upload.url,
+    publicId: `r2:${upload.key}`,
+    resourceType: 'image'
+  };
 }
 
 async function resolveWholesalerProofUrls(req, payload) {
@@ -1121,11 +1133,18 @@ exports.rejectWholesalerRequest = async (req, res) => {
       return res.status(409).json({ success: false, message: `Request already ${doc.status}` });
     }
 
+    await Promise.all([
+      cleanupWholesalerProofIfPresent(doc.idProofUpload),
+      cleanupWholesalerProofIfPresent(doc.businessAddressProofUpload)
+    ]);
+
     doc.status = 'rejected';
     doc.isApproved = false;
     doc.reviewReason = String(req.body.reason || '').trim();
     doc.reviewedBy = req.userId || null;
     doc.reviewedAt = new Date();
+    doc.idProofUpload = '';
+    doc.businessAddressProofUpload = '';
     await doc.save();
 
     return res.status(200).json({
@@ -1289,7 +1308,7 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
     doc.activationOtpAttempts = 0;
     await doc.save();
 
-    setRefreshTokenCookie(res, 'wholesale', refreshToken);
+    setRefreshTokenCookie(req, res, 'wholesale', refreshToken);
 
     return res.status(200).json({
       success: true,

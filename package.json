@@ -7,16 +7,18 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
-    "start": "NODE_ENV=production node index.js",
-    "start:dev": "NODE_ENV=development node index.js",
+    "dev": "cross-env NODE_ENV=development nodemon index.js",
+    "start": "cross-env NODE_ENV=production node index.js",
+    "start:dev": "cross-env NODE_ENV=development node index.js",
     "build": "npm install",
-    "pm2:start": "pm2 start index.js --name ecommerce-api",
+    "pm2:start": "pm2 start config/ecosystem.config.js --env production",
     "pm2:stop": "pm2 stop ecommerce-api",
     "pm2:restart": "pm2 restart ecommerce-api",
+    "pm2:logs": "pm2 logs ecommerce-api",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1045.0",
     "@google-analytics/data": "^5.2.1",
     "adm-zip": "^0.5.16",
     "axios": "^1.13.5",
@@ -48,5 +50,8 @@
     "twilio": "^5.12.2",
     "unzipper": "^0.12.3",
     "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
   }
 }

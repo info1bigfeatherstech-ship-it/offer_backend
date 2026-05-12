@@ -36,7 +36,6 @@ const OTP_LENGTH = 6;
 
 /** Email configuration */
 const EMAIL_FROM = process.env.EMAIL_USER;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://offerwaalebaba.netlify.app';
 
 // ==============================
 // EMAIL TRANSPORTER

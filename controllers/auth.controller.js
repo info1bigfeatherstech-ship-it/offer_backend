@@ -8,6 +8,7 @@ const tokenStore = require('../config/tokenBlacklist');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront-scope.middleware');
+const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 
 // Import from OTP service
 const { sendOTP, generateOTP } = require("../services/otp.service");
@@ -107,20 +108,22 @@ const resolveRefreshCookieName = (portal) => {
   return REFRESH_COOKIE_BY_PORTAL[normalizeRefreshPortal(portal)] || REFRESH_COOKIE_BY_PORTAL.ecomm;
 };
 
-const setRefreshTokenCookie = (res, portal, refreshToken) => {
+const setRefreshTokenCookie = (req, res, portal, refreshToken) => {
   const cookieName = resolveRefreshCookieName(portal);
-  res.cookie(cookieName, refreshToken, getRefreshCookieOptions());
+  const opts = getRefreshCookieOptions(req);
+  res.cookie(cookieName, refreshToken, opts);
   if (cookieName !== 'refreshToken') {
-    res.clearCookie('refreshToken', getRefreshCookieOptions());
+    res.clearCookie('refreshToken', opts);
   }
   return cookieName;
 };
 
-const clearRefreshTokenCookie = (res, portal) => {
+const clearRefreshTokenCookie = (req, res, portal) => {
   const cookieName = resolveRefreshCookieName(portal);
-  res.clearCookie(cookieName, getRefreshCookieOptions());
+  const opts = getRefreshCookieOptions(req);
+  res.clearCookie(cookieName, opts);
   if (cookieName !== 'refreshToken') {
-    res.clearCookie('refreshToken', getRefreshCookieOptions());
+    res.clearCookie('refreshToken', opts);
   }
 };
 
@@ -280,26 +283,6 @@ const canLoginForPortal = (user, portal) => {
   };
 };
 
-// ========== COOKIE CONFIGURATION (Industry Standard) ==========
-const getRefreshCookieOptions = () => {
-  const isProduction = process.env.NODE_ENV === 'production';
-  
-  const options = {
-    httpOnly: true,
-    secure: isProduction,  // Production: true, Development: false
-    sameSite: isProduction ? 'none' : 'lax',
-    path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000,  // 7 days
-  };
-  
-  // Optional: Set domain for production (supports subdomains)
-  if (isProduction && process.env.COOKIE_DOMAIN) {
-    options.domain = process.env.COOKIE_DOMAIN;
-  }
-  
-  return options;
-};
-
 // Google OAuth2 client
 const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID || 'NO_CLIENT_ID_SET'
@@ -428,7 +411,7 @@ const verifyOTPAndLogin = async (req, res) => {
       });
       await user.save();
 
-      setRefreshTokenCookie(res, 'ecomm', refreshToken);
+      setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
       return res.status(200).json({
         success: true,
@@ -481,7 +464,7 @@ const verifyOTPAndLogin = async (req, res) => {
 
     await user.save();
 
-    setRefreshTokenCookie(res, 'ecomm', refreshToken);
+    setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
     return res.status(200).json({
       success: true,
@@ -571,7 +554,7 @@ user.refreshTokens.push({
 
    await user.save();
 
-    setRefreshTokenCookie(res, portal || 'ecomm', refreshToken);
+    setRefreshTokenCookie(req, res, portal || 'ecomm', refreshToken);
 
 
     return res.status(200).json({
@@ -791,7 +774,7 @@ const logout = async (req, res) => {
       }
     }
 
-    clearRefreshTokenCookie(res, logoutPortal || 'ecomm');
+    clearRefreshTokenCookie(req, res, logoutPortal || 'ecomm');
 
     return res.status(200).json({
       success: true,
@@ -879,8 +862,7 @@ const refreshAccessToken = async (req, res) => {
 
     await user.save();
 
-    //  Use getRefreshCookieOptions() for consistent cookie settings
-    setRefreshTokenCookie(res, refreshedPortal, newRefreshToken);
+    setRefreshTokenCookie(req, res, refreshedPortal, newRefreshToken);
 
     // console.log(" New tokens sent successfully");
 
@@ -1097,7 +1079,7 @@ user.refreshTokens.push({
 
 await user.save();
 
-setRefreshTokenCookie(res, 'ecomm', refreshToken);
+setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
 
     return res.status(200).json({
@@ -1176,7 +1158,7 @@ const logoutAllDevices = async (req, res) => {
     }
     user.refreshTokens = [];
     await user.save();
-    clearRefreshTokenCookie(res, 'ecomm');
+    clearRefreshTokenCookie(req, res, 'ecomm');
     return res.json({ success: true, message: 'Logged out from all devices' });
   } catch (error) {
     return res.status(500).json({

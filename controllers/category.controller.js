@@ -352,9 +352,20 @@ const deleteCategory = async (req, res) => {
       });
     }
 
+    const previousPublicId = category.image?.publicId;
     category.status = 'inactive';
     category.showInMenu = false;
+    category.image = { url: '', publicId: '' };
     await category.save();
+
+    if (previousPublicId) {
+      try {
+        await deleteFromCloudinary(previousPublicId);
+      } catch (mediaErr) {
+        // Non-fatal cleanup error: category state change should still succeed.
+        console.error('Category media cleanup failed:', mediaErr.message);
+      }
+    }
 
     //  INVALIDATE CATEGORY CACHE AFTER DELETE
     await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
