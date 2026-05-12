@@ -6,14 +6,16 @@ const { validationResult } = require('express-validator');
 const path = require('path');
 const WholesalerDetails = require('../models/WholesalerDetails');
 const User = require('../models/User');
-const { generateOTP, sendOTP } = require('../services/otp.service');
+const { generateOTP, sendOTP, deliverOtpFor, getOtpExpiryMs } = require('../services/otp.service');
 const { buildWholesalerPdfPreviewUrl } = require('../utils/cloudinaryProofDelivery');
 const { uploadBufferToR2 } = require('../utils/r2Storage');
 const { optimizeProductImageBuffer } = require('../utils/cloudinaryHelper');
 const { deleteFromR2ByUrl } = require('../utils/r2Storage');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 
-const OTP_TTL_MS = 10 * 60 * 1000;
+// Wholesaler activation OTP follows the same global expiry window as every
+// other OTP flow. Driven by OTP_EXPIRY_MINUTES env (default: 5 minutes).
+const OTP_TTL_MS = getOtpExpiryMs();
 const MAX_OTP_ATTEMPTS = 5;
 const ACCESS_EXPIRES = process.env.ACCESS_TOKEN_EXPIRES || '15m';
 const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
@@ -1188,7 +1190,20 @@ exports.sendWholesalerActivationOtp = async (req, res) => {
     doc.activationOtpSentAt = new Date();
     await doc.save();
 
-    await sendOTP(doc.mobileNumber, otp);
+    // Route through the env-aware delivery layer. Wholesaler records have
+    // both `mobileNumber` and `email` populated at approval-time, so SMS,
+    // Email and Both modes all work seamlessly.
+    try {
+      await deliverOtpFor({
+        phone: doc.mobileNumber,
+        email: doc.email,
+        otp,
+        purpose: 'wholesaler_activation'
+      });
+    } catch (deliverErr) {
+      console.error('Wholesaler activation OTP delivery failed:', deliverErr?.message, deliverErr?.details || '');
+      return authContractError(res, 502, 'WHOLESALER_ACTIVATION_OTP_SEND_FAILED', 'Could not send activation OTP. Please try again.');
+    }
 
     return res.status(200).json({
       success: true,

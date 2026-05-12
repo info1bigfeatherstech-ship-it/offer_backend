@@ -11,11 +11,25 @@ const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 
 // Import from OTP service
-const { sendOTP, generateOTP } = require("../services/otp.service");
+const {
+  sendOTP,
+  generateOTP,
+  deliverOtpFor,
+  validateRecipientsForMode,
+  getDeliveryMode,
+  OTP_DELIVERY_MODES,
+  getOtpExpiryMs
+} = require("../services/otp.service");
 
 // ========== HELPERS ==========
 
-// Helper to send OTP via SMS
+/**
+ * LEGACY helper kept for any internal caller that only had a phone in hand.
+ * Now routes through env-aware delivery layer.
+ *
+ * Prefer `deliverRegistrationStyleOTP({ phone, email, otp, purpose })` below
+ * for new flows so email-mode actually works.
+ */
 const sendPhoneOTP = async (phone, otp) => {
   try {
     await sendOTP(phone, otp);
@@ -25,6 +39,19 @@ const sendPhoneOTP = async (phone, otp) => {
     console.error(` Failed to send OTP to ${phone}:`, error.message);
     throw error;
   }
+};
+
+/**
+ * Build a frontend-friendly "OTP sent to ..." message from the delivery
+ * result. Never throws — pure string formatter.
+ */
+const describeOtpDelivery = (delivery) => {
+  if (!delivery || !Array.isArray(delivery.deliveredVia) || delivery.deliveredVia.length === 0) {
+    return 'OTP sent';
+  }
+  if (delivery.deliveredVia.length === 2) return 'OTP sent to your phone and email';
+  if (delivery.deliveredVia[0] === 'email') return 'OTP sent to your email';
+  return 'OTP sent to your phone number';
 };
 
 // Helper to extract token from Authorization header
@@ -50,7 +77,9 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
 
 const ACCESS_EXPIRES = process.env.ACCESS_TOKEN_EXPIRES || '15m';
 const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
-const CONTACT_CHANGE_OTP_TTL_MS = 10 * 60 * 1000;
+// Contact-change OTP shares the global expiry window so all OTP flows stay
+// in lockstep. Change via OTP_EXPIRY_MINUTES env.
+const CONTACT_CHANGE_OTP_TTL_MS = getOtpExpiryMs();
 const CONTACT_CHANGE_MAX_ATTEMPTS = 5;
 const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
 const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
@@ -301,26 +330,56 @@ const register = async (req, res) => {
 
     const { email, password, name, phone } = req.body;
 
-    // Check if email already exists (verified user)
-    const existingEmailUser = await User.findOne({ email, isPhoneVerified: true });
+    // Pre-flight: ensure the configured OTP delivery mode has the recipients it needs.
+    // (Both phone + email are collected at registration so this is almost always fine,
+    // but we still guard against malformed payloads / future schema changes.)
+    const recipientCheck = validateRecipientsForMode({ phone, email });
+    if (!recipientCheck.ok) {
+      return respondAuthError(
+        res,
+        400,
+        'OTP_RECIPIENT_MISSING',
+        `OTP delivery mode "${recipientCheck.mode}" requires a ${recipientCheck.missing}.`
+      );
+    }
+
+    // Check if email already exists (any verified user — phone OR email verified)
+    const existingEmailUser = await User.findOne({
+      email,
+      $or: [{ isPhoneVerified: true }, { isEmailVerified: true }]
+    });
     if (existingEmailUser) {
       return respondAuthError(res, 409, 'EMAIL_ALREADY_REGISTERED', 'User with this email already exists. Please login.');
     }
 
-    // Check if phone already exists (verified user)
-    const existingPhoneUser = await User.findOne({ phone, isPhoneVerified: true });
+    // Check if phone already exists (any verified user — phone OR email verified)
+    const existingPhoneUser = await User.findOne({
+      phone,
+      $or: [{ isPhoneVerified: true }, { isEmailVerified: true }]
+    });
     if (existingPhoneUser) {
       return respondAuthError(res, 409, 'PHONE_ALREADY_REGISTERED', 'User with this phone number already exists. Please login.');
     }
 
-    // Check if unverified user exists
+    // Check if unverified user exists (neither phone nor email verified yet)
     const unverifiedUser = await User.findOne({
       $or: [{ email }, { phone }],
-      isPhoneVerified: false
+      isPhoneVerified: false,
+      isEmailVerified: false
     });
 
     const otp = generateOTP();
-    const expires = new Date(Date.now() + 10 * 60 * 1000);
+    const expires = new Date(Date.now() + getOtpExpiryMs());
+
+    // Persist OTP into BOTH fields so verification can match regardless of the
+    // channel the user actually receives it on (SMS/Email/Both). Same code,
+    // same expiry, so this is safe — and keeps the verify path simple.
+    const otpFields = {
+      phoneVerificationOTP: otp,
+      phoneVerificationOTPExpires: expires,
+      emailVerificationOTP: otp,
+      emailVerificationOTPExpires: expires
+    };
 
     if (unverifiedUser) {
       // Update existing unverified user
@@ -328,8 +387,10 @@ const register = async (req, res) => {
       unverifiedUser.email = email;
       unverifiedUser.phone = phone;
       unverifiedUser.password = password;
-      unverifiedUser.phoneVerificationOTP = otp;
-      unverifiedUser.phoneVerificationOTPExpires = expires;
+      unverifiedUser.phoneVerificationOTP = otpFields.phoneVerificationOTP;
+      unverifiedUser.phoneVerificationOTPExpires = otpFields.phoneVerificationOTPExpires;
+      unverifiedUser.emailVerificationOTP = otpFields.emailVerificationOTP;
+      unverifiedUser.emailVerificationOTPExpires = otpFields.emailVerificationOTPExpires;
       await unverifiedUser.save();
     } else {
       // Create new user
@@ -342,22 +403,38 @@ const register = async (req, res) => {
         status: 'active',
         isEmailVerified: false,
         isPhoneVerified: false,
-          isProfileComplete: false,  
-        registrationMethod: 'phone',
-        phoneVerificationOTP: otp,
-        phoneVerificationOTPExpires: expires
+        isProfileComplete: false,
+        registrationMethod: getDeliveryMode() === OTP_DELIVERY_MODES.EMAIL ? 'email' : 'phone',
+        ...otpFields
       });
       await user.save();
     }
 
-    // Send OTP
-    await sendPhoneOTP(phone, otp);
+    // Deliver OTP via configured channel(s). Throws only if ALL channels fail.
+    let delivery;
+    try {
+      delivery = await deliverOtpFor({ phone, email, otp, purpose: 'registration' });
+    } catch (deliverErr) {
+      console.error('Registration OTP delivery failed:', deliverErr?.message, deliverErr?.details || '');
+      return respondAuthError(
+        res,
+        502,
+        'OTP_DELIVERY_FAILED',
+        'Could not send OTP. Please try again in a moment.'
+      );
+    }
 
     return res.status(200).json({
       success: true,
-      message: 'OTP sent to your phone number',
+      message: describeOtpDelivery(delivery),
+      // Backward-compatible fields used by existing frontend:
       phone: phone,
-      requiresOTPVerification: true
+      requiresOTPVerification: true,
+      // New fields — frontend can adopt progressively:
+      email: email,
+      deliveryMode: delivery.deliveryMode,
+      deliveredVia: delivery.deliveredVia,
+      ...(Object.keys(delivery.errors || {}).length ? { partialErrors: delivery.errors } : {})
     });
 
   } catch (error) {
@@ -374,31 +451,39 @@ const register = async (req, res) => {
 
 const verifyOTPAndLogin = async (req, res) => {
   try {
-    let { phone, otp } = req.body;
+    // Backward compatible: accept legacy `phone` field OR new `identifier` field.
+    // `identifier` may be a 10-digit phone OR an email — auto-detected.
+    const rawIdentifier = String(req.body.identifier || req.body.phone || req.body.email || '').trim();
+    const otpRaw = req.body.otp;
 
-    if (!phone || !otp) {
-      return respondAuthError(res, 400, 'PHONE_OTP_PAYLOAD_INVALID', 'Phone number and OTP are required');
+    if (!rawIdentifier || !otpRaw) {
+      return respondAuthError(res, 400, 'PHONE_OTP_PAYLOAD_INVALID', 'Identifier (phone/email) and OTP are required');
     }
 
-    // Convert both to strings
-    phone = String(phone).trim();
-    const otpString = String(otp).trim();
+    const otpString = String(otpRaw).trim();
+    const looksLikeEmail = rawIdentifier.includes('@');
+    const looksLikePhone = /^\d{10}$/.test(rawIdentifier);
 
-    if (!/^\d{10}$/.test(phone)) {
-      return respondAuthError(res, 400, 'PHONE_NUMBER_INVALID', 'Invalid phone number format. Must be 10 digits.');
+    if (!looksLikeEmail && !looksLikePhone) {
+      return respondAuthError(res, 400, 'IDENTIFIER_INVALID', 'Identifier must be a 10-digit phone number or a valid email.');
     }
 
-    //  FIX: Added all required fields to select
-    const user = await User.findOne({ phone }).select(
-      "+phoneVerificationOTP +phoneVerificationOTPExpires +refreshTokens phone name email userType role isPhoneVerified status isEmailVerified isProfileComplete"
+    // Build identifier-based lookup. Select both verification OTP fields since
+    // the channel used at registration may differ from what we expect.
+    const lookup = looksLikeEmail
+      ? { email: rawIdentifier.toLowerCase() }
+      : { phone: rawIdentifier };
+
+    const user = await User.findOne(lookup).select(
+      "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires +refreshTokens phone name email userType role isPhoneVerified status isEmailVerified isProfileComplete"
     );
 
     if (!user) {
-      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found with this phone number');
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', `User not found with this ${looksLikeEmail ? 'email' : 'phone number'}`);
     }
 
-    // If already verified, just login
-    if (user.isPhoneVerified) {
+    // If already verified (either channel), just login.
+    if (user.isPhoneVerified || user.isEmailVerified) {
       const accessToken = generateAccessToken(user._id, user.userType, user.role);
       const refreshToken = generateRefreshToken(user._id);
       const hashedRefreshToken = hashToken(refreshToken);
@@ -429,22 +514,48 @@ const verifyOTPAndLogin = async (req, res) => {
       });
     }
 
-    // Check OTP expiry
-    if (!user.phoneVerificationOTPExpires || new Date() > user.phoneVerificationOTPExpires) {
-      return respondAuthError(res, 400, 'OTP_EXPIRED', 'OTP has expired. Please request a new OTP.');
-    }
+    // OTP match — accept either field (phone or email) since we wrote the
+    // same OTP to both at registration time.
+    const phoneOtpValid =
+      user.phoneVerificationOTP &&
+      user.phoneVerificationOTPExpires &&
+      new Date() <= user.phoneVerificationOTPExpires &&
+      user.phoneVerificationOTP === otpString;
 
-    // Compare OTP
-    if (user.phoneVerificationOTP !== otpString) {
+    const emailOtpValid =
+      user.emailVerificationOTP &&
+      user.emailVerificationOTPExpires &&
+      new Date() <= user.emailVerificationOTPExpires &&
+      user.emailVerificationOTP === otpString;
+
+    if (!phoneOtpValid && !emailOtpValid) {
+      // Distinguish "expired" vs "wrong" for better UX:
+      const hadAnyOtp =
+        user.phoneVerificationOTP ||
+        user.emailVerificationOTP;
+      const allExpired =
+        (!user.phoneVerificationOTPExpires || new Date() > user.phoneVerificationOTPExpires) &&
+        (!user.emailVerificationOTPExpires || new Date() > user.emailVerificationOTPExpires);
+
+      if (hadAnyOtp && allExpired) {
+        return respondAuthError(res, 400, 'OTP_EXPIRED', 'OTP has expired. Please request a new OTP.');
+      }
       return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
-      
-    // Activate user
-    user.isPhoneVerified = true;
+
+    // Activate user. Set verification flag based on the lookup channel — the
+    // identifier the user actually proved control of.
+    if (looksLikeEmail) {
+      user.isEmailVerified = true;
+    } else {
+      user.isPhoneVerified = true;
+    }
     user.status = "active";
     user.isProfileComplete = true;
     user.phoneVerificationOTP = undefined;
     user.phoneVerificationOTPExpires = undefined;
+    user.emailVerificationOTP = undefined;
+    user.emailVerificationOTPExpires = undefined;
       
     // Generate tokens
     const accessToken = generateAccessToken(user._id, user.userType, user.role);
@@ -510,8 +621,10 @@ const login = async (req, res) => {
       return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
     }
 
-    if (!user.isPhoneVerified) {
-      return respondAuthError(res, 403, 'PHONE_NOT_VERIFIED', 'Phone number not verified. Please complete registration.');
+    // Account is considered verified if EITHER channel was verified at registration.
+    // This keeps login working whether OTP_DELIVERY_MODE was sms, email, or both.
+    if (!user.isPhoneVerified && !user.isEmailVerified) {
+      return respondAuthError(res, 403, 'PHONE_NOT_VERIFIED', 'Account not verified. Please complete registration.');
     }
 
     if (user.status !== "active") {
@@ -604,26 +717,32 @@ const sendPasswordResetOTP = async (req, res) => {
     }
 
     const otp = generateOTP();
-    const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    const otpExpires = new Date(Date.now() + getOtpExpiryMs());
 
     user.passwordResetOTP = otp;
     user.passwordResetOTPExpires = otpExpires;
     await user.save({ validateBeforeSave: false });
 
-    const isEmail = identifier.includes('@');
+    const isEmail = String(identifier).includes('@');
 
-    if (isEmail) {
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: user.email,
-        subject: 'Password Reset OTP',
-        html: `<p>Your password reset OTP is <strong>${otp}</strong>. It expires in 10 minutes.</p>`
-      };
-      transporter.sendMail(mailOptions, (error) => {
-        if (error) console.error('Email error:', error);
+    // For password-reset the channel is dictated by the identifier the user
+    // typed in, not by OTP_DELIVERY_MODE. So we explicitly force the channel.
+    try {
+      await deliverOtpFor({
+        phone: user.phone,
+        email: user.email,
+        otp,
+        purpose: 'password_reset',
+        forceChannel: isEmail ? 'email' : 'sms'
       });
-    } else {
-      await sendPhoneOTP(user.phone, otp);
+    } catch (deliverErr) {
+      console.error('Password reset OTP delivery failed:', deliverErr?.message, deliverErr?.details || '');
+      return respondAuthError(
+        res,
+        502,
+        'OTP_DELIVERY_FAILED',
+        'Could not send OTP. Please try again in a moment.'
+      );
     }
 
     return res.status(200).json({

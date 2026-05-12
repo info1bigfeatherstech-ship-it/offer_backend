@@ -2646,7 +2646,10 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       successful: 0,
       failed: 0,
       errors: [],
-      products: []
+      products: [],
+      // Rows that were created/updated successfully but with NO images
+      // (folder missing / empty / upload skipped). Admin can re-upload later.
+      missingImages: []
     };
 
     const BATCH_SIZE = 50;
@@ -2686,19 +2689,46 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
 
           // Upload images from productCode folder.
           // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
+          //
+          // POLICY (intentional, requested by product):
+          //   Missing images must NOT block product/variant creation. The
+          //   product is created with an empty images array and is flagged so
+          //   the admin can see in the response which rows lack images and
+          //   re-upload them later. This matches the preview controller which
+          //   already treats missing images as a warning, not an error.
           const folderCandidates = getImageFolderCandidatesForRow(row);
           const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
             rootFolder,
             folderCandidates
           );
+
+          let variantImages = [];
+          let imagesWarning = null;
+
           if (!imageFolder) {
-            throw new Error(
+            imagesWarning =
               `Image folder not found for productCode ${productCode}. ` +
               `Tried: ${folderCandidates.join(", ")}. ` +
-              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
-            );
+              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}. ` +
+              `Product/variant created without images — re-upload images later.`;
+            console.warn(`⚠️ ${imagesWarning}`);
+          } else {
+            try {
+              variantImages = await uploadVariantImages(
+                imageFolder,
+                row.name,
+                matchedCode || productCode
+              );
+            } catch (imgErr) {
+              // Folder exists but empty / all uploads failed → don't block
+              // product creation. Record the reason for the response report.
+              variantImages = [];
+              imagesWarning =
+                `Image upload skipped for productCode ${productCode}: ${imgErr.message}. ` +
+                `Product/variant created without images — re-upload images later.`;
+              console.warn(`⚠️ ${imagesWarning}`);
+            }
           }
-          const variantImages = await uploadVariantImages(imageFolder, row.name, matchedCode || productCode);
 
           // Build complete variant with wholesale
           const newVariant = await buildCompleteVariant(row, row.name, variantImages);
@@ -2781,6 +2811,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'updated' });
+            if (imagesWarning) {
+              stats.missingImages.push({
+                row: `${row.name} (row ${row.rowNumber || '?'})`,
+                productCode,
+                action: 'updated',
+                reason: imagesWarning
+              });
+            }
           } else {
             const existingProductWithCode = await Product.findOne({
               "variants.productCode": productCodeToDbQuery(productCode)
@@ -2842,6 +2880,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'inserted' });
+            if (imagesWarning) {
+              stats.missingImages.push({
+                row: `${row.name} (row ${row.rowNumber || '?'})`,
+                productCode,
+                action: 'inserted',
+                reason: imagesWarning
+              });
+            }
           }
           
         } catch (err) {
@@ -2894,16 +2940,25 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     console.log(`\n🎉 BULK UPLOAD COMPLETED!`);
     console.log(`✅ Successful: ${stats.successful}`);
     console.log(`❌ Failed: ${stats.failed}`);
+    if (stats.missingImages.length > 0) {
+      console.log(`🖼️  Created without images: ${stats.missingImages.length} (admin should re-upload images for these)`);
+    }
 
     // =============================================
     // Send FINAL response with download link
     // =============================================
     return res.status(200).json({
       success: true,
-      message: "Bulk upload completed",
+      message: stats.missingImages.length > 0
+        ? `Bulk upload completed. ${stats.missingImages.length} product(s) created without images — see "missingImages" to re-upload.`
+        : "Bulk upload completed",
       totalRows: rows.length,
       successful: stats.successful,
       failed: stats.failed,
+      // Products that succeeded but have no images yet. Empty array when all
+      // products had their images uploaded.
+      createdWithoutImagesCount: stats.missingImages.length,
+      missingImages: stats.missingImages,
       downloadUrl: errorReportUrl  // ✅ Direct download link in response
     });
     

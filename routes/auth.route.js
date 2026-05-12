@@ -63,19 +63,32 @@ router.post(
 );
 
 // Step 2: Verify OTP and auto-login
+//
+// Accepts either:
+//   { phone, otp }                  ← legacy / phone-mode
+//   { email, otp }                  ← email-mode
+//   { identifier, otp }             ← preferred (auto-detected as phone or email)
+//
+// At least one of phone/email/identifier MUST be present.
 router.post(
     '/otp-verify-login',
     [
-        body('phone')
-            .trim()
-            .notEmpty()
-            .withMessage('Phone number is required'),
         body('otp')
             .trim()
             .notEmpty()
-            .withMessage('OTP is required')
+            .withMessage('OTP is required'),
+        body().custom((value) => {
+            const hasIdentifier =
+                (value && typeof value.identifier === 'string' && value.identifier.trim()) ||
+                (value && typeof value.phone === 'string' && value.phone.trim()) ||
+                (value && typeof value.email === 'string' && value.email.trim());
+            if (!hasIdentifier) {
+                throw new Error('Identifier (phone or email) is required');
+            }
+            return true;
+        })
     ],
-    verifyOTPAndLogin  // ✅ Verifies OTP, marks phone verified, returns tokens
+    verifyOTPAndLogin  // ✅ Verifies OTP, marks account verified, returns tokens
 );
 
 // =============================================
