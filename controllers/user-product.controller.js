@@ -101,6 +101,54 @@ function decorateProductForStorefront(product, userType, storefront) {
   };
 }
 
+// Attach `appliedTags: string[]` to every product in a list using a single
+// batched ProductTag lookup. Products with no ProductTag document receive
+// `appliedTags: []`. Multiple ProductTag rows per product (shouldn't happen
+// per schema, but defensive) are merged and de-duplicated.
+async function attachAppliedTagsToProducts(products) {
+  if (!Array.isArray(products) || products.length === 0) {
+    return Array.isArray(products) ? products : [];
+  }
+
+  const productIds = products.map((p) => p?._id).filter(Boolean);
+  if (productIds.length === 0) {
+    return products.map((p) => ({ ...p, appliedTags: [] }));
+  }
+
+  const tagDocs = await ProductTag.find({ product: { $in: productIds } })
+    .select('product tags')
+    .lean();
+
+  const tagMap = new Map();
+  for (const doc of tagDocs) {
+    if (!doc?.product) continue;
+    const key = String(doc.product);
+    const incoming = Array.isArray(doc.tags) ? doc.tags : [];
+    const existing = tagMap.get(key) || [];
+    tagMap.set(key, Array.from(new Set([...existing, ...incoming])));
+  }
+
+  return products.map((p) => ({
+    ...p,
+    appliedTags: (p?._id && tagMap.get(String(p._id))) || [],
+  }));
+}
+
+// Single-product variant of `attachAppliedTagsToProducts`. Always returns an
+// `appliedTags` array on the decorated product object.
+async function attachAppliedTagsToProduct(product) {
+  if (!product || !product._id) {
+    return product;
+  }
+  const doc = await ProductTag.findOne({ product: product._id })
+    .select('tags')
+    .lean();
+  return {
+    ...product,
+    appliedTags: Array.isArray(doc?.tags) ? doc.tags : [],
+  };
+}
+
 // =============================================
 // GET /products/all - WITH CACHE
 // =============================================
@@ -367,11 +415,13 @@ console.table(
         .lean({ virtuals: true }),
     ]);
 
-    const productsWithData = products.map((product) =>
-      decorateProductForStorefront(
-        product,
-        currentUserType,
-        storefront
+    const productsWithData = await attachAppliedTagsToProducts(
+      products.map((product) =>
+        decorateProductForStorefront(
+          product,
+          currentUserType,
+          storefront
+        )
       )
     );
 
@@ -441,10 +491,12 @@ const getProductBySlug = async (req, res) => {
       });
     }
 
-    const productResponse = decorateProductForStorefront(
-      product.toObject(),
-      userType,
-      storefront
+    const productResponse = await attachAppliedTagsToProduct(
+      decorateProductForStorefront(
+        product.toObject(),
+        userType,
+        storefront
+      )
     );
 
     const responseData = {
@@ -656,11 +708,13 @@ const searchProducts = async (req, res) => {
       .populate("category")
       .lean({ virtuals: true });
 
-    const productsWithData = products.map((product) =>
-      decorateProductForStorefront(
-        product,
-        currentUserType,
-        currentStorefront
+    const productsWithData = await attachAppliedTagsToProducts(
+      products.map((product) =>
+        decorateProductForStorefront(
+          product,
+          currentUserType,
+          currentStorefront
+        )
       )
     );
 
@@ -890,11 +944,13 @@ const getProductsByCategory = async (req, res) => {
       .populate("category")
       .lean({ virtuals: true });
 
-    const productsWithData = products.map((product) =>
-      decorateProductForStorefront(
-        product,
-        currentUserType,
-        currentStorefront
+    const productsWithData = await attachAppliedTagsToProducts(
+      products.map((product) =>
+        decorateProductForStorefront(
+          product,
+          currentUserType,
+          currentStorefront
+        )
       )
     );
 
@@ -1053,8 +1109,10 @@ const getFeaturedProducts = async (req, res) => {
       .populate('category')
       .lean({ virtuals: true });
 
-    const productsWithData = products.map((product) =>
-      decorateProductForStorefront(product, userType, storefront)
+    const productsWithData = await attachAppliedTagsToProducts(
+      products.map((product) =>
+        decorateProductForStorefront(product, userType, storefront)
+      )
     );
 
     const responseData = {
@@ -1134,8 +1192,10 @@ const getRelatedProducts = async (req, res) => {
       .populate('category')
       .lean({ virtuals: true });
 
-    const relatedWithData = related.map((rel) =>
-      decorateProductForStorefront(rel, userType, storefront)
+    const relatedWithData = await attachAppliedTagsToProducts(
+      related.map((rel) =>
+        decorateProductForStorefront(rel, userType, storefront)
+      )
     );
 
     const responseData = {
@@ -1180,10 +1240,12 @@ const getProductDetails = async (req, res) => {
 
     const userType = req.userType || 'user';
 
-    const productResponse = decorateProductForStorefront(
-      product.toObject(),
-      userType,
-      storefront
+    const productResponse = await attachAppliedTagsToProduct(
+      decorateProductForStorefront(
+        product.toObject(),
+        userType,
+        storefront
+      )
     );
 
     res.status(200).json({
