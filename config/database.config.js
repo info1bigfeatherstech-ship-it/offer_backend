@@ -37,12 +37,19 @@
         heartbeatFrequencyMS: 10000,
       });
           
+      // Production-safe default: do NOT auto-sync indexes on every cold start.
+      // syncIndexes() on a large Product collection can lock writes for minutes
+      // and may drop manually-created indexes that aren't in the schema.
+      // Opt-in explicitly by setting MONGODB_SYNC_PRODUCT_INDEXES=true for the
+      // single deploy where schema indexes actually changed, then flip back.
       const syncProductIndexes =
-        String(process.env.MONGODB_SYNC_PRODUCT_INDEXES || 'true').toLowerCase() === 'true';
+        String(process.env.MONGODB_SYNC_PRODUCT_INDEXES || 'false').toLowerCase() === 'true';
       if (syncProductIndexes) {
         const Product = require('../models/Product');
         await Product.syncIndexes();
         console.log('[MongoDB] ✓ Product indexes synced');
+      } else {
+        console.log('[MongoDB] Product index sync skipped (set MONGODB_SYNC_PRODUCT_INDEXES=true to force)');
       }
 
 
