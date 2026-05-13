@@ -1,76 +1,61 @@
 const Address = require("../models/Address");
+const {
+  validatePhysicalAddressForSave,
+  shouldRunFullAddressValidation
+} = require("../utils/addressValidation");
+
+const clean = (val) => (typeof val === "string" ? val.trim() : val);
 
 // Add a new address
 const addAddress = async (req, res) => {
   try {
     const userId = req.userId;
 
-    let {
-      fullName,
-      phone,
-      houseNumber,
-      area,
-      landmark,
-      addressLine1,
-      addressLine2,
-      city,
-      state,
-      postalCode,
-      country,
+    const {
       addressType,
-      isDefault,
+      isDefault: isDefaultRaw,
       isGift,
       deliveryInstructions
     } = req.body;
 
-    // =========================
-    // 🔒 BASIC VALIDATION
-    // =========================
-    if (
-      !fullName ||
-      !phone ||
-      !houseNumber ||
-      !area ||
-      !city ||
-      !state ||
-      !postalCode
-    ) {
+    const candidate = {
+      fullName: clean(req.body.fullName),
+      phone: clean(req.body.phone),
+      houseNumber: clean(req.body.houseNumber),
+      area: clean(req.body.area),
+      landmark: clean(req.body.landmark),
+      addressLine1: clean(req.body.addressLine1),
+      addressLine2: clean(req.body.addressLine2),
+      city: clean(req.body.city),
+      state: clean(req.body.state),
+      postalCode: clean(req.body.postalCode),
+      country: clean(req.body.country) || "India"
+    };
+
+    const validation = validatePhysicalAddressForSave(candidate);
+    if (!validation.ok) {
       return res.status(400).json({
         success: false,
-        message: "Required address fields are missing"
+        code: validation.code,
+        message: validation.message,
+        errors: validation.errors
       });
     }
 
-    // =========================
-    // 🧹 SANITIZATION
-    // =========================
-    const clean = (val) =>
-      typeof val === "string" ? val.trim() : val;
-
-    fullName = clean(fullName);
-    phone = clean(phone);
-    houseNumber = clean(houseNumber);
-    area = clean(area);
-    landmark = clean(landmark);
-    addressLine1 = clean(addressLine1);
-    addressLine2 = clean(addressLine2);
-    city = clean(city);
-    state = clean(state);
-    postalCode = clean(postalCode);
-    country = clean(country) || "India";
+    const d = validation.data;
 
     // =========================
     // 🔍 DUPLICATE CHECK (SMART)
     // =========================
     const existingAddress = await Address.findOne({
       userId,
-      fullName,
-      phone,
-      houseNumber,
-      area,
-      city,
-      state,
-      postalCode
+      fullName: d.fullName,
+      phone: d.phone,
+      houseNumber: d.houseNumber,
+      area: d.area,
+      city: d.city,
+      state: d.state,
+      postalCode: d.postalCode
     });
 
     if (existingAddress) {
@@ -86,19 +71,12 @@ const addAddress = async (req, res) => {
     // =========================
     const addressCount = await Address.countDocuments({ userId });
 
+    let isDefault = false;
     if (addressCount === 0) {
-      // 🟢 FIRST ADDRESS → ALWAYS DEFAULT
       isDefault = true;
-    } else if (isDefault === true || isDefault === "true") {
-      // 🟡 USER WANTS THIS DEFAULT → REMOVE OLD
-      await Address.updateMany(
-        { userId },
-        { $set: { isDefault: false } }
-      );
+    } else if (isDefaultRaw === true || isDefaultRaw === "true") {
+      await Address.updateMany({ userId }, { $set: { isDefault: false } });
       isDefault = true;
-    } else {
-      // 🔴 NORMAL CASE
-      isDefault = false;
     }
 
     // =========================
@@ -106,21 +84,21 @@ const addAddress = async (req, res) => {
     // =========================
     const address = new Address({
       userId,
-      fullName,
-      phone,
-      houseNumber,
-      area,
-      landmark: landmark || "",
-      addressLine1: addressLine1 || "",
-      addressLine2: addressLine2 || "",
-      city,
-      state,
-      postalCode,
-      country,
-      addressType: addressType || "home", // home | work | other
+      fullName: d.fullName,
+      phone: d.phone,
+      houseNumber: d.houseNumber,
+      area: d.area,
+      landmark: d.landmark || "",
+      addressLine1: d.addressLine1,
+      addressLine2: d.addressLine2,
+      city: d.city,
+      state: d.state,
+      postalCode: d.postalCode,
+      country: d.country,
+      addressType: addressType || "home",
       isDefault,
-      isGift: isGift || false,
-      deliveryInstructions: deliveryInstructions || ""
+      isGift: Boolean(isGift),
+      deliveryInstructions: clean(deliveryInstructions) || ""
     });
 
     await address.save();
@@ -130,7 +108,6 @@ const addAddress = async (req, res) => {
       message: "Address added successfully",
       address
     });
-
   } catch (error) {
     console.error("Add address error:", error);
 
@@ -198,11 +175,10 @@ const updateAddress = async (req, res) => {
     const userId = req.userId;
     const { id } = req.params;
 
-    let updates = { ...req.body };
+    const updates = { ...req.body };
+    delete updates._id;
+    delete updates.userId;
 
-    // =========================
-    //  FIND ADDRESS (OWNERSHIP CHECK)
-    // =========================
     const address = await Address.findOne({ _id: id, userId });
 
     if (!address) {
@@ -212,99 +188,95 @@ const updateAddress = async (req, res) => {
       });
     }
 
-    // =========================
-    //  SANITIZATION FUNCTION
-    // =========================
-    const clean = (val) =>
-      typeof val === "string" ? val.trim() : val;
-
-    // =========================
-    //  VALIDATION (PARTIAL)
-    // =========================
     if (updates.phone) {
       updates.phone = clean(updates.phone);
     }
-
     if (updates.postalCode) {
       updates.postalCode = clean(updates.postalCode);
     }
-
     if (updates.fullName) {
       updates.fullName = clean(updates.fullName);
     }
-
     if (updates.houseNumber) {
       updates.houseNumber = clean(updates.houseNumber);
     }
-
     if (updates.area) {
       updates.area = clean(updates.area);
     }
-
     if (updates.city) {
       updates.city = clean(updates.city);
     }
-
     if (updates.state) {
       updates.state = clean(updates.state);
     }
-
     if (updates.addressLine1) {
       updates.addressLine1 = clean(updates.addressLine1);
     }
-
     if (updates.addressLine2) {
       updates.addressLine2 = clean(updates.addressLine2);
     }
-
     if (updates.landmark !== undefined) {
       updates.landmark = clean(updates.landmark);
     }
-
     if (updates.country) {
       updates.country = clean(updates.country);
     }
+    if (updates.deliveryInstructions !== undefined) {
+      updates.deliveryInstructions = clean(updates.deliveryInstructions);
+    }
 
-    // =========================
-    // 🔒 DEFAULT ADDRESS LOGIC
-    // =========================
     if (updates.isDefault === true || updates.isDefault === "true") {
-      await Address.updateMany(
-        { userId },
-        { $set: { isDefault: false } }
-      );
-
+      await Address.updateMany({ userId }, { $set: { isDefault: false } });
       updates.isDefault = true;
     }
 
-    // =========================
-    // 🛑 PREVENT EMPTY REQUIRED FIELDS
-    // =========================
-    const requiredFields = [
-      "fullName",
-      "phone",
-      "houseNumber",
-      "area",
-      "city",
-      "state",
-      "postalCode"
-    ];
+    const updateKeys = Object.keys(updates).filter((k) => updates[k] !== undefined);
+    const runFullValidation = shouldRunFullAddressValidation(updateKeys);
 
-    for (const field of requiredFields) {
-      if (updates[field] !== undefined && updates[field] === "") {
+    if (runFullValidation) {
+      const docObj = address.toObject();
+      const merged = { ...docObj, ...updates };
+      const validation = validatePhysicalAddressForSave(merged);
+      if (!validation.ok) {
         return res.status(400).json({
           success: false,
-          message: `${field} cannot be empty`
+          code: validation.code,
+          message: validation.message,
+          errors: validation.errors
         });
       }
+      const { data: v } = validation;
+      const validatedKeySet = new Set(Object.keys(v));
+      for (const key of Object.keys(updates)) {
+        if (validatedKeySet.has(key)) {
+          address[key] = v[key];
+        } else {
+          address[key] = updates[key];
+        }
+      }
+    } else {
+      const requiredFields = [
+        "fullName",
+        "phone",
+        "houseNumber",
+        "area",
+        "city",
+        "state",
+        "postalCode"
+      ];
+      for (const field of requiredFields) {
+        if (updates[field] !== undefined && updates[field] === "") {
+          return res.status(400).json({
+            success: false,
+            code: "FIELD_EMPTY",
+            message: `${field} cannot be empty`
+          });
+        }
+      }
+      Object.keys(updates).forEach((key) => {
+        address[key] = updates[key];
+      });
     }
-
-    // =========================
-    // 🔁 APPLY UPDATES
-    // =========================
-    Object.keys(updates).forEach((key) => {
-      address[key] = updates[key];
-    });
 
     await address.save();
 
@@ -313,7 +285,6 @@ const updateAddress = async (req, res) => {
       message: "Address updated successfully",
       address
     });
-
   } catch (error) {
     console.error("Update address error:", error);
 

@@ -154,27 +154,35 @@ class GracefulShutdownService {
   setupProcessHandlers() {
     // Handle various shutdown signals
     const signals = ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT'];
-    
+
     signals.forEach(signal => {
       process.on(signal, () => {
         this.shutdown(signal);
       });
     });
 
-    // Handle uncaught exceptions
+    // uncaughtException -> shutdown is justified: synchronous throw means
+    // application state may be corrupted, safer to restart via PM2.
     process.on('uncaughtException', (error) => {
-      logger.error(`[Fatal] Uncaught Exception: ${error.message}`);
-      logger.error(error.stack);
+      logger.error(`[Fatal] Uncaught Exception: ${error.message}`, {
+        stack: error.stack
+      });
       this.shutdown('UNCAUGHT_EXCEPTION');
     });
 
-    // Handle unhandled promise rejections
-    process.on('unhandledRejection', (reason) => {
-      logger.error(`[Fatal] Unhandled Rejection: ${reason}`);
-      this.shutdown('UNHANDLED_REJECTION');
+    // unhandledRejection -> log only. Crashing the whole process for a single
+    // stray rejection (third-party SDK glitch, transient network blip, etc.)
+    // creates PM2 restart loops and customer-facing 502s. Node.js 20+ default
+    // is also "warn only"; we keep that behaviour and surface the reason for
+    // post-mortem.
+    process.on('unhandledRejection', (reason, promise) => {
+      const error = reason instanceof Error ? reason : new Error(String(reason));
+      logger.error(`[Fatal] Unhandled Rejection: ${error.message}`, {
+        stack: error.stack,
+        reason: typeof reason === 'object' ? undefined : String(reason)
+      });
     });
 
-    // Handle process warnings
     process.on('warning', (warning) => {
       logger.warn(`[Process Warning] ${warning.name}: ${warning.message}`);
     });
