@@ -3,6 +3,8 @@
  * Uses shared shipment sync from order.controller.
  */
 
+const axios = require('axios');
+const AdmZip = require('adm-zip');
 const Order = require('../models/Order');
 const ShiprocketService = require('../utils/shiprocket');
 const logger = require('../utils/logger');
@@ -85,6 +87,89 @@ function assertStaffJson(req, res) {
   return true;
 }
 
+/** Dedupe and cap bulk `orderIds` from JSON body (max MAX_BULK_ORDER_IDS). */
+function normalizeBulkOrderIds(body) {
+  const rawIds = Array.isArray(body?.orderIds) ? body.orderIds : [];
+  const seen = new Set();
+  const orderIds = [];
+  for (const x of rawIds) {
+    const id = String(x || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    orderIds.push(id);
+    if (orderIds.length >= MAX_BULK_ORDER_IDS) break;
+  }
+  return orderIds;
+}
+
+/**
+ * Fetch Shiprocket label PDF bytes (same rules as single-label download).
+ * @param {import('mongoose').Document} order — populated staff order
+ * @returns {Promise<Buffer>}
+ */
+async function fetchShiprocketLabelPdfBuffer(order) {
+  const shipmentId = order.shipmentInfo?.shipmentId;
+  if (!shipmentId) {
+    const e = new Error('No shipment_id on order.');
+    e.code = 'SHIPMENT_ID_MISSING';
+    throw e;
+  }
+  const gate = evaluateOrderPaymentForShiprocketFulfillment(order);
+  if (!gate.ok) {
+    const e = new Error(gate.message || 'Payment rules do not allow this shipment action.');
+    e.code = gate.code || 'PAYMENT_REQUIRED';
+    e.details = gate.details || null;
+    throw e;
+  }
+  const siPre = order.shipmentInfo || {};
+  const hasAwb = Boolean(siPre.awbCode || siPre.trackingNumber);
+  if (!hasAwb) {
+    const e = new Error('Assign AWB before downloading or opening a shipping label.');
+    e.code = 'AWB_REQUIRED';
+    throw e;
+  }
+  let labelUrl = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
+  if (!labelUrl) {
+    const label = await ShiprocketService.generateShippingLabel({ shipmentId });
+    if (!label.success || !label.labelUrl) {
+      const e = new Error(label.message || 'Could not get shipping label URL');
+      e.code = label.code || 'LABEL_FAILED';
+      throw e;
+    }
+    await applyUpsertShipmentInfo({
+      order,
+      shipmentPayload: {
+        labelUrl: label.labelUrl,
+        providerStatus: order.shipmentInfo?.providerStatus
+      },
+      trigger: 'admin_shipping_label_pdf',
+      allowOrderStatusUpdate: false
+    });
+    labelUrl = String(label.labelUrl).trim();
+  }
+  const external = await axios.get(labelUrl, {
+    responseType: 'arraybuffer',
+    timeout: 45000,
+    maxContentLength: 25 * 1024 * 1024,
+    headers: {
+      Accept: 'application/pdf,application/octet-stream,*/*',
+      'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+    },
+    validateStatus: (s) => s >= 200 && s < 400
+  });
+  const buf = Buffer.from(external.data || []);
+  if (!buf.length) {
+    const e = new Error('Label download returned empty body');
+    e.code = 'LABEL_EMPTY_BODY';
+    throw e;
+  }
+  return buf;
+}
+
+function safeZipEntryBase(orderId, suffix) {
+  return `${String(orderId).replace(/[^\w.-]+/g, '_').slice(0, 80)}${suffix}`;
+}
+
 /**
  * Process ids in windows of `parallel` concurrent handlers (deterministic order).
  * @template R
@@ -119,7 +204,22 @@ async function mapInConcurrentWindows(ids, parallel, handler) {
  */
 async function runAssignShipFromOrder(order, courierIdOverride) {
   try {
-    const shipmentId = order.shipmentInfo?.shipmentId;
+    let shipmentId = order.shipmentInfo?.shipmentId ? String(order.shipmentInfo.shipmentId).trim() : '';
+    if (!shipmentId && order.shipmentInfo?.shiprocketOrderId) {
+      const lookup = await ShiprocketService.fetchShipmentIdForForwardOrder({
+        shiprocketOrderId: order.shipmentInfo.shiprocketOrderId,
+        channelOrderId: order.orderId
+      });
+      if (lookup.success && lookup.shipmentId) {
+        shipmentId = String(lookup.shipmentId).trim();
+        await applyUpsertShipmentInfo({
+          order,
+          shipmentPayload: { shipmentId: lookup.shipmentId },
+          trigger: 'admin_resolve_shipment_id',
+          allowOrderStatusUpdate: false
+        });
+      }
+    }
     if (!shipmentId) {
       return { success: false, code: 'SHIPMENT_ID_MISSING', message: 'Create/push shipment first (no shipment_id on order).' };
     }
@@ -179,6 +279,28 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
         code: assign.code || 'ASSIGN_AWB_FAILED',
         message: assign.message || 'Assign AWB failed',
         details: assign.details || null
+      };
+    }
+
+    const effectiveAwb =
+      Boolean(assign.mock) ||
+      Boolean(String(assign.awbCode || '').trim()) ||
+      Boolean(String(assign.trackingNumber || '').trim()) ||
+      Number(assign.raw?.awb_assign_status) === 1;
+    if (!effectiveAwb) {
+      const raw = assign.raw || {};
+      const nested = raw.response?.data && typeof raw.response.data === 'object' ? raw.response.data : {};
+      const walletMsg =
+        nested.awb_assign_error ||
+        raw.message ||
+        assign.message ||
+        'Shiprocket did not issue an AWB. Recharge the Shiprocket wallet or try another courier.';
+      return {
+        success: false,
+        code: 'ASSIGN_AWB_NOT_COMPLETED',
+        message: walletMsg,
+        details: raw,
+        shipment: assign
       };
     }
 
@@ -432,16 +554,7 @@ async function runBulkSchedulePickupSingle(orderId, pickupDateYmd) {
 exports.adminBulkFulfillmentShipNow = async (req, res) => {
   try {
     if (!assertStaffJson(req, res)) return;
-    const rawIds = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
-    const seen = new Set();
-    const orderIds = [];
-    for (const x of rawIds) {
-      const id = String(x || '').trim();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      orderIds.push(id);
-      if (orderIds.length >= MAX_BULK_ORDER_IDS) break;
-    }
+    const orderIds = normalizeBulkOrderIds(req.body);
     if (orderIds.length === 0) {
       return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
     }
@@ -484,16 +597,7 @@ exports.adminBulkFulfillmentSchedulePickup = async (req, res) => {
       return jsonError(res, 400, 'INVALID_PICKUP_DATE', dateCheck.message);
     }
 
-    const rawIds = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
-    const seen = new Set();
-    const orderIds = [];
-    for (const x of rawIds) {
-      const id = String(x || '').trim();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      orderIds.push(id);
-      if (orderIds.length >= MAX_BULK_ORDER_IDS) break;
-    }
+    const orderIds = normalizeBulkOrderIds(req.body);
     if (orderIds.length === 0) {
       return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
     }
@@ -565,6 +669,8 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
         status = 409;
       } else if (c === 'ASSIGN_INTERNAL_ERROR') {
         status = 500;
+      } else if (c === 'SHIPROCKET_WALLET_OR_BALANCE') {
+        status = 402;
       }
       return jsonError(res, status, c, assignRes.message, assignRes.details ? { details: assignRes.details } : {});
     }
@@ -644,6 +750,10 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
     if (!shipmentId) {
       return jsonError(res, 400, 'SHIPMENT_ID_MISSING', 'No shipment_id on order.');
     }
+    const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
+    if (!hasAwb) {
+      return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label from Shiprocket.');
+    }
     const label = await ShiprocketService.generateShippingLabel({ shipmentId });
     if (!label.success) {
       return jsonError(res, 502, label.code || 'LABEL_FAILED', label.message || 'Label generation failed', {
@@ -668,6 +778,69 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
   } catch (error) {
     logger.error('adminFulfillmentShippingLabel', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'FULFILLMENT_LABEL_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * GET /orders/admin/items/:orderId/fulfillment/shipping-label-file
+ * Proxies Shiprocket label PDF so the admin can download without CORS issues.
+ */
+exports.adminFulfillmentShippingLabelFile = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+
+    let buf;
+    try {
+      buf = await fetchShiprocketLabelPdfBuffer(order);
+    } catch (fetchErr) {
+      logger.error('adminFulfillmentShippingLabelFile fetch', {
+        message: fetchErr.message,
+        stack: fetchErr.stack,
+        code: fetchErr.code,
+        status: fetchErr.response?.status
+      });
+      const code = fetchErr.code || 'LABEL_FILE_FAILED';
+      if (code === 'SHIPMENT_ID_MISSING') {
+        return jsonError(res, 400, code, fetchErr.message || 'No shipment_id on order.');
+      }
+      if (code === 'AWB_REQUIRED') {
+        return jsonError(res, 400, code, fetchErr.message || 'Assign AWB first.');
+      }
+      const payHttp = fulfillmentPaymentBlockHttpStatus(code);
+      if (payHttp === 403) {
+        return jsonError(res, 403, code, fetchErr.message || 'Payment rules block this action.', {
+          details: fetchErr.details != null ? fetchErr.details : null
+        });
+      }
+      if (fetchErr.response?.status) {
+        return jsonError(
+          res,
+          502,
+          'LABEL_FILE_FETCH_FAILED',
+          `Could not download label from Shiprocket URL (HTTP ${fetchErr.response.status}).`
+        );
+      }
+      if (code === 'LABEL_FAILED' || code === 'LABEL_EMPTY_BODY') {
+        return jsonError(res, 502, code, fetchErr.message || 'Label error', {
+          details: fetchErr.details || null
+        });
+      }
+      return jsonError(res, 500, code, fetchErr.message || 'Server error');
+    }
+
+    const safe = String(order.orderId || 'order').replace(/[^\w.-]+/g, '_').slice(0, 80);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Shiprocket-label-${safe}.pdf"`);
+    return res.status(200).send(buf);
+  } catch (error) {
+    logger.error('adminFulfillmentShippingLabelFile', {
+      message: error.message,
+      stack: error.stack,
+      status: error.response?.status
+    });
+    return jsonError(res, 500, 'LABEL_FILE_FAILED', error.message || 'Server error');
   }
 };
 
@@ -743,6 +916,156 @@ exports.adminFulfillmentListCouriers = async (req, res) => {
   } catch (error) {
     logger.error('adminFulfillmentListCouriers', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'FULFILLMENT_COURIERS_FAILED', error.message || 'Server error');
+  }
+};
+
+const BULK_DOC_SKIP_STATUSES = new Set(['cancelled', 'payment_failed']);
+
+/** POST /orders/admin/items/bulk-documents/tax-invoices-zip — ZIP of GST invoice HTML + manifest.json */
+exports.adminBulkTaxInvoicesZip = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+
+    const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
+      try {
+        const order = await loadOrderDocByOrderId(oid);
+        if (!order) {
+          return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
+        }
+        const st = String(order.orderStatus || '').toLowerCase();
+        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+          return {
+            orderId: oid,
+            success: false,
+            code: 'SKIP_BAD_STATUS',
+            message: `Cannot build invoice for status ${order.orderStatus}`
+          };
+        }
+        const vm = buildGstInvoiceViewModel(order);
+        const html = buildGstInvoiceHtml(vm);
+        const entryName = safeZipEntryBase(oid, '-tax-invoice.html');
+        return { orderId: oid, success: true, entryName, html };
+      } catch (err) {
+        logger.error('adminBulkTaxInvoicesZip row', { orderId: oid, message: err?.message, stack: err?.stack });
+        return {
+          orderId: oid,
+          success: false,
+          code: 'INVOICE_BUILD_FAILED',
+          message: err?.message || String(err)
+        };
+      }
+    });
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    if (succeeded.length === 0) {
+      return jsonError(res, 400, 'BULK_INVOICES_NONE', 'No tax invoices could be added to the ZIP.', {
+        failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+      });
+    }
+
+    const zip = new AdmZip();
+    const manifest = {
+      type: 'tax_invoices',
+      generatedAt: new Date().toISOString(),
+      summary: {
+        total: results.length,
+        succeeded: succeeded.length,
+        failed: failed.length
+      },
+      succeeded: succeeded.map((r) => ({ orderId: r.orderId, file: r.entryName })),
+      failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+    };
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+    for (const row of succeeded) {
+      zip.addFile(row.entryName, Buffer.from(row.html, 'utf8'));
+    }
+    const buf = zip.toBuffer();
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="tax-invoices-bulk-${Date.now()}.zip"`);
+    return res.status(200).send(buf);
+  } catch (error) {
+    logger.error('adminBulkTaxInvoicesZip', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_INVOICES_ZIP_FAILED', error.message || 'Server error');
+  }
+};
+
+/** POST /orders/admin/items/bulk-documents/shipping-labels-zip — ZIP of label PDFs + manifest.json */
+exports.adminBulkShippingLabelsZip = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+
+    const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
+      try {
+        const order = await loadOrderDocByOrderId(oid);
+        if (!order) {
+          return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
+        }
+        const st = String(order.orderStatus || '').toLowerCase();
+        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+          return {
+            orderId: oid,
+            success: false,
+            code: 'SKIP_BAD_STATUS',
+            message: `Cannot download label for status ${order.orderStatus}`
+          };
+        }
+        const pdfBuf = await fetchShiprocketLabelPdfBuffer(order);
+        const entryName = safeZipEntryBase(oid, '-shipping-label.pdf');
+        return { orderId: oid, success: true, entryName, pdfBuf };
+      } catch (err) {
+        const code = err.code || 'LABEL_FAILED';
+        logger.error('adminBulkShippingLabelsZip row', {
+          orderId: oid,
+          code,
+          message: err?.message,
+          httpStatus: err.response?.status
+        });
+        return { orderId: oid, success: false, code, message: err?.message || String(err) };
+      }
+    });
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    if (succeeded.length === 0) {
+      return jsonError(res, 400, 'BULK_LABELS_NONE', 'No shipping labels could be added to the ZIP.', {
+        failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+      });
+    }
+
+    const zip = new AdmZip();
+    const manifest = {
+      type: 'shipping_labels',
+      generatedAt: new Date().toISOString(),
+      summary: {
+        total: results.length,
+        succeeded: succeeded.length,
+        failed: failed.length
+      },
+      succeeded: succeeded.map((r) => ({ orderId: r.orderId, file: r.entryName })),
+      failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+    };
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+    for (const row of succeeded) {
+      zip.addFile(row.entryName, row.pdfBuf);
+    }
+    const buf = zip.toBuffer();
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="shipping-labels-bulk-${Date.now()}.zip"`);
+    return res.status(200).send(buf);
+  } catch (error) {
+    logger.error('adminBulkShippingLabelsZip', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_LABELS_ZIP_FAILED', error.message || 'Server error');
   }
 };
 

@@ -285,12 +285,18 @@ async function computeCheckoutTotals({
 
   if (deliveryChargesOverride != null && Number.isFinite(Number(deliveryChargesOverride))) {
     deliveryCharges = roundMoney2(Number(deliveryChargesOverride));
-    deliveryMeta = deliveryMetaOverride || {
-      estimatedDays: null,
-      courierName: null,
-      isDeliverable: true,
-      codAvailable: true,
-      mock: false
+    const baseOverride =
+      deliveryMetaOverride && typeof deliveryMetaOverride === 'object' ? deliveryMetaOverride : {};
+    deliveryMeta = {
+      estimatedDays: baseOverride.estimatedDays ?? null,
+      courierName: baseOverride.courierName ?? null,
+      courierCompanyId:
+        baseOverride.courierCompanyId != null && Number.isFinite(Number(baseOverride.courierCompanyId))
+          ? Number(baseOverride.courierCompanyId)
+          : null,
+      isDeliverable: baseOverride.isDeliverable !== false,
+      codAvailable: baseOverride.codAvailable !== false,
+      mock: Boolean(baseOverride.mock)
     };
   } else {
     const ship = await ShiprocketService.checkDeliveryAvailability(postalCode, {
@@ -309,9 +315,14 @@ async function computeCheckoutTotals({
     }
 
     deliveryCharges = roundMoney2(Number(ship.deliveryCharges) || 0);
+    const cid =
+      ship.courierCompanyId != null && Number.isFinite(Number(ship.courierCompanyId))
+        ? Number(ship.courierCompanyId)
+        : null;
     deliveryMeta = {
       estimatedDays: ship.estimatedDays,
       courierName: ship.courierName,
+      courierCompanyId: cid,
       isDeliverable: ship.isDeliverable,
       codAvailable: ship.codAvailable !== false,
       mock: ship.mock

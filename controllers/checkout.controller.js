@@ -82,6 +82,7 @@ async function buildFinalTotals({
       deliveryMeta: {
         estimatedDays: String(2 + Math.floor(Math.random() * 3)) + '-5',
         courierName: 'Demo courier (Shiprocket off)',
+        courierCompanyId: null,
         isDeliverable: true,
         codAvailable: true,
         mock: true
@@ -285,6 +286,11 @@ exports.quoteCheckout = async (req, res) => {
       deliveryCharges: finalTotals.deliveryCharges,
       estimatedDays: finalTotals.deliveryMeta?.estimatedDays,
       courierName: finalTotals.deliveryMeta?.courierName,
+      courierCompanyId:
+        finalTotals.deliveryMeta?.courierCompanyId != null &&
+        Number.isFinite(Number(finalTotals.deliveryMeta.courierCompanyId))
+          ? Number(finalTotals.deliveryMeta.courierCompanyId)
+          : null,
       weightKg: finalTotals.totalWeight,
       dims: finalTotals.dims,
       couponCodeUpper,

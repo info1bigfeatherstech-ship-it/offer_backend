@@ -226,12 +226,21 @@ class ShiprocketService {
           ? String(best.estimated_delivery_days)
           : best.etd || '3–5';
 
+      const companyIdRaw =
+        best.courier_company_id ??
+        best.courier_id ??
+        best.company_id ??
+        best.id ??
+        null;
+      const companyId =
+        companyIdRaw != null && Number.isFinite(Number(companyIdRaw)) ? Number(companyIdRaw) : null;
+
       return {
         isDeliverable: true,
         deliveryCharges: Math.max(0, rate),
         estimatedDays: days,
         courierName: best.courier_name || best.airline_name || 'Courier',
-        courierCompanyId: best.courier_company_id,
+        courierCompanyId: companyId,
         codAvailable:
           best.cod === 1 ||
           best.cod === true ||
@@ -762,13 +771,61 @@ class ShiprocketService {
       if (!data) {
         return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
       }
+
+      const nested = data.response?.data && typeof data.response.data === 'object' ? data.response.data : {};
+      const awbCode =
+        data.awb_code ||
+        nested.awb_code ||
+        data.awb ||
+        nested.awb ||
+        null;
+      const trackingNumber =
+        data.tracking_number ||
+        nested.tracking_number ||
+        awbCode ||
+        null;
+      const courierName = data.courier_name || nested.courier_name || null;
+      const labelUrl = data.label_url || nested.label_url || null;
+
+      const awbAssignStatus = data.awb_assign_status != null ? Number(data.awb_assign_status) : null;
+      const statusCode = data.status_code != null ? Number(data.status_code) : null;
+
+      const hasAwb = Boolean(String(awbCode || trackingNumber || '').trim());
+      /** Shiprocket often returns HTTP 200 with awb_assign_status 0 and a wallet / rules message when no AWB is issued. */
+      const assignSucceeded = hasAwb || awbAssignStatus === 1;
+      const errMsg =
+        nested.awb_assign_error ||
+        data.awb_error ||
+        (typeof data.payload === 'string' ? data.payload : null) ||
+        data.message ||
+        'Shiprocket did not return an AWB. Recharge the Shiprocket wallet or check courier availability.';
+
+      if (!assignSucceeded) {
+        const walletish =
+          statusCode === 350 ||
+          /recharge|wallet|balance|insufficient/i.test(String(errMsg || ''));
+        return {
+          success: false,
+          code: walletish ? 'SHIPROCKET_WALLET_OR_BALANCE' : 'ASSIGN_AWB_NOT_COMPLETED',
+          message: errMsg,
+          details: data,
+          awbCode: null,
+          trackingNumber: null,
+          courier: null,
+          labelUrl: null,
+          providerStatus: 'assignment_failed',
+          raw: data,
+          mock: false
+        };
+      }
+
       return {
         success: true,
-        awbCode: data.awb_code || data.response?.data?.awb_code || null,
-        trackingNumber: data.awb_code || data.tracking_number || data.response?.data?.awb_code || null,
-        courier: data.courier_name || data.response?.data?.courier_name || null,
-        labelUrl: data.label_url || data.response?.data?.label_url || null,
-        providerStatus: data.awb_assign_status || data.status || 'assigned',
+        awbCode: awbCode || null,
+        trackingNumber: trackingNumber || null,
+        courier: courierName,
+        labelUrl,
+        providerStatus: 'assigned',
         raw: data,
         mock: false
       };
@@ -889,6 +946,51 @@ class ShiprocketService {
         details: err.response?.data || null
       };
     }
+  }
+
+  /**
+   * When we stored Shiprocket channel / order id but not shipment_id (e.g. order waiting for courier on SR),
+   * try GET /external/orders/show/{id} to read shipment_id for assign-AWB.
+   */
+  async fetchShipmentIdForForwardOrder({ shiprocketOrderId, channelOrderId }) {
+    if (!this.enabled) {
+      return { success: false, code: 'SHIPROCKET_DISABLED', message: 'Shiprocket is disabled' };
+    }
+    const rawIds = [shiprocketOrderId, channelOrderId]
+      .map((x) => (x != null ? String(x).trim() : ''))
+      .filter(Boolean);
+    const ids = [...new Set(rawIds)];
+    for (const id of ids) {
+      try {
+        const data = await this.requestWithAuth({
+          method: 'get',
+          url: `${this.baseURL}/external/orders/show/${encodeURIComponent(id)}`,
+          timeout: 20000
+        });
+        if (!data) continue;
+        const root = data && typeof data.data === 'object' && data.data ? data.data : data;
+        const sid =
+          root?.shipment_id ||
+          root?.shipmentId ||
+          (Array.isArray(root?.shipments) && root.shipments[0] && (root.shipments[0].id || root.shipments[0].shipment_id)) ||
+          null;
+        if (sid != null && String(sid).trim()) {
+          return { success: true, shipmentId: String(sid).trim(), raw: root };
+        }
+      } catch (err) {
+        logger.warn('[Shiprocket] fetchShipmentIdForForwardOrder show failed', {
+          id,
+          status: err.response?.status,
+          message: err?.message
+        });
+      }
+    }
+    return {
+      success: false,
+      code: 'SHIPMENT_ID_LOOKUP_FAILED',
+      message:
+        'Could not read shipment_id from Shiprocket. If the order is waiting for courier selection on Shiprocket, finish that there or retry after saving.'
+    };
   }
 
   /**
