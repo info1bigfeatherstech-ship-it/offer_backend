@@ -204,9 +204,9 @@ async function abortTransactionSafely(session) {
 
 function generateOrderIdCandidate() {
     if (typeof crypto.randomUUID === 'function') {
-        return `ORD-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
+        return `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
     }
-    return `ORD-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+    return `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
 
 function isOrderIdDuplicateError(error) {
@@ -467,6 +467,27 @@ async function ensureShipmentForOrder({ order, trigger }) {
     if (hasAwb) {
         return { success: true, alreadyExists: true };
     }
+
+    if (!order.shipmentInfo?.shipmentId && order.shipmentInfo?.shiprocketOrderId) {
+        const lookup = await ShiprocketService.fetchShipmentIdForForwardOrder({
+            shiprocketOrderId: order.shipmentInfo.shiprocketOrderId,
+            channelOrderId: order.orderId
+        });
+        if (lookup.success && lookup.shipmentId) {
+            await upsertShipmentInfo({
+                order,
+                shipmentPayload: {
+                    shipmentId: lookup.shipmentId,
+                    shiprocketOrderId: String(order.shipmentInfo.shiprocketOrderId)
+                },
+                trigger: `${trigger}_resolve_shipment_id`,
+                allowOrderStatusUpdate: false
+            });
+            order.shipmentInfo = { ...(order.shipmentInfo || {}), shipmentId: String(lookup.shipmentId) };
+            order.markModified('shipmentInfo');
+        }
+    }
+
     if (order.shipmentInfo?.shipmentId) {
         return { success: true, alreadyExists: true, pendingAwbAssignment: true };
     }
@@ -965,9 +986,13 @@ exports.createOrder = async (req, res) => {
             meta: {
                 estimatedDays: quote.shippingMeta?.estimatedDays || null,
                 courierName: quote.shippingMeta?.courierName || null,
+                courierCompanyId:
+                    quote.shippingMeta?.courierCompanyId != null &&
+                    Number.isFinite(Number(quote.shippingMeta.courierCompanyId))
+                        ? Number(quote.shippingMeta.courierCompanyId)
+                        : null,
                 isDeliverable: true,
-                codAvailable: quote.shippingMeta?.codAvailable !== false,
-                // mock: Boolean(quote.shippingMeta?.mock)
+                codAvailable: quote.shippingMeta?.codAvailable !== false
             }
         };
 
@@ -1026,6 +1051,14 @@ exports.createOrder = async (req, res) => {
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const pricedShip = priced.deliveryMeta || {};
+        const quoteShip = quote.shippingMeta || {};
+        const resolvedCourierCompanyId =
+            pricedShip.courierCompanyId != null && Number.isFinite(Number(pricedShip.courierCompanyId))
+                ? Number(pricedShip.courierCompanyId)
+                : quoteShip.courierCompanyId != null && Number.isFinite(Number(quoteShip.courierCompanyId))
+                  ? Number(quoteShip.courierCompanyId)
+                  : null;
         const quoteTotalsMismatch =
             roundMoney2(quote.itemsSubtotal) !== roundMoney2(subtotal) ||
             roundMoney2(quote.promotionDiscount) !== roundMoney2(discount) ||
@@ -1098,10 +1131,9 @@ exports.createOrder = async (req, res) => {
                 sessions: []
             },
             shippingSnapshot: {
-                courierName: quote.shippingMeta?.courierName || null,
-                estimatedDays: quote.shippingMeta?.estimatedDays || null,
-                courierCompanyId:
-                    quote.shippingMeta?.courierCompanyId != null ? Number(quote.shippingMeta.courierCompanyId) : null
+                courierName: pricedShip.courierName || quoteShip.courierName || null,
+                estimatedDays: pricedShip.estimatedDays ?? quoteShip.estimatedDays ?? null,
+                courierCompanyId: resolvedCourierCompanyId
             }
         };
 

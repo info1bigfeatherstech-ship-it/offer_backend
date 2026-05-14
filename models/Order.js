@@ -163,9 +163,9 @@ const orderSchema = new mongoose.Schema(
 orderSchema.pre('save', function() {
   if (!this.orderId) {
     if (typeof crypto.randomUUID === 'function') {
-      this.orderId = `ORD-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
+      this.orderId = `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
     } else {
-      this.orderId = `ORD-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+      this.orderId = `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
     }
   }
 });

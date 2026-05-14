@@ -110,6 +110,20 @@ router.post(
 );
 
 router.post(
+  '/admin/items/bulk-documents/tax-invoices-zip',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkTaxInvoicesZip
+);
+
+router.post(
+  '/admin/items/bulk-documents/shipping-labels-zip',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkShippingLabelsZip
+);
+
+router.post(
   '/admin/items/:orderId/fulfillment/ensure-shipment',
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
@@ -135,6 +149,13 @@ router.post(
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
   adminFulfillment.adminFulfillmentShippingLabel
+);
+
+router.get(
+  '/admin/items/:orderId/fulfillment/shipping-label-file',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentShippingLabelFile
 );
 
 router.post(
