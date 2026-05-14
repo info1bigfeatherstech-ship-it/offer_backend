@@ -4093,11 +4093,16 @@ const deleteProduct = async (req, res) => {
 
     const product = await Product.findOneAndUpdate(
       { slug, status: { $ne: "archived" } },
-      { 
-        $set: { 
+      {
+        $set: {
           status: "archived",
-          // archivedAt: new Date()
-        } 
+          // Storefront list filters primarily on per-channel lifecycle; without
+          // this, channelStatus can stay "active" and Redis-cached lists still
+          // match the product even though legacy status is archived.
+          "channelStatus.ecomm": "archived",
+          "channelStatus.wholesale": "archived",
+          archivedAt: new Date()
+        }
       },
       { new: true }
     );
@@ -4168,6 +4173,8 @@ const bulkDelete = async (req, res) => {
       {
         $set: {
           status: "archived",
+          "channelStatus.ecomm": "archived",
+          "channelStatus.wholesale": "archived",
           archivedAt: new Date()
         }
       }
@@ -4979,6 +4986,8 @@ const hardDeleteProduct = async (req, res) => {
 
     await Product.deleteOne({ _id: product._id });
 
+    await invalidateProductCaches(slug);
+
     return res.status(200).json({
       success: true,
       message: "Product permanently deleted"
@@ -5065,6 +5074,8 @@ const bulkHardDelete = async (req, res) => {
     const deleteResult = await Product.deleteMany({
       _id: { $in: productIds }
     });
+
+    await invalidateAllProductCaches();
 
     return res.status(200).json({
       success: true,

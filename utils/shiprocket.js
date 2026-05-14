@@ -267,28 +267,9 @@ class ShiprocketService {
   }
 
   /**
-   * Create Shiprocket forward shipment after payment (best-effort).
+   * Line items + package metrics for adhoc create and courier serviceability (shared).
    */
-  async createShipment(order) {
-    if (!this.enabled) {
-      return {
-        success: true,
-        mock: true,
-        trackingNumber: `MOCK-${order.orderId}`,
-        courier: 'Mock Courier'
-      };
-    }
-
-    const pickupLocationRaw = String(process.env.SHIPROCKET_PICKUP_LOCATION || process.env.PICKUP_LOCATION_NICKNAME || '').trim();
-    if (!pickupLocationRaw) {
-      return {
-        success: false,
-        error:
-          'Shiprocket pickup location is not configured. Set SHIPROCKET_PICKUP_LOCATION (pickup nickname from Shiprocket panel) and restart the server.'
-      };
-    }
-    const pickupLocation = pickupLocationRaw;
-
+  async buildAdhocPayloadParts(order) {
     const orderItems = [];
     for (const item of order.items || []) {
       let length = 10;
@@ -331,8 +312,6 @@ class ShiprocketService {
     }
 
     const addr = order.addressSnapshot || {};
-    const billingPhone = String(addr.phone || '').replace(/\D/g, '').slice(-10) || '9999999999';
-
     const totalWeight = orderItems.reduce((s, it) => s + (Number(it.weight) || 0.5) * (Number(it.units) || 1), 0);
     const maxL = Math.max(10, ...orderItems.map((i) => Number(i.length) || 0));
     const maxB = Math.max(10, ...orderItems.map((i) => Number(i.breadth) || 0));
@@ -343,6 +322,56 @@ class ShiprocketService {
     const splitAdv = String(order.paymentInfo?.splitMode || 'full').toLowerCase() === 'advance';
     const useCodAtDoor =
       payMethod === 'cod' || (payMethod === 'online' && balanceViaCod && splitAdv);
+    let codCollect = 0;
+    if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
+      codCollect = roundMoney2(order.balanceDueInr);
+    }
+    const codAmountForQuote =
+      useCodAtDoor && payMethod === 'cod' ? roundMoney2(Number(order.totalAmount) || 0) : useCodAtDoor ? codCollect : 0;
+
+    return {
+      orderItems,
+      addr,
+      totalWeight: Math.max(0.05, totalWeight),
+      maxL,
+      maxB,
+      maxH,
+      useCodAtDoor,
+      payMethod,
+      balanceViaCod,
+      splitAdv,
+      codCollect,
+      codAmountForQuote
+    };
+  }
+
+  /**
+   * Create Shiprocket forward shipment after payment (best-effort).
+   */
+  async createShipment(order) {
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        trackingNumber: `MOCK-${order.orderId}`,
+        courier: 'Mock Courier'
+      };
+    }
+
+    const pickupLocationRaw = String(process.env.SHIPROCKET_PICKUP_LOCATION || process.env.PICKUP_LOCATION_NICKNAME || '').trim();
+    if (!pickupLocationRaw) {
+      return {
+        success: false,
+        error:
+          'Shiprocket pickup location is not configured. Set SHIPROCKET_PICKUP_LOCATION (pickup nickname from Shiprocket panel) and restart the server.'
+      };
+    }
+    const pickupLocation = pickupLocationRaw;
+
+    const parts = await this.buildAdhocPayloadParts(order);
+    const { orderItems, addr, totalWeight, maxL, maxB, maxH, useCodAtDoor, payMethod, balanceViaCod, codCollect } =
+      parts;
+    const billingPhone = String(addr.phone || '').replace(/\D/g, '').slice(-10) || '9999999999';
 
     const payload = {
       order_id: order.orderId,
@@ -374,13 +403,12 @@ class ShiprocketService {
       length: maxL,
       breadth: maxB,
       height: maxH,
-      weight: Math.max(0.05, totalWeight)
+      weight: totalWeight
     };
 
     if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
-      const collect = roundMoney2(order.balanceDueInr);
-      if (collect > 0) {
-        payload.order_total = collect;
+      if (codCollect > 0) {
+        payload.order_total = codCollect;
       }
     }
 
@@ -397,6 +425,7 @@ class ShiprocketService {
       return {
         success: true,
         shipmentId: data.shipment_id,
+        shiprocketOrderId: data.order_id != null ? String(data.order_id) : null,
         awbCode: data.awb_code || data.tracking_number || null,
         trackingNumber: data.awb_code || data.tracking_number || null,
         courier: data.courier_name,
@@ -585,6 +614,317 @@ class ShiprocketService {
       return this.getTrackingByShipmentId(shipmentId);
     }
     return { success: false, code: 'TRACKING_REFERENCE_MISSING', message: 'awbCode or shipmentId is required' };
+  }
+
+  static formatAxiosError(err) {
+    const d = err?.response?.data;
+    if (d && typeof d === 'object') {
+      if (Array.isArray(d.errors) && d.errors.length) {
+        return String(d.errors[0]?.message || d.errors[0] || d.message || JSON.stringify(d)).slice(0, 800);
+      }
+      if (d.message) return String(d.message);
+      return JSON.stringify(d).slice(0, 800);
+    }
+    return err?.message ? String(err.message) : String(err);
+  }
+
+  parseNumericShipmentId(shipmentId) {
+    const n = Number(String(shipmentId ?? '').trim());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  /**
+   * Courier list for route (same serviceability API as checkout).
+   * @returns {{ success: boolean, couriers?: array, message?: string, mock?: boolean }}
+   */
+  async listCouriersForRoute(deliveryPincode, opts = {}) {
+    const pincode = String(deliveryPincode || '').replace(/\D/g, '').slice(0, 6);
+    const weight = Math.max(0.05, Number(opts.weightKg) || 0.5);
+    const length = Math.max(1, Number(opts.lengthCm) || 10);
+    const breadth = Math.max(1, Number(opts.widthCm) || 10);
+    const height = Math.max(1, Number(opts.heightCm) || 10);
+    const codAmount = Math.max(0, Number(opts.codAmount) || 0);
+
+    if (pincode.length !== 6) {
+      return { success: false, message: 'Valid 6-digit delivery pincode required' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        couriers: [
+          {
+            courier_company_id: 0,
+            courier_name: 'Mock Courier',
+            rate: 60,
+            estimated_delivery_days: 3,
+            cod: 1
+          }
+        ]
+      };
+    }
+
+    const pickup = String(process.env.STORE_PINCODE || process.env.PICKUP_PINCODE || '560001').replace(/\D/g, '').slice(0, 6);
+    try {
+      const data = await this.requestWithAuth({
+        method: 'get',
+        url: `${this.baseURL}/external/courier/serviceability`,
+        params: {
+          pickup_postcode: pickup,
+          delivery_postcode: pincode,
+          weight,
+          cod: codAmount > 0 ? 1 : 0,
+          cod_amount: codAmount > 0 ? codAmount : undefined,
+          length,
+          breadth,
+          height
+        },
+        timeout: 20000
+      });
+      if (!data) {
+        return { success: false, message: 'Shiprocket auth failed' };
+      }
+      const list = data?.data?.available_courier_companies || data?.data?.available_courier_list || [];
+      if (!Array.isArray(list) || list.length === 0) {
+        return { success: false, message: 'No courier available for this route' };
+      }
+      return { success: true, couriers: list };
+    } catch (err) {
+      logger.error('[Shiprocket] listCouriersForRoute failed:', err.response?.data || err.message);
+      return { success: false, message: ShiprocketService.formatAxiosError(err) };
+    }
+  }
+
+  /**
+   * Pick recommended courier_id: cheapest rate among COD-eligible (if COD) else all; tie-break by faster ETD.
+   */
+  pickRecommendedCourierId(couriers, { codRequired }) {
+    if (!Array.isArray(couriers) || couriers.length === 0) return null;
+    const needCod = Boolean(codRequired);
+    const filtered = needCod
+      ? couriers.filter(
+          (c) =>
+            c.cod === 1 ||
+            c.cod === true ||
+            c.is_cod_available === 1 ||
+            c.is_cod_available === true
+        )
+      : couriers;
+    const pool = filtered.length ? filtered : couriers;
+    const scored = pool.map((c) => {
+      const rate = Number(c.rate ?? c.freight_charge ?? Infinity);
+      const etd = Number(c.estimated_delivery_days ?? c.etd ?? c.etd_hours ?? 999);
+      return { c, rate: Number.isFinite(rate) ? rate : Infinity, etd: Number.isFinite(etd) ? etd : 999 };
+    });
+    scored.sort((a, b) => {
+      if (a.rate !== b.rate) return a.rate - b.rate;
+      return a.etd - b.etd;
+    });
+    const top = scored[0]?.c;
+    const cid = top?.courier_company_id;
+    return cid != null ? Number(cid) : null;
+  }
+
+  /**
+   * POST /external/courier/assign/awb — panel "Ship Now" equivalent.
+   * @see https://apidocs.shiprocket.in/
+   */
+  async assignAwb({ shipmentId, courierId = null }) {
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (!sid) {
+      return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid shipment_id is required' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        awbCode: `MOCK-AWB-${sid}`,
+        trackingNumber: `MOCK-AWB-${sid}`,
+        courier: 'Mock Courier',
+        labelUrl: null,
+        providerStatus: 'mock_assigned',
+        raw: { mock: true }
+      };
+    }
+    if (courierId == null || !Number.isFinite(Number(courierId))) {
+      return { success: false, code: 'COURIER_ID_REQUIRED', message: 'courier_id is required for assign AWB' };
+    }
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/courier/assign/awb`,
+        data: {
+          shipment_id: sid,
+          courier_id: Number(courierId)
+        },
+        timeout: 30000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      return {
+        success: true,
+        awbCode: data.awb_code || data.response?.data?.awb_code || null,
+        trackingNumber: data.awb_code || data.tracking_number || data.response?.data?.awb_code || null,
+        courier: data.courier_name || data.response?.data?.courier_name || null,
+        labelUrl: data.label_url || data.response?.data?.label_url || null,
+        providerStatus: data.awb_assign_status || data.status || 'assigned',
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      logger.error('[Shiprocket] assignAwb failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'ASSIGN_AWB_FAILED',
+        message: ShiprocketService.formatAxiosError(err),
+        details: err.response?.data || null
+      };
+    }
+  }
+
+  /**
+   * POST /external/courier/generate/pickup — scheduled pickup (date required).
+   * @see https://apidocs.shiprocket.in/
+   */
+  async schedulePickup({ shipmentId, pickupDate }) {
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (!sid) {
+      return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid shipment_id is required' };
+    }
+    const dateStr = String(pickupDate || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      return { success: false, code: 'INVALID_PICKUP_DATE', message: 'pickupDate must be YYYY-MM-DD' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        pickupDate: dateStr,
+        providerStatus: 'pickup_scheduled_mock',
+        raw: { mock: true }
+      };
+    }
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/courier/generate/pickup`,
+        data: {
+          shipment_id: sid,
+          pickup_date: [dateStr]
+        },
+        timeout: 30000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      return {
+        success: true,
+        pickupDate: dateStr,
+        providerStatus: data.pickup_status || data.status || 'pickup_scheduled',
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      logger.error('[Shiprocket] schedulePickup failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'PICKUP_SCHEDULE_FAILED',
+        message: ShiprocketService.formatAxiosError(err),
+        details: err.response?.data || null
+      };
+    }
+  }
+
+  /**
+   * POST /external/orders/print/invoice — shipping label / invoice PDF link.
+   */
+  async generateShippingLabel({ shipmentId }) {
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (!sid) {
+      return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid shipment_id is required' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        labelUrl: `https://example.invalid/mock-label-${sid}.pdf`,
+        raw: { mock: true }
+      };
+    }
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/orders/print/invoice`,
+        data: { ids: [sid] },
+        timeout: 45000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      let labelUrl = null;
+      if (Array.isArray(data)) {
+        labelUrl = data[0]?.invoice_url || data[0]?.label_url || data[0]?.url || null;
+      } else {
+        labelUrl =
+          data.invoice_url ||
+          data.label_url ||
+          data?.response?.invoice_url ||
+          data?.data?.[0]?.invoice_url ||
+          data?.data?.invoice_url ||
+          null;
+      }
+      return {
+        success: true,
+        labelUrl,
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      logger.error('[Shiprocket] generateShippingLabel failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'LABEL_GENERATE_FAILED',
+        message: ShiprocketService.formatAxiosError(err),
+        details: err.response?.data || null
+      };
+    }
+  }
+
+  /**
+   * POST /external/orders/cancel — cancel before dispatch (Shiprocket-side).
+   * @param {{ ids: (string|number)[] }} shiprocketIds — Shiprocket order ids (numeric) as returned by create/adhoc.
+   */
+  async cancelShiprocketOrders(shiprocketIds = []) {
+    const ids = (Array.isArray(shiprocketIds) ? shiprocketIds : [])
+      .map((x) => Number(String(x).trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (!ids.length) {
+      return { success: false, code: 'SHIPROCKET_IDS_REQUIRED', message: 'At least one Shiprocket order id is required' };
+    }
+    if (!this.enabled) {
+      return { success: true, mock: true, raw: { cancelled: ids } };
+    }
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/orders/cancel`,
+        data: { ids },
+        timeout: 30000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      return { success: true, raw: data, mock: false };
+    } catch (err) {
+      logger.error('[Shiprocket] cancelShiprocketOrders failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'SHIPROCKET_CANCEL_FAILED',
+        message: ShiprocketService.formatAxiosError(err),
+        details: err.response?.data || null
+      };
+    }
   }
 }
 

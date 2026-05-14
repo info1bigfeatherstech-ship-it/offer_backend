@@ -12,7 +12,19 @@
  * `server.js`. Entry script in package.json must remain `index.js`.
  */
 
-require('dotenv').config();
+const path = require('path');
+// Load `.env` beside this file (not `process.cwd()`), so variables like
+// SHIPROCKET_PICKUP_LOCATION are present when the app is started from another directory.
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+try {
+  const fs = require('fs');
+  const envLocal = path.join(__dirname, '.env.local');
+  if (fs.existsSync(envLocal)) {
+    require('dotenv').config({ path: envLocal, override: true });
+  }
+} catch (_) {
+  /* ignore optional .env.local */
+}
 
 // Sentry MUST be initialised right after env loading and before any other
 // module (express, mongoose, redis, http) is required, so OpenTelemetry can

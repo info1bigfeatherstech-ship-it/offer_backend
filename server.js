@@ -220,6 +220,21 @@ function validateStartupConfig() {
     warnings.push('OWNER_REVIEW_ALLOWED_ORIGINS not configured; owner review relies on default origins.');
   }
 
+  const shiprocketEnabled = String(process.env.SHIPROCKET_ENABLED || '').toLowerCase() === 'true';
+  if (shiprocketEnabled) {
+    const pickupNickname = String(
+      process.env.SHIPROCKET_PICKUP_LOCATION || process.env.PICKUP_LOCATION_NICKNAME || ''
+    ).trim();
+    if (!pickupNickname) {
+      warnings.push(
+        'SHIPROCKET_ENABLED=true but SHIPROCKET_PICKUP_LOCATION (or PICKUP_LOCATION_NICKNAME) is empty — forward shipment create will fail until you set the pickup address nickname from Shiprocket (Company → Pick Up Addresses) and restart the API.'
+      );
+    }
+    if (!String(process.env.SHIPROCKET_EMAIL || '').trim() || !String(process.env.SHIPROCKET_PASSWORD || '').trim()) {
+      warnings.push('SHIPROCKET_EMAIL or SHIPROCKET_PASSWORD missing; Shiprocket login will fail.');
+    }
+  }
+
   const resolvedDefaultProvider = defaultMediaProvider || (mediaMode === 'hybrid' ? 'r2' : 'cloudinary');
   const resolvedReturnProvider = returnMediaProvider || (mediaMode === 'hybrid' ? 'cloudinary' : resolvedDefaultProvider);
 
