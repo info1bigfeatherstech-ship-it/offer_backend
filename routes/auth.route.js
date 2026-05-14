@@ -30,7 +30,7 @@ const router = express.Router();
 // 1️⃣ REGISTER FLOW (One-time: name, email, phone, password)
 // =============================================
 
-// Step 1: Register with all details + send OTP on phone
+// Step 1: Register with all details + send OTP (channel from OTP_DELIVERY_MODE: email / sms / both)
 router.post(
     '/register',
     [

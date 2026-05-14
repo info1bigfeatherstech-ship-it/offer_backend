@@ -84,18 +84,25 @@ const orderSchema = new mongoose.Schema(
     // For shipment (future use)
     shipmentInfo: {
       shipmentId: String,
+      /** Shiprocket channel order id (numeric) — used for cancel API */
+      shiprocketOrderId: { type: String, default: null },
       awbCode: String,
       trackingNumber: String,
       courier: String,
+      assignedCourierId: { type: String, default: null },
       providerStatus: String,
       estimatedDelivery: String,
       labelUrl: String,
       shippedAt: Date,
       outForDeliveryAt: Date,
       deliveredAt: Date,
+      /** Scheduled pickup date YYYY-MM-DD (Shiprocket generate/pickup) */
+      pickupDate: { type: String, default: null },
+      pickupScheduledAt: Date,
       lastSyncAt: Date,
       lastSyncSource: String,
       lastError: String,
+      lastPickupError: { type: String, default: null },
       createAttemptCount: { type: Number, default: 0 },
       rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] }
     },
@@ -140,6 +147,13 @@ const orderSchema = new mongoose.Schema(
     appliedCoupon: {
         code: { type: String },
         discount: { type: Number, default: 0 }
+    },
+
+    /** Snapshot from checkout quote (Shiprocket serviceability) — quote courier at order time */
+    shippingSnapshot: {
+      courierName: { type: String, default: null },
+      estimatedDays: { type: String, default: null },
+      courierCompanyId: { type: Number, default: null }
     }
   },
   { timestamps: true }

@@ -242,8 +242,11 @@ function mapOrderRow(order) {
   const itemCount = Array.isArray(o.items) ? o.items.length : 0;
   const bucketKey = fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
   const financials = normalizeFinancialView(o);
-  
-        
+  const si = o.shipmentInfo || {};
+  const hasAwb = Boolean(si.awbCode || si.trackingNumber);
+  const hasShipmentId = Boolean(si.shipmentId);
+  const pickupScheduled = Boolean(si.pickupScheduledAt || si.pickupDate);
+
   return {
     orderId: o.orderId,
     orderIdDisplay: `#${String(o.orderId).replace(/^#/, '')}`,
@@ -259,7 +262,10 @@ function mapOrderRow(order) {
     paymentStatus: o.paymentStatus,
     paymentLabel: paymentLabelForUi(o.paymentStatus),
     balanceDueInr: financials.balanceDueInr,
-    amountPaidInr: financials.amountPaidInr
+    amountPaidInr: financials.amountPaidInr,
+    hasAwb,
+    hasShipmentId,
+    pickupScheduled
   };
 }
 

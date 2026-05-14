@@ -1,11 +1,13 @@
 /**
- * Expires unpaid online orders after the payment hold window and releases reserved inventory.
+ * Expires unpaid online orders after the payment hold window, releases reserved inventory,
+ * and merges order lines back into the user's cart (cart was cleared when the order was created).
  * Safe under multi-instance: each document is updated inside a transaction with a state check.
  */
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
 const { releaseReservedInventoryForOrder } = require('./orderInventory.service');
+const { mergeOrderLineItemsIntoUserCart } = require('./restoreCartFromOrder.service');
 
 function getPaymentHoldMs() {
   const mins = Math.min(24 * 60, Math.max(5, Number(process.env.PAYMENT_HOLD_MINUTES || 30)));
@@ -121,6 +123,7 @@ class PaymentHoldExpiryService {
           await order.save({ session });
 
           await releaseReservedInventoryForOrder(order, session);
+          await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session);
 
           await session.commitTransaction();
           session.endSession();
