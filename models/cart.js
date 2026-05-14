@@ -67,6 +67,7 @@ const cartSchema = new mongoose.Schema(
       deliveryCharges: { type: Number, default: 0 },
       estimatedDays: { type: String, default: null },
       courierName: { type: String, default: null },
+      courierCompanyId: { type: Number, default: null },
       weightKg: { type: Number, default: null },
       dims: {
         lengthCm: Number,

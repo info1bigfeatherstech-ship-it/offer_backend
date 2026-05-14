@@ -18,8 +18,10 @@ const {
     roundMoney2
 } = require('../services/checkoutComputation.service');
 const { releaseReservedInventoryForOrder } = require('../services/orderInventory.service');
+const { mergeOrderLineItemsIntoUserCart } = require('../services/restoreCartFromOrder.service');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
@@ -36,6 +38,7 @@ const {
     isOrderStaffRequest,
     buildRequestLogContext
 } = require('../utils/checkoutFlow');
+const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 
 const normalizeDecisionCode = (errorLike, fallback) =>
     String(errorLike?.code || fallback || 'ORDER_FLOW_ERROR').trim().toUpperCase();
@@ -201,9 +204,9 @@ async function abortTransactionSafely(session) {
 
 function generateOrderIdCandidate() {
     if (typeof crypto.randomUUID === 'function') {
-        return `ORD-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
+        return `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
     }
-    return `ORD-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+    return `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
 
 function isOrderIdDuplicateError(error) {
@@ -331,7 +334,16 @@ function mapExternalShipmentStatusToOrderStatus(rawStatus) {
     if (['shipment_created', 'order_created', 'created', 'new'].includes(status)) return null;
 
     // Avoid overly-broad "ship" substring matching (e.g. "shipment_created").
-    const shippedKeywords = ['shipped', 'picked up', 'pickup', 'manifest', 'awb assigned', 'in transit', 'transit', 'booked'];
+    const shippedKeywords = [
+        'shipped',
+        'picked up',
+        'manifest',
+        'awb assigned',
+        'awb_assigned',
+        'in transit',
+        'transit',
+        'booked'
+    ];
     const outForDeliveryKeywords = ['out for delivery', 'ofd'];
     const deliveredKeywords = ['deliver', 'completed'];
     const cancelledKeywords = ['cancel', 'undelivered', 'rto', 'return to origin', 'reverse'];
@@ -368,11 +380,23 @@ async function upsertShipmentInfo({
     if (shipmentPayload.shipmentId != null) {
         nextShipmentInfo.shipmentId = String(shipmentPayload.shipmentId);
     }
+    if (shipmentPayload.shiprocketOrderId != null) {
+        nextShipmentInfo.shiprocketOrderId = String(shipmentPayload.shiprocketOrderId);
+    }
+    if (shipmentPayload.assignedCourierId != null) {
+        nextShipmentInfo.assignedCourierId = String(shipmentPayload.assignedCourierId);
+    }
     if (shipmentPayload.courier) {
         nextShipmentInfo.courier = shipmentPayload.courier;
     }
     if (shipmentPayload.labelUrl) {
         nextShipmentInfo.labelUrl = shipmentPayload.labelUrl;
+    }
+    if (shipmentPayload.pickupDate) {
+        nextShipmentInfo.pickupDate = String(shipmentPayload.pickupDate);
+    }
+    if (shipmentPayload.pickupScheduledAt) {
+        nextShipmentInfo.pickupScheduledAt = new Date(shipmentPayload.pickupScheduledAt);
     }
     if (shipmentPayload.estimatedDelivery) {
         nextShipmentInfo.estimatedDelivery = shipmentPayload.estimatedDelivery;
@@ -429,22 +453,43 @@ async function markShipmentSyncFailure({ order, error, trigger }) {
 }
 
 async function ensureShipmentForOrder({ order, trigger }) {
-    if (!order) return { success: false, code: 'ORDER_REQUIRED' };
-    const paymentMethod = String(order.paymentInfo?.method || '').toLowerCase();
-    const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
-    const advancePaid =
-        balanceViaCod &&
-        order.paymentStatus === 'partially_paid' &&
-        Number(order.amountPaidInr || 0) > 0.01;
-    const canCreateShipment =
-        paymentMethod === 'cod' ||
-        order.paymentStatus === 'paid' ||
-        advancePaid;
-    if (!canCreateShipment) {
-        return { success: false, code: 'SHIPMENT_NOT_ELIGIBLE' };
+    if (!order) return { success: false, code: 'ORDER_REQUIRED', message: 'Order is required.' };
+    const paymentGate = evaluateOrderPaymentForShiprocketFulfillment(order);
+    if (!paymentGate.ok) {
+        return {
+            success: false,
+            code: paymentGate.code || 'SHIPMENT_PAYMENT_BLOCKED',
+            message: paymentGate.message || 'Payment requirements not met for shipment.',
+            details: paymentGate.details || null
+        };
     }
-    if (order.shipmentInfo?.trackingNumber) {
+    const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
+    if (hasAwb) {
         return { success: true, alreadyExists: true };
+    }
+
+    if (!order.shipmentInfo?.shipmentId && order.shipmentInfo?.shiprocketOrderId) {
+        const lookup = await ShiprocketService.fetchShipmentIdForForwardOrder({
+            shiprocketOrderId: order.shipmentInfo.shiprocketOrderId,
+            channelOrderId: order.orderId
+        });
+        if (lookup.success && lookup.shipmentId) {
+            await upsertShipmentInfo({
+                order,
+                shipmentPayload: {
+                    shipmentId: lookup.shipmentId,
+                    shiprocketOrderId: String(order.shipmentInfo.shiprocketOrderId)
+                },
+                trigger: `${trigger}_resolve_shipment_id`,
+                allowOrderStatusUpdate: false
+            });
+            order.shipmentInfo = { ...(order.shipmentInfo || {}), shipmentId: String(lookup.shipmentId) };
+            order.markModified('shipmentInfo');
+        }
+    }
+
+    if (order.shipmentInfo?.shipmentId) {
+        return { success: true, alreadyExists: true, pendingAwbAssignment: true };
     }
 
     const result = await ShiprocketService.createShipment(order);
@@ -482,8 +527,8 @@ async function ensureShipmentForOrder({ order, trigger }) {
             providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null)
         },
         trigger,
-        // Never advance order status to shipped unless we have a tracking reference.
-        allowOrderStatusUpdate: hasTrackingRef
+        // Advance orderStatus from carrier only when AWB exists (shipment_id alone = still "invoiced").
+        allowOrderStatusUpdate: Boolean(result?.awbCode || result?.trackingNumber)
     });
     return { success: true, shipment: result };
 }
@@ -941,9 +986,13 @@ exports.createOrder = async (req, res) => {
             meta: {
                 estimatedDays: quote.shippingMeta?.estimatedDays || null,
                 courierName: quote.shippingMeta?.courierName || null,
+                courierCompanyId:
+                    quote.shippingMeta?.courierCompanyId != null &&
+                    Number.isFinite(Number(quote.shippingMeta.courierCompanyId))
+                        ? Number(quote.shippingMeta.courierCompanyId)
+                        : null,
                 isDeliverable: true,
-                codAvailable: quote.shippingMeta?.codAvailable !== false,
-                // mock: Boolean(quote.shippingMeta?.mock)
+                codAvailable: quote.shippingMeta?.codAvailable !== false
             }
         };
 
@@ -1002,6 +1051,14 @@ exports.createOrder = async (req, res) => {
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const pricedShip = priced.deliveryMeta || {};
+        const quoteShip = quote.shippingMeta || {};
+        const resolvedCourierCompanyId =
+            pricedShip.courierCompanyId != null && Number.isFinite(Number(pricedShip.courierCompanyId))
+                ? Number(pricedShip.courierCompanyId)
+                : quoteShip.courierCompanyId != null && Number.isFinite(Number(quoteShip.courierCompanyId))
+                  ? Number(quoteShip.courierCompanyId)
+                  : null;
         const quoteTotalsMismatch =
             roundMoney2(quote.itemsSubtotal) !== roundMoney2(subtotal) ||
             roundMoney2(quote.promotionDiscount) !== roundMoney2(discount) ||
@@ -1072,6 +1129,11 @@ exports.createOrder = async (req, res) => {
                 fullOrderAmountPaise: Math.round(roundMoney2(totalAmount) * 100),
                 quoteId: String(quote._id),
                 sessions: []
+            },
+            shippingSnapshot: {
+                courierName: pricedShip.courierName || quoteShip.courierName || null,
+                estimatedDays: pricedShip.estimatedDays ?? quoteShip.estimatedDays ?? null,
+                courierCompanyId: resolvedCourierCompanyId
             }
         };
 
@@ -1940,6 +2002,165 @@ exports.initiatePendingOrderPayment = async (req, res) => {
     }
 };
 
+/**
+ * User dismissed Razorpay (or never completed) while still on checkout — void the pending
+ * unpaid online order, release reserved stock, and merge order lines back into the cart.
+ * Idempotent for orders already voided via this path or payment hold timeout (cart already restored).
+ */
+exports.abandonOnlineCheckout = async (req, res) => {
+    const { orderId } = req.params;
+    const userId = req.userId;
+
+    try {
+        const oid = orderId != null ? String(orderId).trim() : '';
+        if (!oid) {
+            return respondOrderError(res, 400, 'INVALID_ORDER_ID', 'Order id is required');
+        }
+
+        const existing = await Order.findOne({ orderId: oid, userId }).lean();
+        if (!existing) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        const priorReason = String(existing.paymentInfo?.cancellationReason || '');
+        if (String(existing.orderStatus || '').toLowerCase() === 'cancelled') {
+            if (
+                priorReason === 'checkout_gateway_dismissed' ||
+                priorReason === 'payment_timeout'
+            ) {
+                return res.json({
+                    success: true,
+                    alreadyProcessed: true,
+                    message: 'Order was already cancelled.'
+                });
+            }
+            return respondOrderError(
+                res,
+                409,
+                'ORDER_NOT_ELIGIBLE',
+                'This order cannot be returned to checkout. Use My orders if you need help.'
+            );
+        }
+
+        if (String(existing.orderStatus || '').toLowerCase() !== 'pending') {
+            return respondOrderError(
+                res,
+                409,
+                'ORDER_NOT_ELIGIBLE',
+                'Only a pending unpaid checkout can be returned to the cart.'
+            );
+        }
+
+        if (String(existing.paymentStatus || '').toLowerCase() !== 'pending') {
+            return respondOrderError(
+                res,
+                409,
+                'INVALID_PAYMENT_STATE',
+                'Payment is no longer pending. Check My orders.'
+            );
+        }
+
+        if (String(existing.paymentInfo?.method || '').toLowerCase() !== 'online') {
+            return respondOrderError(
+                res,
+                400,
+                'PAYMENT_NOT_ONLINE',
+                'This action applies only to online checkout orders.'
+            );
+        }
+
+        const paid = Number(existing.amountPaidInr || 0);
+        if (paid > 0.01) {
+            return respondOrderError(
+                res,
+                409,
+                'USE_PAY_BALANCE_ENDPOINT',
+                'A payment instalment is already recorded. Complete payment from My orders.'
+            );
+        }
+
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        try {
+            const order = await Order.findOne({
+                orderId: oid,
+                userId,
+                orderStatus: 'pending',
+                paymentStatus: 'pending',
+                'paymentInfo.method': 'online',
+                $or: [{ amountPaidInr: { $lte: 0.005 } }, { amountPaidInr: { $exists: false } }]
+            }).session(session);
+
+            if (!order) {
+                await session.abortTransaction();
+                session.endSession();
+
+                const again = await Order.findOne({ orderId: oid, userId }).lean();
+                if (again && String(again.orderStatus || '').toLowerCase() === 'cancelled') {
+                    const r = String(again.paymentInfo?.cancellationReason || '');
+                    if (r === 'checkout_gateway_dismissed' || r === 'payment_timeout') {
+                        return res.json({
+                            success: true,
+                            alreadyProcessed: true,
+                            message: 'Order was already cancelled.'
+                        });
+                    }
+                }
+
+                return respondOrderError(
+                    res,
+                    409,
+                    'CHECKOUT_STATE_CHANGED',
+                    'Checkout changed while processing. Refresh the page or open My orders.'
+                );
+            }
+
+            order.orderStatus = 'cancelled';
+            order.paymentStatus = 'failed';
+            order.paymentInfo = order.paymentInfo || {};
+            order.paymentInfo.status = 'abandoned';
+            order.paymentInfo.cancellationReason = 'checkout_gateway_dismissed';
+            order.paymentInfo.cancelledAt = new Date();
+            order.markModified('paymentInfo');
+            normalizeTerminalUnpaidFinancials(order);
+
+            await order.save({ session });
+            await releaseReservedInventoryForOrder(order, session);
+            await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session);
+
+            await session.commitTransaction();
+            session.endSession();
+
+            logger.info('abandonOnlineCheckout: voided pending order and restored cart', {
+                orderId: order.orderId,
+                userId: String(userId)
+            });
+
+            return res.json({
+                success: true,
+                alreadyProcessed: false,
+                orderId: order.orderId,
+                message: 'Returned to checkout. You can change payment options and place the order again.'
+            });
+        } catch (inner) {
+            await session.abortTransaction().catch(() => {});
+            session.endSession();
+            logger.error('abandonOnlineCheckout transaction failed', {
+                orderId: oid,
+                message: inner.message,
+                stack: inner.stack
+            });
+            return respondOrderError(res, 500, 'ABANDON_CHECKOUT_FAILED', 'Could not return to checkout. Try again or open My orders.', {
+                error: inner.message
+            });
+        }
+    } catch (error) {
+        logger.error('abandonOnlineCheckout', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'INTERNAL_ERROR', 'Could not return to checkout');
+    }
+};
+
 // ========== GET ORDER ==========
 // controllers/order.controller.js
 
@@ -2004,10 +2225,15 @@ exports.getOrder = async (req, res) => {
             transformedOrder.userId = transformedOrder.userId._id;
         }
 
-        return res.json({
+        const payload = {
             success: true,
             order: transformedOrder
-        });
+        };
+        if (isOrderStaff) {
+            payload.fulfillmentPaymentGate = evaluateOrderPaymentForShiprocketFulfillment(order);
+        }
+
+        return res.json(payload);
 
     } catch (error) {
         console.error('Get order error:', error);
@@ -2060,11 +2286,29 @@ exports.cancelOrder = async (req, res) => {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
-        const cancellableStatuses = ['pending', 'confirmed'];
+        const hasShiprocketAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
+        const hasScheduledPickup = Boolean(order.shipmentInfo?.pickupScheduledAt || order.shipmentInfo?.pickupDate);
+        const terminalOrderStatuses = new Set(['shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed']);
+        if (terminalOrderStatuses.has(String(order.orderStatus || '').toLowerCase())) {
+            await session.abortTransaction();
+            session.endSession();
+            return respondOrderError(res, 400, 'ORDER_CANCELLATION_NOT_ALLOWED', `Order cannot be cancelled in ${order.orderStatus} status`);
+        }
+        const cancellableStatuses = ['pending', 'confirmed', 'processing'];
         if (!cancellableStatuses.includes(order.orderStatus)) {
             await session.abortTransaction();
             session.endSession();
             return respondOrderError(res, 400, 'ORDER_CANCELLATION_NOT_ALLOWED', `Order cannot be cancelled in ${order.orderStatus} status`);
+        }
+        if (hasShiprocketAwb || hasScheduledPickup) {
+            await session.abortTransaction();
+            session.endSession();
+            return respondOrderError(
+                res,
+                400,
+                'ORDER_CANCELLATION_NOT_ALLOWED',
+                'Order cannot be cancelled after shipment AWB is assigned or pickup is scheduled. Contact support if needed.'
+            );
         }
 
         const wasPaid = order.paymentStatus === 'paid';
@@ -2257,7 +2501,8 @@ exports.generateInvoice = async (req, res) => {
 
         return res.json({
             success: true,
-            invoice: invoice
+            invoice: invoice,
+            gstInvoice: buildGstInvoiceViewModel(order)
         });
 
     } catch (error) {
@@ -2822,3 +3067,7 @@ exports.refundOrderPayment = async (req, res) => {
         );
     }
 };
+
+/** Used by admin fulfillment controller — keeps shipment sync logic single-sourced. */
+exports.applyUpsertShipmentInfo = upsertShipmentInfo;
+exports.ensureShipmentForOrderExport = ensureShipmentForOrder;
