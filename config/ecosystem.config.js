@@ -26,6 +26,12 @@ if (instancesFromEnv) {
 
 const execMode = resolvedInstances === 1 ? 'fork' : 'cluster';
 
+// PM2 `--env production` merges `env_production` over `env`; define both so the flag is valid.
+const prodEnv = {
+  NODE_ENV: 'production',
+  PORT: 4000
+};
+
 module.exports = {
   apps: [{
     name: 'ecommerce-api',
@@ -38,10 +44,8 @@ module.exports = {
     max_restarts: 10,
     min_uptime: '30s',
     max_memory_restart: '2G',
-    env: {
-      NODE_ENV: 'production',
-      PORT: 4000
-    },
+    env: { ...prodEnv },
+    env_production: { ...prodEnv },
     error_file: './logs/pm2-error.log',
     out_file: './logs/pm2-out.log',
     log_file: './logs/pm2-combined.log',
