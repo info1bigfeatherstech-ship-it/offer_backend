@@ -6,7 +6,7 @@
 
 const crypto = require('crypto');
 
-const PREFIX_WHOLESALE = 'OWB-WHOLE-';
+const PREFIX_WHOLESALE = 'OWB-WH-';
 const PREFIX_ECOMM = 'OWB-ECOMM-';
 
 function normalizeStorefront(value) {
