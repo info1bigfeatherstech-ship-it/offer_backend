@@ -96,6 +96,20 @@ router.post(
 );
 
 router.post(
+  '/admin/items/bulk-approval/confirm',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkApprovalConfirm
+);
+
+router.post(
+  '/admin/items/bulk-approval/cancel',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkApprovalCancel
+);
+
+router.post(
   '/admin/items/bulk-fulfillment/ship-now',
   verifyToken,
   authorizeRoles('admin', 'order_manager'),

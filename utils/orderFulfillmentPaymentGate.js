@@ -93,8 +93,8 @@ function evaluateOrderPaymentForShiprocketFulfillment(order) {
       code: 'ADVANCE_OR_FULL_PAYMENT_REQUIRED',
       message:
         minFirst != null
-          ? `Collect the agreed online instalment (at least ₹${minFirst}) before shipping.`
-          : 'Complete the required online payment before shipping.',
+          ? `Waiting for the customer to pay the agreed online instalment (at least ₹${minFirst}) before Shiprocket actions.`
+          : 'Waiting for the customer to complete the required online payment before Shiprocket actions.',
       details: {
         paymentStatus: status,
         amountPaidInr: paid,
@@ -106,7 +106,8 @@ function evaluateOrderPaymentForShiprocketFulfillment(order) {
   return {
     ok: false,
     code: 'PAYMENT_REQUIRED',
-    message: 'Complete payment before Shiprocket actions for this online order.',
+    message:
+      'Waiting for the customer to complete online payment before Shiprocket actions.',
     details: {
       paymentStatus: status,
       splitMode,
