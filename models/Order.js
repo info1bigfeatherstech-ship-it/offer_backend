@@ -156,6 +156,32 @@ const orderSchema = new mongoose.Schema(
       courierName: { type: String, default: null },
       estimatedDays: { type: String, default: null },
       courierCompanyId: { type: Number, default: null }
+    },
+
+    /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */
+    shippingWeightSnapshot: {
+      totalWeightKg: { type: Number, default: null },
+      dims: {
+        lengthCm: { type: Number, default: null },
+        widthCm: { type: Number, default: null },
+        heightCm: { type: Number, default: null }
+      },
+      lines: {
+        type: [
+          {
+            productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+            variantId: { type: mongoose.Schema.Types.ObjectId },
+            productName: { type: String, default: null },
+            sku: { type: String, default: null },
+            quantity: { type: Number, default: 0 },
+            unitWeightKg: { type: Number, default: null },
+            lineWeightKg: { type: Number, default: null }
+          }
+        ],
+        default: []
+      },
+      /** checkout | catalog_fallback (legacy display only) */
+      source: { type: String, default: 'checkout' }
     }
   },
   { timestamps: true }
