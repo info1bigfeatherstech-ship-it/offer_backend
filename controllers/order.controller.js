@@ -30,6 +30,7 @@ const {
     isAdvanceBalanceCodCheckout,
     assertStorePolicyAllowsCheckout
 } = require('../utils/checkoutPaymentPolicy');
+const { generateOrderId } = require('../utils/orderId');
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
@@ -220,13 +221,6 @@ async function abortTransactionSafely(session) {
     } catch (_) {
         // Swallow abort failures to preserve the original controller error.
     }
-}
-
-function generateOrderIdCandidate() {
-    if (typeof crypto.randomUUID === 'function') {
-        return `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
-    }
-    return `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
 
 function isOrderIdDuplicateError(error) {
@@ -1151,6 +1145,7 @@ exports.createOrder = async (req, res) => {
             address: addressId,
             addressSnapshot: address.toObject(),
             userType: finalUserType,
+            storefront,
             orderStatus:
                 isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
             paymentStatus: normalizedPaymentMethod === 'cod' ? 'pending' : 'pending',
@@ -1183,7 +1178,10 @@ exports.createOrder = async (req, res) => {
         let order = null;
         let orderSaved = false;
         for (let attempt = 0; attempt < 5; attempt++) {
-            const candidateOrderId = generateOrderIdCandidate();
+            const candidateOrderId = generateOrderId({
+                storefront,
+                userType: finalUserType
+            });
             order = new Order({
                 orderId: candidateOrderId,
                 ...orderPayload

@@ -1,6 +1,6 @@
 // models/Order.js
 const mongoose = require('mongoose');
-const crypto = require('crypto');
+const { generateOrderId } = require('../utils/orderId');
 
 const orderItemSchema = new mongoose.Schema(
   {
@@ -42,6 +42,9 @@ const orderSchema = new mongoose.Schema(
     addressSnapshot: { type: Object, required: true },
     
     userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
+
+    /** Checkout channel at order place (for ID prefix + admin scope) */
+    storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
     
     orderStatus: { 
       type: String, 
@@ -187,14 +190,13 @@ const orderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Generate order ID before saving
+// Generate order ID before saving (fallback if controller did not set orderId)
 orderSchema.pre('save', function() {
   if (!this.orderId) {
-    if (typeof crypto.randomUUID === 'function') {
-      this.orderId = `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
-    } else {
-      this.orderId = `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
-    }
+    this.orderId = generateOrderId({
+      storefront: this.storefront,
+      userType: this.userType
+    });
   }
 });
 
