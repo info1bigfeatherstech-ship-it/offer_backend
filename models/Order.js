@@ -142,7 +142,9 @@ const orderSchema = new mongoose.Schema(
       refundInitiatedAt: Date,
       refundAmount: Number,
       refundId: String,
-      status: String
+      status: String,
+      /** `cancellation` = order cancelled before delivery; `product_return` = post-delivery return flow */
+      refundContext: { type: String, enum: ['cancellation', 'product_return', null], default: null }
     },
     appliedCoupon: {
         code: { type: String },

@@ -39,6 +39,7 @@ const {
     buildRequestLogContext
 } = require('../utils/checkoutFlow');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
+const { isLegacyAutoFulfillOnCheckout } = require('../constants/orderFulfillmentAutomation');
 
 const normalizeDecisionCode = (errorLike, fallback) =>
     String(errorLike?.code || fallback || 'ORDER_FLOW_ERROR').trim().toUpperCase();
@@ -454,6 +455,19 @@ async function markShipmentSyncFailure({ order, error, trigger }) {
 
 async function ensureShipmentForOrder({ order, trigger }) {
     if (!order) return { success: false, code: 'ORDER_REQUIRED', message: 'Order is required.' };
+
+    if (!isLegacyAutoFulfillOnCheckout()) {
+        const st = String(order.orderStatus || '').toLowerCase();
+        if (st === 'pending') {
+            return {
+                success: false,
+                code: 'ORDER_AWAITING_ADMIN_CONFIRMATION',
+                message:
+                    'Shiprocket shipment cannot be created while the order is still pending admin confirmation. After the order is confirmed for fulfilment, retry from the admin panel.'
+            };
+        }
+    }
+
     const paymentGate = evaluateOrderPaymentForShiprocketFulfillment(order);
     if (!paymentGate.ok) {
         return {
@@ -1111,7 +1125,8 @@ exports.createOrder = async (req, res) => {
             address: addressId,
             addressSnapshot: address.toObject(),
             userType: finalUserType,
-            orderStatus: normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
+            orderStatus:
+                isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
             paymentStatus: normalizedPaymentMethod === 'cod' ? 'pending' : 'pending',
             amountPaidInr,
             balanceDueInr,
@@ -1273,7 +1288,7 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        if (normalizedPaymentMethod === 'cod') {
+        if (isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod') {
             ensureShipmentForOrder({
                 order,
                 trigger: 'cod_order_created'
@@ -1399,7 +1414,11 @@ exports.verifyPayment = async (req, res) => {
             return respondOrderError(res, 400, 'PAYMENT_ORDER_MISMATCH', 'Payment does not match this order');
         }
 
-        if (order.paymentStatus === 'paid' && order.orderStatus === 'confirmed') {
+        if (
+            isLegacyAutoFulfillOnCheckout() &&
+            order.paymentStatus === 'paid' &&
+            String(order.orderStatus || '').toLowerCase() === 'confirmed'
+        ) {
             return res.json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -1473,10 +1492,11 @@ exports.verifyPayment = async (req, res) => {
 
         if (order.balanceDueInr <= 0.005) {
             order.paymentStatus = 'paid';
-            order.orderStatus = 'confirmed';
             order.balanceDueInr = 0;
         } else {
             order.paymentStatus = 'partially_paid';
+        }
+        if (isLegacyAutoFulfillOnCheckout()) {
             order.orderStatus = 'confirmed';
         }
 
@@ -1501,6 +1521,7 @@ exports.verifyPayment = async (req, res) => {
         await order.save();
 
         const shouldEnqueueShipmentAfterVerify =
+            isLegacyAutoFulfillOnCheckout() &&
             !order.shipmentInfo?.trackingNumber &&
             (order.paymentStatus === 'paid' ||
                 (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
@@ -1606,10 +1627,11 @@ exports.razorpayWebhook = async (req, res) => {
                 order.balanceDueInr = roundMoney2(order.totalAmount - order.amountPaidInr);
                 if (order.balanceDueInr <= 0.005) {
                     order.paymentStatus = 'paid';
-                    order.orderStatus = 'confirmed';
                     order.balanceDueInr = 0;
                 } else {
                     order.paymentStatus = 'partially_paid';
+                }
+                if (isLegacyAutoFulfillOnCheckout()) {
                     order.orderStatus = 'confirmed';
                 }
                 order.paymentInfo.razorpayPaymentId = payment.id;
@@ -1629,6 +1651,7 @@ exports.razorpayWebhook = async (req, res) => {
                 await order.save();
 
                 const shouldEnqueueShipmentAfterWebhook =
+                    isLegacyAutoFulfillOnCheckout() &&
                     !order.shipmentInfo?.trackingNumber &&
                     (order.paymentStatus === 'paid' ||
                         (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
@@ -2324,6 +2347,7 @@ exports.cancelOrder = async (req, res) => {
         order.paymentInfo.cancelledAt = new Date();
         order.returnInfo = {
             ...(order.returnInfo || {}),
+            refundContext: 'cancellation',
             status: canInitiateRefund ? 'refund_pending' : (wasPaid ? 'refund_unavailable' : 'not_required'),
             requestedAt: new Date(),
             refundAmount: canInitiateRefund ? order.totalAmount : (order.returnInfo?.refundAmount || 0)
@@ -2350,6 +2374,7 @@ exports.cancelOrder = async (req, res) => {
                 order.paymentStatus = 'refunded';
                 order.returnInfo = {
                     ...(order.returnInfo || {}),
+                    refundContext: 'cancellation',
                     refundAmount: order.totalAmount,
                     refundId: refund.id,
                     status: 'refunded',
@@ -2359,6 +2384,7 @@ exports.cancelOrder = async (req, res) => {
             } catch (refundError) {
                 order.returnInfo = {
                     ...(order.returnInfo || {}),
+                    refundContext: 'cancellation',
                     status: 'refund_failed'
                 };
                 order.paymentInfo = {
@@ -2513,43 +2539,127 @@ exports.generateInvoice = async (req, res) => {
     }
 };
 
+function buildPaymentTimelineStep(order) {
+    const ps = String(order.paymentStatus || '').toLowerCase();
+    const method = String(order.paymentInfo?.method || '').toLowerCase();
+
+    if (ps === 'paid') {
+        return {
+            status: 'Payment Confirmed',
+            completed: true,
+            timestamp: order.paymentInfo?.paidAt || order.updatedAt
+        };
+    }
+    if (ps === 'partially_paid') {
+        return {
+            status: 'Advance paid (balance on delivery)',
+            completed: true,
+            timestamp: order.paymentInfo?.paidAt || order.updatedAt
+        };
+    }
+    if (method === 'cod') {
+        return {
+            status: 'Pay on delivery (COD)',
+            completed: false,
+            timestamp: null
+        };
+    }
+    if (ps === 'refunded' || ps === 'partially_refunded') {
+        return {
+            status: 'Payment refunded',
+            completed: true,
+            timestamp: order.updatedAt
+        };
+    }
+    if (ps === 'failed') {
+        return {
+            status: 'Payment failed',
+            completed: true,
+            timestamp: order.updatedAt
+        };
+    }
+    return { status: 'Payment Pending', completed: false, timestamp: null };
+}
+
 function buildDefaultOrderTimeline(order) {
+    const placed = { status: 'Order Placed', completed: true, timestamp: order.createdAt };
+    const payment = buildPaymentTimelineStep(order);
+
     const timeline = {
-        pending: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Pending', completed: false, timestamp: null }
-        ],
+        pending: [placed, { ...payment, completed: payment.completed }],
         confirmed: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-            { status: 'Processing', completed: false, timestamp: null }
+            placed,
+            payment,
+            { status: 'Confirmed — preparing shipment', completed: true, timestamp: order.updatedAt },
+            { status: 'Courier booking (Ship now)', completed: false, timestamp: null }
+        ],
+        processing: [
+            placed,
+            payment,
+            {
+                status: 'Processing — courier booked',
+                completed: true,
+                timestamp:
+                    order.shipmentInfo?.awbAssignedAt ||
+                    order.shipmentInfo?.shippedAt ||
+                    order.updatedAt
+            },
+            { status: 'Shipped', completed: false, timestamp: null }
         ],
         shipped: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
             { status: 'Out for Delivery', completed: false, timestamp: null }
         ],
         out_for_delivery: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
-            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            {
+                status: 'Out for Delivery',
+                completed: true,
+                timestamp: order.shipmentInfo?.outForDeliveryAt || null
+            },
             { status: 'Delivered', completed: false, timestamp: null }
         ],
         delivered: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
-            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            {
+                status: 'Out for Delivery',
+                completed: true,
+                timestamp: order.shipmentInfo?.outForDeliveryAt || null
+            },
             { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt || null }
         ],
+        return_requested: [
+            placed,
+            payment,
+            { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt || null },
+            {
+                status: 'Return requested',
+                completed: true,
+                timestamp: order.returnInfo?.requestedAt || order.updatedAt
+            }
+        ],
         cancelled: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Cancelled', completed: true, timestamp: order.updatedAt }
+            placed,
+            { status: 'Cancelled', completed: true, timestamp: order.paymentInfo?.cancelledAt || order.updatedAt }
+        ],
+        payment_failed: [
+            placed,
+            { status: 'Payment failed', completed: true, timestamp: order.updatedAt }
         ]
     };
-    return timeline[order.orderStatus] || timeline.pending;
+
+    const st = String(order.orderStatus || '').toLowerCase();
+    if (timeline[st]) return timeline[st];
+    if (['processing', 'shipped', 'out_for_delivery', 'delivered'].includes(st)) {
+        return timeline.confirmed;
+    }
+    return timeline.pending;
 }
 
 function buildLiveTimelineFromEvents(events, fallbackTimeline) {
@@ -2702,6 +2812,7 @@ exports.createReturnRequest = async (req, res) => {
 
         order.returnInfo = {
             ...(order.returnInfo || {}),
+            refundContext: 'product_return',
             reasonType,
             reasonMessage,
             proofs,
