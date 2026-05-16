@@ -23,6 +23,15 @@ const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service'
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
+    buildShippingWeightSnapshotFromCheckoutLines,
+    buildShippingWeightSnapshotFromOrderItems
+} = require('../utils/shippingWeightSnapshot');
+const {
+    isAdvanceBalanceCodCheckout,
+    assertStorePolicyAllowsCheckout
+} = require('../utils/checkoutPaymentPolicy');
+const { generateOrderId } = require('../utils/orderId');
+const {
     normalizePaymentMethod,
     normalizePaymentPlan,
     normalizeBalanceCollection,
@@ -39,6 +48,7 @@ const {
     buildRequestLogContext
 } = require('../utils/checkoutFlow');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
+const { isLegacyAutoFulfillOnCheckout } = require('../constants/orderFulfillmentAutomation');
 
 const normalizeDecisionCode = (errorLike, fallback) =>
     String(errorLike?.code || fallback || 'ORDER_FLOW_ERROR').trim().toUpperCase();
@@ -60,6 +70,17 @@ const RETURN_REQUEST_WINDOW_DAYS = (() => {
     }
     return Math.floor(parsed);
 })();
+
+/** Unpaid-online orders receive `paymentHoldExpiresAt` at creation; clears once Razorpay capture is persisted so APIs/UI cannot show a stale deadline. */
+function clearOnlinePaymentHoldAfterSuccessfulCapture(order) {
+    if (!order?.paymentHoldExpiresAt) return false;
+    if (String(order.paymentInfo?.method || '').trim().toLowerCase() !== 'online') return false;
+    order.paymentHoldExpiresAt = null;
+    if (typeof order.markModified === 'function') {
+        order.markModified('paymentHoldExpiresAt');
+    }
+    return true;
+}
 
 function normalizeReturnReasonType(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -200,13 +221,6 @@ async function abortTransactionSafely(session) {
     } catch (_) {
         // Swallow abort failures to preserve the original controller error.
     }
-}
-
-function generateOrderIdCandidate() {
-    if (typeof crypto.randomUUID === 'function') {
-        return `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
-    }
-    return `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
 
 function isOrderIdDuplicateError(error) {
@@ -454,6 +468,19 @@ async function markShipmentSyncFailure({ order, error, trigger }) {
 
 async function ensureShipmentForOrder({ order, trigger }) {
     if (!order) return { success: false, code: 'ORDER_REQUIRED', message: 'Order is required.' };
+
+    if (!isLegacyAutoFulfillOnCheckout()) {
+        const st = String(order.orderStatus || '').toLowerCase();
+        if (st === 'pending') {
+            return {
+                success: false,
+                code: 'ORDER_AWAITING_ADMIN_CONFIRMATION',
+                message:
+                    'Shiprocket shipment cannot be created while the order is still pending admin confirmation. After the order is confirmed for fulfilment, retry from the admin panel.'
+            };
+        }
+    }
+
     const paymentGate = evaluateOrderPaymentForShiprocketFulfillment(order);
     if (!paymentGate.ok) {
         return {
@@ -721,17 +748,6 @@ exports.createOrder = async (req, res) => {
         }
 
         const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
-        if (normalizedPaymentMethod === 'cod' && !checkoutPolicy.codEnabled) {
-            await abortTransactionSafely(session);
-            if (idempotency.enabled) {
-                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
-            }
-            return res.status(400).json({
-                success: false,
-                code: 'COD_DISABLED_BY_STORE',
-                message: 'Cash on delivery is not available at the moment.'
-            });
-        }
 
         let normalizedOnlinePaymentMode;
         let effectiveAdvancePercent;
@@ -743,6 +759,30 @@ exports.createOrder = async (req, res) => {
             });
             normalizedOnlinePaymentMode = sel.normalizedPaymentPlan;
             effectiveAdvancePercent = sel.effectiveAdvancePercent;
+        } catch (policyErr) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            if (policyErr?.statusCode) {
+                return sendCheckoutFlowError(
+                    res,
+                    policyErr,
+                    'Checkout validation failed',
+                    'ORDER_CHECKOUT_VALIDATION_FAILED'
+                );
+            }
+            throw policyErr;
+        }
+
+        try {
+            assertStorePolicyAllowsCheckout({
+                policy: checkoutPolicy,
+                paymentMethod: normalizedPaymentMethod,
+                paymentPlan:
+                    normalizedPaymentMethod === 'cod' ? 'full' : normalizedOnlinePaymentMode,
+                balanceCollection
+            });
         } catch (policyErr) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
@@ -941,22 +981,11 @@ exports.createOrder = async (req, res) => {
             });
         }
 
-        const isAdvanceBalanceCod =
-            normalizedPaymentMethod === 'online' &&
-            confirmedPaymentPlan === 'advance' &&
-            quoteBalanceLocked === 'cod';
-
-        if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
-            await abortTransactionSafely(session);
-            if (idempotency.enabled) {
-                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
-            }
-            return res.status(400).json({
-                success: false,
-                code: 'COD_DISABLED_BY_STORE',
-                message: 'Cash on delivery is not available for the remaining balance at the moment.'
-            });
-        }
+        const isAdvanceBalanceCod = isAdvanceBalanceCodCheckout({
+            paymentMethod: normalizedPaymentMethod,
+            paymentPlan: confirmedPaymentPlan,
+            balanceCollection: quoteBalanceLocked
+        });
 
         if (normalizedPaymentMethod === 'cod' && quote.shippingMeta?.codAvailable === false) {
             await abortTransactionSafely(session);
@@ -1051,6 +1080,11 @@ exports.createOrder = async (req, res) => {
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const shippingWeightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
+            lines: priced.lines,
+            totalWeightKg: priced.totalWeight,
+            dims: priced.dims
+        });
         const pricedShip = priced.deliveryMeta || {};
         const quoteShip = quote.shippingMeta || {};
         const resolvedCourierCompanyId =
@@ -1111,7 +1145,9 @@ exports.createOrder = async (req, res) => {
             address: addressId,
             addressSnapshot: address.toObject(),
             userType: finalUserType,
-            orderStatus: normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
+            storefront,
+            orderStatus:
+                isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
             paymentStatus: normalizedPaymentMethod === 'cod' ? 'pending' : 'pending',
             amountPaidInr,
             balanceDueInr,
@@ -1134,14 +1170,18 @@ exports.createOrder = async (req, res) => {
                 courierName: pricedShip.courierName || quoteShip.courierName || null,
                 estimatedDays: pricedShip.estimatedDays ?? quoteShip.estimatedDays ?? null,
                 courierCompanyId: resolvedCourierCompanyId
-            }
+            },
+            shippingWeightSnapshot
         };
 
         // 9. Create order with collision-safe orderId retries.
         let order = null;
         let orderSaved = false;
         for (let attempt = 0; attempt < 5; attempt++) {
-            const candidateOrderId = generateOrderIdCandidate();
+            const candidateOrderId = generateOrderId({
+                storefront,
+                userType: finalUserType
+            });
             order = new Order({
                 orderId: candidateOrderId,
                 ...orderPayload
@@ -1273,7 +1313,7 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        if (normalizedPaymentMethod === 'cod') {
+        if (isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod') {
             ensureShipmentForOrder({
                 order,
                 trigger: 'cod_order_created'
@@ -1379,6 +1419,9 @@ exports.verifyPayment = async (req, res) => {
         order.paymentInfo = order.paymentInfo || {};
         order.paymentInfo.capturedPaymentIds = order.paymentInfo.capturedPaymentIds || [];
         if (order.paymentInfo.capturedPaymentIds.includes(razorpay_payment_id)) {
+            if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+                await order.save();
+            }
             return res.json({
                 success: true,
                 message: 'Payment already verified',
@@ -1399,7 +1442,11 @@ exports.verifyPayment = async (req, res) => {
             return respondOrderError(res, 400, 'PAYMENT_ORDER_MISMATCH', 'Payment does not match this order');
         }
 
-        if (order.paymentStatus === 'paid' && order.orderStatus === 'confirmed') {
+        if (
+            isLegacyAutoFulfillOnCheckout() &&
+            order.paymentStatus === 'paid' &&
+            String(order.orderStatus || '').toLowerCase() === 'confirmed'
+        ) {
             return res.json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -1473,10 +1520,11 @@ exports.verifyPayment = async (req, res) => {
 
         if (order.balanceDueInr <= 0.005) {
             order.paymentStatus = 'paid';
-            order.orderStatus = 'confirmed';
             order.balanceDueInr = 0;
         } else {
             order.paymentStatus = 'partially_paid';
+        }
+        if (isLegacyAutoFulfillOnCheckout()) {
             order.orderStatus = 'confirmed';
         }
 
@@ -1497,10 +1545,13 @@ exports.verifyPayment = async (req, res) => {
 
         order.paymentInfo.capturedPaymentIds.push(razorpay_payment_id);
 
+        clearOnlinePaymentHoldAfterSuccessfulCapture(order);
+
         order.markModified('paymentInfo');
         await order.save();
 
         const shouldEnqueueShipmentAfterVerify =
+            isLegacyAutoFulfillOnCheckout() &&
             !order.shipmentInfo?.trackingNumber &&
             (order.paymentStatus === 'paid' ||
                 (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
@@ -1577,13 +1628,22 @@ exports.razorpayWebhook = async (req, res) => {
                         { 'paymentInfo.sessions.razorpayOrderId': payment.order_id }
                     ]
                 });
-                if (!order || order.paymentStatus === 'paid') {
+                if (!order) {
+                    break;
+                }
+                if (order.paymentStatus === 'paid') {
+                    if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+                        await order.save();
+                    }
                     break;
                 }
 
                 order.paymentInfo = order.paymentInfo || {};
                 order.paymentInfo.capturedPaymentIds = order.paymentInfo.capturedPaymentIds || [];
                 if (order.paymentInfo.capturedPaymentIds.includes(payment.id)) {
+                    if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+                        await order.save();
+                    }
                     break;
                 }
 
@@ -1606,10 +1666,11 @@ exports.razorpayWebhook = async (req, res) => {
                 order.balanceDueInr = roundMoney2(order.totalAmount - order.amountPaidInr);
                 if (order.balanceDueInr <= 0.005) {
                     order.paymentStatus = 'paid';
-                    order.orderStatus = 'confirmed';
                     order.balanceDueInr = 0;
                 } else {
                     order.paymentStatus = 'partially_paid';
+                }
+                if (isLegacyAutoFulfillOnCheckout()) {
                     order.orderStatus = 'confirmed';
                 }
                 order.paymentInfo.razorpayPaymentId = payment.id;
@@ -1625,10 +1686,13 @@ exports.razorpayWebhook = async (req, res) => {
                         s.paidAt = new Date();
                     }
                 }
+                clearOnlinePaymentHoldAfterSuccessfulCapture(order);
+
                 order.markModified('paymentInfo');
                 await order.save();
 
                 const shouldEnqueueShipmentAfterWebhook =
+                    isLegacyAutoFulfillOnCheckout() &&
                     !order.shipmentInfo?.trackingNumber &&
                     (order.paymentStatus === 'paid' ||
                         (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
@@ -2225,6 +2289,16 @@ exports.getOrder = async (req, res) => {
             transformedOrder.userId = transformedOrder.userId._id;
         }
 
+        if (isOrderStaff) {
+            const snap = transformedOrder.shippingWeightSnapshot;
+            if (!snap?.lines?.length && Array.isArray(order.items) && order.items.length) {
+                const fallback = await buildShippingWeightSnapshotFromOrderItems(order);
+                if (fallback) {
+                    transformedOrder.shippingWeightSnapshot = fallback;
+                }
+            }
+        }
+
         const payload = {
             success: true,
             order: transformedOrder
@@ -2324,6 +2398,7 @@ exports.cancelOrder = async (req, res) => {
         order.paymentInfo.cancelledAt = new Date();
         order.returnInfo = {
             ...(order.returnInfo || {}),
+            refundContext: 'cancellation',
             status: canInitiateRefund ? 'refund_pending' : (wasPaid ? 'refund_unavailable' : 'not_required'),
             requestedAt: new Date(),
             refundAmount: canInitiateRefund ? order.totalAmount : (order.returnInfo?.refundAmount || 0)
@@ -2350,6 +2425,7 @@ exports.cancelOrder = async (req, res) => {
                 order.paymentStatus = 'refunded';
                 order.returnInfo = {
                     ...(order.returnInfo || {}),
+                    refundContext: 'cancellation',
                     refundAmount: order.totalAmount,
                     refundId: refund.id,
                     status: 'refunded',
@@ -2359,6 +2435,7 @@ exports.cancelOrder = async (req, res) => {
             } catch (refundError) {
                 order.returnInfo = {
                     ...(order.returnInfo || {}),
+                    refundContext: 'cancellation',
                     status: 'refund_failed'
                 };
                 order.paymentInfo = {
@@ -2513,43 +2590,127 @@ exports.generateInvoice = async (req, res) => {
     }
 };
 
+function buildPaymentTimelineStep(order) {
+    const ps = String(order.paymentStatus || '').toLowerCase();
+    const method = String(order.paymentInfo?.method || '').toLowerCase();
+
+    if (ps === 'paid') {
+        return {
+            status: 'Payment Confirmed',
+            completed: true,
+            timestamp: order.paymentInfo?.paidAt || order.updatedAt
+        };
+    }
+    if (ps === 'partially_paid') {
+        return {
+            status: 'Advance paid (balance on delivery)',
+            completed: true,
+            timestamp: order.paymentInfo?.paidAt || order.updatedAt
+        };
+    }
+    if (method === 'cod') {
+        return {
+            status: 'Pay on delivery (COD)',
+            completed: false,
+            timestamp: null
+        };
+    }
+    if (ps === 'refunded' || ps === 'partially_refunded') {
+        return {
+            status: 'Payment refunded',
+            completed: true,
+            timestamp: order.updatedAt
+        };
+    }
+    if (ps === 'failed') {
+        return {
+            status: 'Payment failed',
+            completed: true,
+            timestamp: order.updatedAt
+        };
+    }
+    return { status: 'Payment Pending', completed: false, timestamp: null };
+}
+
 function buildDefaultOrderTimeline(order) {
+    const placed = { status: 'Order Placed', completed: true, timestamp: order.createdAt };
+    const payment = buildPaymentTimelineStep(order);
+
     const timeline = {
-        pending: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Pending', completed: false, timestamp: null }
-        ],
+        pending: [placed, { ...payment, completed: payment.completed }],
         confirmed: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
-            { status: 'Processing', completed: false, timestamp: null }
+            placed,
+            payment,
+            { status: 'Confirmed — preparing shipment', completed: true, timestamp: order.updatedAt },
+            { status: 'Courier booking (Ship now)', completed: false, timestamp: null }
+        ],
+        processing: [
+            placed,
+            payment,
+            {
+                status: 'Processing — courier booked',
+                completed: true,
+                timestamp:
+                    order.shipmentInfo?.awbAssignedAt ||
+                    order.shipmentInfo?.shippedAt ||
+                    order.updatedAt
+            },
+            { status: 'Shipped', completed: false, timestamp: null }
         ],
         shipped: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
             { status: 'Out for Delivery', completed: false, timestamp: null }
         ],
         out_for_delivery: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
-            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            {
+                status: 'Out for Delivery',
+                completed: true,
+                timestamp: order.shipmentInfo?.outForDeliveryAt || null
+            },
             { status: 'Delivered', completed: false, timestamp: null }
         ],
         delivered: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Payment Confirmed', completed: true, timestamp: order.paymentInfo?.paidAt || order.updatedAt },
+            placed,
+            payment,
             { status: 'Shipped', completed: true, timestamp: order.shipmentInfo?.shippedAt || null },
-            { status: 'Out for Delivery', completed: true, timestamp: order.shipmentInfo?.outForDeliveryAt || null },
+            {
+                status: 'Out for Delivery',
+                completed: true,
+                timestamp: order.shipmentInfo?.outForDeliveryAt || null
+            },
             { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt || null }
         ],
+        return_requested: [
+            placed,
+            payment,
+            { status: 'Delivered', completed: true, timestamp: order.shipmentInfo?.deliveredAt || null },
+            {
+                status: 'Return requested',
+                completed: true,
+                timestamp: order.returnInfo?.requestedAt || order.updatedAt
+            }
+        ],
         cancelled: [
-            { status: 'Order Placed', completed: true, timestamp: order.createdAt },
-            { status: 'Cancelled', completed: true, timestamp: order.updatedAt }
+            placed,
+            { status: 'Cancelled', completed: true, timestamp: order.paymentInfo?.cancelledAt || order.updatedAt }
+        ],
+        payment_failed: [
+            placed,
+            { status: 'Payment failed', completed: true, timestamp: order.updatedAt }
         ]
     };
-    return timeline[order.orderStatus] || timeline.pending;
+
+    const st = String(order.orderStatus || '').toLowerCase();
+    if (timeline[st]) return timeline[st];
+    if (['processing', 'shipped', 'out_for_delivery', 'delivered'].includes(st)) {
+        return timeline.confirmed;
+    }
+    return timeline.pending;
 }
 
 function buildLiveTimelineFromEvents(events, fallbackTimeline) {
@@ -2702,6 +2863,7 @@ exports.createReturnRequest = async (req, res) => {
 
         order.returnInfo = {
             ...(order.returnInfo || {}),
+            refundContext: 'product_return',
             reasonType,
             reasonMessage,
             proofs,

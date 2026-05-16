@@ -21,6 +21,12 @@ const {
   buildRequestLogContext
 } = require('../utils/checkoutFlow');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const {
+  isAdvanceBalanceCodCheckout,
+  assertStorePolicyAllowsCheckout,
+  validateCarrierCodForCheckout,
+  buildClientCodAvailability
+} = require('../utils/checkoutPaymentPolicy');
 const logger = require('../utils/logger');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -174,35 +180,33 @@ exports.quoteCheckout = async (req, res) => {
 
     const normalizedBalanceCollection = normalizeBalanceCollection(balanceCollection);
 
-    let hintedMethod = null;
+    let hintedMethod = 'online';
     if (paymentMethodHint !== undefined && paymentMethodHint !== null && String(paymentMethodHint).trim() !== '') {
       hintedMethod = normalizePaymentMethod(paymentMethodHint);
       if (!hintedMethod) {
         throw createInvalidPaymentMethodError();
       }
-      if (hintedMethod === 'cod' && !checkoutPolicy.codEnabled) {
-        return respondCheckoutInputError(
-          res,
-          400,
-          'COD_DISABLED_BY_STORE',
-          'Cash on delivery is not available at the moment.'
-        );
+    }
+
+    try {
+      assertStorePolicyAllowsCheckout({
+        policy: checkoutPolicy,
+        paymentMethod: hintedMethod === 'cod' ? 'cod' : 'online',
+        paymentPlan: normalizedQuotePlan,
+        balanceCollection: normalizedBalanceCollection
+      });
+    } catch (policyErr) {
+      if (policyErr?.statusCode && policyErr?.code) {
+        return sendCheckoutFlowError(res, policyErr, policyErr.message, policyErr.code);
       }
+      throw policyErr;
     }
 
-    const isAdvanceBalanceCod =
-      hintedMethod === 'online' &&
-      normalizedQuotePlan === 'advance' &&
-      normalizedBalanceCollection === 'cod';
-
-    if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
-      return respondCheckoutInputError(
-        res,
-        400,
-        'COD_DISABLED_BY_STORE',
-        'Cash on delivery is not available for the remaining balance at the moment.'
-      );
-    }
+    const isAdvanceBalanceCod = isAdvanceBalanceCodCheckout({
+      paymentMethod: hintedMethod === 'cod' ? 'cod' : 'online',
+      paymentPlan: normalizedQuotePlan,
+      balanceCollection: normalizedBalanceCollection
+    });
 
     let shiprocketPricingMode = 'online';
     if (hintedMethod === 'cod') {
@@ -342,7 +346,10 @@ exports.quoteCheckout = async (req, res) => {
       success: true,
       quoteId: quote._id,
       isDeliverable: true,
-      codAvailable: quote.shippingMeta.codAvailable && checkoutPolicy.codEnabled,
+      ...buildClientCodAvailability({
+        policy: checkoutPolicy,
+        carrierCodAvailable: quote.shippingMeta.codAvailable
+      }),
       checkoutPolicy,
       deliveryEstimate: eta,
       courierName: finalTotals.deliveryMeta?.courierName || null,
@@ -405,15 +412,6 @@ exports.confirmCheckout = async (req, res) => {
 
     const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
 
-    if (normalizedPaymentMethod === 'cod' && !checkoutPolicy.codEnabled) {
-      return respondCheckoutInputError(
-        res,
-        400,
-        'COD_DISABLED_BY_STORE',
-        'Cash on delivery is not available at the moment.'
-      );
-    }
-
     let normalizedPaymentPlan;
     let effectiveAdvancePercent;
     try {
@@ -441,18 +439,24 @@ exports.confirmCheckout = async (req, res) => {
       );
     }
 
-    const isAdvanceBalanceCod =
-      normalizedPaymentMethod === 'online' &&
-      normalizedPaymentPlan === 'advance' &&
-      normalizedBalanceCollection === 'cod';
+    const isAdvanceBalanceCod = isAdvanceBalanceCodCheckout({
+      paymentMethod: normalizedPaymentMethod,
+      paymentPlan: normalizedPaymentPlan,
+      balanceCollection: normalizedBalanceCollection
+    });
 
-    if (isAdvanceBalanceCod && !checkoutPolicy.codEnabled) {
-      return respondCheckoutInputError(
-        res,
-        400,
-        'COD_DISABLED_BY_STORE',
-        'Cash on delivery is not available for the remaining balance at the moment.'
-      );
+    try {
+      assertStorePolicyAllowsCheckout({
+        policy: checkoutPolicy,
+        paymentMethod: normalizedPaymentMethod,
+        paymentPlan: normalizedPaymentPlan,
+        balanceCollection: normalizedBalanceCollection
+      });
+    } catch (policyErr) {
+      if (policyErr?.statusCode && policyErr?.code) {
+        return sendCheckoutFlowError(res, policyErr, policyErr.message, policyErr.code);
+      }
+      throw policyErr;
     }
 
     const quote = await CheckoutQuote.findOne({ _id: quoteId, userId, status: 'active' });
@@ -509,16 +513,17 @@ exports.confirmCheckout = async (req, res) => {
       advancePercentForBalanceCod: isAdvanceBalanceCod ? effectiveAdvancePercent : null
     });
 
-    if (
-      (normalizedPaymentMethod === 'cod' || isAdvanceBalanceCod) &&
-      (!checkoutPolicy.codEnabled || recomputed.deliveryMeta?.codAvailable === false)
-    ) {
-      return res.status(400).json({
+    const carrierCodCheck = validateCarrierCodForCheckout({
+      carrierCodAvailable: recomputed.deliveryMeta?.codAvailable,
+      paymentMethod: normalizedPaymentMethod,
+      paymentPlan: normalizedPaymentPlan,
+      balanceCollection: normalizedBalanceCollection
+    });
+    if (!carrierCodCheck.ok) {
+      return res.status(carrierCodCheck.statusCode).json({
         success: false,
-        code: !checkoutPolicy.codEnabled ? 'COD_DISABLED_BY_STORE' : 'COD_NOT_AVAILABLE',
-        message: !checkoutPolicy.codEnabled
-          ? 'Cash on delivery is not available at the moment.'
-          : 'COD is not available for this pincode and cart combination.'
+        code: carrierCodCheck.code,
+        message: carrierCodCheck.message
       });
     }
 
@@ -571,7 +576,10 @@ exports.confirmCheckout = async (req, res) => {
       paymentMethod: normalizedPaymentMethod,
       paymentPlan: normalizedPaymentPlan,
       checkoutPolicy,
-      codAvailable: recomputed.deliveryMeta?.codAvailable !== false && checkoutPolicy.codEnabled,
+      ...buildClientCodAvailability({
+        policy: checkoutPolicy,
+        carrierCodAvailable: recomputed.deliveryMeta?.codAvailable
+      }),
       totals: {
         itemCount: cartDoc.items.length,
         itemsSubtotal: recomputed.subtotal,

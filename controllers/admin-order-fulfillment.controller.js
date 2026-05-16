@@ -15,6 +15,10 @@ const {
   evaluateOrderPaymentForShiprocketFulfillment,
   fulfillmentPaymentBlockHttpStatus
 } = require('../utils/orderFulfillmentPaymentGate');
+const {
+  runAdminApproveOrderSingle,
+  runAdminCancelOrderSingle
+} = require('../services/adminOrderApproval.service');
 
 function jsonError(res, status, code, message, extras = {}) {
   return res.status(status).json({ success: false, code, message, ...extras });
@@ -30,7 +34,7 @@ async function loadStaffOrder(req, res, orderId) {
     jsonError(res, 400, 'ORDER_ID_REQUIRED', 'orderId is required');
     return null;
   }
-  const order = await Order.findOne({ orderId: id }).populate('items.productId', 'name slug shipping');
+  const order = await Order.findOne({ orderId: id }).populate('items.productId', 'name slug shipping variants');
   if (!order) {
     jsonError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
     return null;
@@ -65,7 +69,7 @@ function pickupDateNotInPast(pickupDateYmd) {
 
 const MAX_BULK_ORDER_IDS = 50;
 const DEFAULT_BULK_CONCURRENCY = 4;
-const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping' };
+const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping variants' };
 
 async function loadOrderDocByOrderId(orderId) {
   const id = String(orderId || '').trim();
@@ -233,39 +237,34 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       return { success: false, code: 'INVALID_DELIVERY_PINCODE', message: 'Order address must include a 6-digit delivery pincode.' };
     }
 
+    // Ship Now uses checkout-quoted courier (shippingSnapshot) unless staff passes courierId.
     let courierId = courierIdOverride != null ? Number(courierIdOverride) : null;
     if (courierId != null && !Number.isFinite(courierId)) {
       return { success: false, code: 'INVALID_COURIER_ID', message: 'courierId must be a number when provided.' };
     }
 
-    if (courierId == null && order.shippingSnapshot?.courierCompanyId != null) {
-      const q = Number(order.shippingSnapshot.courierCompanyId);
-      if (Number.isFinite(q) && q > 0) {
-        courierId = q;
-      }
-    }
+    const quotedCourierId =
+      order.shippingSnapshot?.courierCompanyId != null &&
+      Number.isFinite(Number(order.shippingSnapshot.courierCompanyId)) &&
+      Number(order.shippingSnapshot.courierCompanyId) > 0
+        ? Number(order.shippingSnapshot.courierCompanyId)
+        : null;
+    const quotedCourierName = String(order.shippingSnapshot?.courierName || '').trim() || null;
 
     if (courierId == null) {
-      const listRes = await ShiprocketService.listCouriersForRoute(deliveryPin, {
-        weightKg: parts.totalWeight,
-        lengthCm: parts.maxL,
-        widthCm: parts.maxB,
-        heightCm: parts.maxH,
-        codAmount: parts.codAmountForQuote
-      });
-      if (!listRes.success) {
+      if (quotedCourierId != null) {
+        courierId = quotedCourierId;
+      } else if (!ShiprocketService.enabled) {
+        // Mock/dev tariff — no Shiprocket company id on snapshot.
+        courierId = 1;
+      } else {
         return {
           success: false,
-          code: 'COURIER_LIST_FAILED',
-          message: listRes.message || 'Could not list couriers',
-          details: listRes
+          code: 'QUOTED_COURIER_ID_MISSING',
+          message:
+            'This order has no checkout courier id (shippingSnapshot.courierCompanyId). ' +
+            'Ship Now only assigns the courier the customer paid shipping for — fix the order snapshot or re-checkout.'
         };
-      }
-      courierId = ShiprocketService.pickRecommendedCourierId(listRes.couriers || [], {
-        codRequired: parts.useCodAtDoor
-      });
-      if (courierId == null) {
-        return { success: false, code: 'NO_COURIER_SELECTED', message: 'No suitable courier_id could be selected.' };
       }
     }
 
@@ -308,6 +307,7 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       order,
       shipmentPayload: {
         ...assign,
+        courier: assign.courier || quotedCourierName,
         assignedCourierId: String(courierId),
         shiprocketOrderId: order.shipmentInfo?.shiprocketOrderId || undefined
       },
@@ -1129,5 +1129,73 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
   } catch (error) {
     logger.error('adminReturnReversePickupRetry', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'RETURN_RETRY_FAILED', error.message || 'Server error');
+  }
+};
+
+/** POST /orders/admin/items/bulk-approval/confirm  body: { orderIds: string[], concurrency?: number } */
+exports.adminBulkApprovalConfirm = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runAdminApproveOrderSingle(oid));
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const skipped = succeeded.filter((r) => r.skipped);
+    const shipmentDeferred = succeeded.filter((r) => r.code === 'CONFIRMED_SHIPMENT_DEFERRED');
+
+    return res.json({
+      success: true,
+      summary: {
+        total: results.length,
+        succeeded: succeeded.length,
+        failed: failed.length,
+        skipped: skipped.length,
+        completed: succeeded.filter((r) => !r.skipped).length,
+        shipmentDeferred: shipmentDeferred.length
+      },
+      results
+    });
+  } catch (error) {
+    logger.error('adminBulkApprovalConfirm', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_CONFIRM_FAILED', error.message || 'Server error');
+  }
+};
+
+/** POST /orders/admin/items/bulk-approval/cancel  body: { orderIds: string[], concurrency?: number } */
+exports.adminBulkApprovalCancel = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runAdminCancelOrderSingle(oid));
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const skipped = succeeded.filter((r) => r.skipped);
+
+    return res.json({
+      success: true,
+      summary: {
+        total: results.length,
+        succeeded: succeeded.length,
+        failed: failed.length,
+        skipped: skipped.length,
+        completed: succeeded.filter((r) => !r.skipped).length
+      },
+      results
+    });
+  } catch (error) {
+    logger.error('adminBulkApprovalCancel', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_CANCEL_FAILED', error.message || 'Server error');
   }
 };

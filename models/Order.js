@@ -1,6 +1,6 @@
 // models/Order.js
 const mongoose = require('mongoose');
-const crypto = require('crypto');
+const { generateOrderId } = require('../utils/orderId');
 
 const orderItemSchema = new mongoose.Schema(
   {
@@ -42,6 +42,9 @@ const orderSchema = new mongoose.Schema(
     addressSnapshot: { type: Object, required: true },
     
     userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
+
+    /** Checkout channel at order place (for ID prefix + admin scope) */
+    storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
     
     orderStatus: { 
       type: String, 
@@ -142,7 +145,9 @@ const orderSchema = new mongoose.Schema(
       refundInitiatedAt: Date,
       refundAmount: Number,
       refundId: String,
-      status: String
+      status: String,
+      /** `cancellation` = order cancelled before delivery; `product_return` = post-delivery return flow */
+      refundContext: { type: String, enum: ['cancellation', 'product_return', null], default: null }
     },
     appliedCoupon: {
         code: { type: String },
@@ -154,19 +159,44 @@ const orderSchema = new mongoose.Schema(
       courierName: { type: String, default: null },
       estimatedDays: { type: String, default: null },
       courierCompanyId: { type: Number, default: null }
+    },
+
+    /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */
+    shippingWeightSnapshot: {
+      totalWeightKg: { type: Number, default: null },
+      dims: {
+        lengthCm: { type: Number, default: null },
+        widthCm: { type: Number, default: null },
+        heightCm: { type: Number, default: null }
+      },
+      lines: {
+        type: [
+          {
+            productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+            variantId: { type: mongoose.Schema.Types.ObjectId },
+            productName: { type: String, default: null },
+            sku: { type: String, default: null },
+            quantity: { type: Number, default: 0 },
+            unitWeightKg: { type: Number, default: null },
+            lineWeightKg: { type: Number, default: null }
+          }
+        ],
+        default: []
+      },
+      /** checkout | catalog_fallback (legacy display only) */
+      source: { type: String, default: 'checkout' }
     }
   },
   { timestamps: true }
 );
 
-// Generate order ID before saving
+// Generate order ID before saving (fallback if controller did not set orderId)
 orderSchema.pre('save', function() {
   if (!this.orderId) {
-    if (typeof crypto.randomUUID === 'function') {
-      this.orderId = `OWB-ECOMM-${crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
-    } else {
-      this.orderId = `OWB-ECOMM-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
-    }
+    this.orderId = generateOrderId({
+      storefront: this.storefront,
+      userType: this.userType
+    });
   }
 });
 

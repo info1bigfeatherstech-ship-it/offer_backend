@@ -279,6 +279,9 @@ class ShiprocketService {
    * Line items + package metrics for adhoc create and courier serviceability (shared).
    */
   async buildAdhocPayloadParts(order) {
+    const { resolveShiprocketPackageMetrics } = require('./shippingWeightSnapshot');
+    const snapMetrics = await resolveShiprocketPackageMetrics(order);
+
     const orderItems = [];
     for (const item of order.items || []) {
       let length = 10;
@@ -304,6 +307,10 @@ class ShiprocketService {
         }
       }
 
+      if (snapMetrics?.lineWeightByVariantId?.has(String(item.variantId))) {
+        weight = snapMetrics.lineWeightByVariantId.get(String(item.variantId));
+      }
+
       const unit = Number(item.priceSnapshot?.sale ?? item.priceSnapshot?.base ?? 0);
       orderItems.push({
         name,
@@ -321,10 +328,18 @@ class ShiprocketService {
     }
 
     const addr = order.addressSnapshot || {};
-    const totalWeight = orderItems.reduce((s, it) => s + (Number(it.weight) || 0.5) * (Number(it.units) || 1), 0);
-    const maxL = Math.max(10, ...orderItems.map((i) => Number(i.length) || 0));
-    const maxB = Math.max(10, ...orderItems.map((i) => Number(i.breadth) || 0));
-    const maxH = Math.max(10, ...orderItems.map((i) => Number(i.height) || 0));
+    const totalWeight = snapMetrics
+      ? snapMetrics.totalWeight
+      : orderItems.reduce((s, it) => s + (Number(it.weight) || 0.5) * (Number(it.units) || 1), 0);
+    const maxL = snapMetrics
+      ? snapMetrics.maxL
+      : Math.max(10, ...orderItems.map((i) => Number(i.length) || 0));
+    const maxB = snapMetrics
+      ? snapMetrics.maxB
+      : Math.max(10, ...orderItems.map((i) => Number(i.breadth) || 0));
+    const maxH = snapMetrics
+      ? snapMetrics.maxH
+      : Math.max(10, ...orderItems.map((i) => Number(i.height) || 0));
 
     const payMethod = String(order.paymentInfo?.method || '').toLowerCase();
     const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
