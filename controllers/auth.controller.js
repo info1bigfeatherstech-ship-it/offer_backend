@@ -156,6 +156,7 @@ const clearRefreshTokenCookie = (req, res, portal) => {
   }
 };
 
+/** Logout / legacy: first matching scoped cookie (portal-specific). */
 const readRefreshTokenFromRequest = (req, portal) => {
   const cookieName = resolveRefreshCookieName(portal);
   const scopedCookie = req.cookies?.[cookieName];
@@ -163,7 +164,6 @@ const readRefreshTokenFromRequest = (req, portal) => {
     return { refreshToken: scopedCookie, cookieName };
   }
 
-  // Defensive fallback: if portal inference is wrong, still recover from any scoped cookie.
   const knownScopedCookies = Object.values(REFRESH_COOKIE_BY_PORTAL);
   for (const knownName of knownScopedCookies) {
     const candidate = req.cookies?.[knownName];
@@ -177,6 +177,75 @@ const readRefreshTokenFromRequest = (req, portal) => {
     return { refreshToken: legacyCookie, cookieName: 'refreshToken' };
   }
   return { refreshToken: null, cookieName };
+};
+
+/**
+ * Refresh flow: ONLY cookies for the requested portal (never cross-mix admin ↔ customer).
+ * Prevents admin panel from silently inheriting a customer refreshToken_ecomm session.
+ */
+const REFRESH_COOKIES_BY_PORTAL = {
+  ecomm: ['refreshToken_ecomm', 'refreshToken'],
+  wholesale: ['refreshToken_wholesale'],
+  'admin-ecomm': ['refreshToken_admin_ecomm'],
+  'admin-wholesale': ['refreshToken_admin_wholesale']
+};
+
+const listRefreshCookieCandidates = (req, preferredPortal) => {
+  const portal = normalizeRefreshPortal(preferredPortal) || 'ecomm';
+  const cookieNames = REFRESH_COOKIES_BY_PORTAL[portal] || REFRESH_COOKIES_BY_PORTAL.ecomm;
+  const candidates = [];
+
+  for (const cookieName of cookieNames) {
+    const value = req.cookies?.[cookieName];
+    if (value) {
+      candidates.push({ refreshToken: value, cookieName });
+    }
+  }
+
+  return candidates;
+};
+
+const resolveRefreshSession = async (refreshToken) => {
+  if (!refreshToken) return null;
+
+  let decoded;
+  try {
+    decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+  } catch {
+    return null;
+  }
+
+  if (decoded.type !== 'refresh') {
+    return null;
+  }
+
+  const hashedToken = hashToken(refreshToken);
+  const user = await User.findById(decoded.id).select(
+    '+refreshTokens.token +refreshTokens.previousToken +refreshTokens.previousTokenValidUntil'
+  );
+  if (!user) {
+    return null;
+  }
+
+  const now = new Date();
+  user.refreshTokens = user.refreshTokens.filter((t) => t.expiresAt > now);
+
+  const tokenIndex = user.refreshTokens.findIndex((t) => {
+    if (t.token === hashedToken) return true;
+    if (
+      t.previousToken === hashedToken &&
+      t.previousTokenValidUntil &&
+      new Date(t.previousTokenValidUntil) > now
+    ) {
+      return true;
+    }
+    return false;
+  });
+  if (tokenIndex === -1) {
+    return null;
+  }
+
+  return { user, tokenIndex, decoded, presentedHash: hashedToken };
 };
 
 const isPrivilegedRole = (role) => {
@@ -910,73 +979,81 @@ const logout = async (req, res) => {
 // ========== 8️ REFRESH ACCESS TOKEN ==========
 const refreshAccessToken = async (req, res) => {
   try {
-    // console.log("🔄 Refresh token request received");
-    
     const refreshPortal = normalizeRefreshPortal(req.body?.portal || req.headers['x-auth-portal']);
-    const { refreshToken, cookieName } = readRefreshTokenFromRequest(req, refreshPortal || 'ecomm');
+    const candidates = listRefreshCookieCandidates(req, refreshPortal || 'ecomm');
 
-    if (!refreshToken) {
-    //   console.log(" No refresh token in cookies");
+    if (candidates.length === 0) {
       return respondAuthError(res, 401, 'REFRESH_TOKEN_MISSING', 'Refresh token missing');
     }
 
-    // console.log(" Refresh token found");
+    let session = null;
+    let cookieName = null;
 
-    let decoded;
-    try {
-      decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
-    //   console.log(" Token verified, userId:", decoded.id);
-    } catch (err) {
-    //   console.log(" Token verification failed:", err.message);
-      return respondAuthError(res, 401, 'REFRESH_TOKEN_INVALID', 'Invalid or expired refresh token');
+    for (const candidate of candidates) {
+      const resolved = await resolveRefreshSession(candidate.refreshToken);
+      if (resolved) {
+        session = resolved;
+        cookieName = candidate.cookieName;
+        break;
+      }
     }
 
-    if (decoded.type !== "refresh") {
-    //   console.log(" Invalid token type:", decoded.type);
-      return respondAuthError(res, 401, 'REFRESH_TOKEN_TYPE_INVALID', 'Invalid token type');
-    }
-
-    const hashedToken = hashToken(refreshToken);
-    const user = await User.findById(decoded.id).select("+refreshTokens.token");
-
-    if (!user) {
-    //   console.log(" User not found:", decoded.id);
-      return respondAuthError(res, 401, 'USER_NOT_FOUND', 'User not found');
-    }
-
-    // Remove expired tokens
-    user.refreshTokens = user.refreshTokens.filter(t => t.expiresAt > new Date());
-
-    //  Find matching token (supports multiple devices)
-    const tokenIndex = user.refreshTokens.findIndex(t => t.token === hashedToken);
-    
-    if (tokenIndex === -1) {
-    //   console.log(" Token mismatch - session expired");
+    if (!session) {
       return respondAuthError(res, 401, 'SESSION_EXPIRED', 'Session expired. Please login again.');
     }
 
-    // console.log(" Token matched, generating new tokens");
+    const { user, tokenIndex, presentedHash } = session;
 
-    // Generate new tokens
-    const refreshedPortal = refreshPortal || (cookieName === 'refreshToken_admin_wholesale'
-      ? 'admin-wholesale'
-      : cookieName === 'refreshToken_admin_ecomm'
-        ? 'admin-ecomm'
-        : cookieName === 'refreshToken_wholesale'
-          ? 'wholesale'
-          : 'ecomm');
+    const refreshedPortal =
+      refreshPortal ||
+      (cookieName === 'refreshToken_admin_wholesale'
+        ? 'admin-wholesale'
+        : cookieName === 'refreshToken_admin_ecomm'
+          ? 'admin-ecomm'
+          : cookieName === 'refreshToken_wholesale'
+            ? 'wholesale'
+            : 'ecomm');
+
+    const portalDecision = canLoginForPortal(user, refreshedPortal);
+    if (!portalDecision.allowed) {
+      return respondAuthError(
+        res,
+        403,
+        portalDecision.code || 'PORTAL_ACCESS_DENIED',
+        portalDecision.message || 'Not allowed to refresh session for this portal.'
+      );
+    }
+
+    const slot = user.refreshTokens[tokenIndex];
+    const now = new Date();
+    const isRotationReplay =
+      slot.previousToken === presentedHash &&
+      slot.previousTokenValidUntil &&
+      new Date(slot.previousTokenValidUntil) > now;
+
+    // Concurrent refresh with already-rotated cookie: issue access token only (no second rotation).
+    if (isRotationReplay) {
+      const newAccessToken = generateAccessToken(user._id, user.userType, user.role, refreshedPortal);
+      return res.status(200).json({
+        success: true,
+        accessToken: newAccessToken
+      });
+    }
+
     const newAccessToken = generateAccessToken(user._id, user.userType, user.role, refreshedPortal);
     const newRefreshToken = generateRefreshToken(user._id);
     const newHashedToken = hashToken(newRefreshToken);
 
-    //  Replace the specific token (preserve device info)
-    const deviceInfo = user.refreshTokens[tokenIndex].deviceInfo || 'Unknown';
-    
+    const deviceInfo = slot.deviceInfo || 'Unknown';
+    const rotatedFromHash = presentedHash || slot.token;
+
     user.refreshTokens[tokenIndex] = {
       token: newHashedToken,
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       createdAt: new Date(),
-      deviceInfo: deviceInfo
+      deviceInfo,
+      previousToken: rotatedFromHash,
+      previousTokenValidUntil: new Date(Date.now() + 60 * 1000)
     };
 
     await user.save();
@@ -1002,6 +1079,19 @@ const me = async (req, res) => {
     const user = await User.findById(req.userId);
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
+    }
+
+    const tokenPortal = normalizePortal(req.authPortal || req.headers['x-auth-portal']);
+    if (
+      (tokenPortal === 'admin-ecomm' || tokenPortal === 'admin-wholesale') &&
+      !isPrivilegedAccount(user)
+    ) {
+      return respondAuthError(
+        res,
+        403,
+        'PORTAL_ACCESS_DENIED',
+        'This account is not allowed to access the admin portal.'
+      );
     }
 
     return res.status(200).json({

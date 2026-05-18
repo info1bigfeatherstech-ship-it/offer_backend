@@ -406,11 +406,25 @@ async function upsertShipmentInfo({
     if (shipmentPayload.labelUrl) {
         nextShipmentInfo.labelUrl = shipmentPayload.labelUrl;
     }
-    if (shipmentPayload.pickupDate) {
-        nextShipmentInfo.pickupDate = String(shipmentPayload.pickupDate);
+    if (shipmentPayload.manifestUrl) {
+        nextShipmentInfo.manifestUrl = shipmentPayload.manifestUrl;
+    }
+    if (shipmentPayload.manifestGeneratedAt) {
+        nextShipmentInfo.manifestGeneratedAt = new Date(shipmentPayload.manifestGeneratedAt);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'pickupDate')) {
+        const pd = shipmentPayload.pickupDate;
+        nextShipmentInfo.pickupDate =
+            pd == null || pd === '' ? null : String(pd).trim() || null;
     }
     if (shipmentPayload.pickupScheduledAt) {
         nextShipmentInfo.pickupScheduledAt = new Date(shipmentPayload.pickupScheduledAt);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'lastPickupError')) {
+        nextShipmentInfo.lastPickupError =
+            shipmentPayload.lastPickupError == null || shipmentPayload.lastPickupError === ''
+                ? null
+                : String(shipmentPayload.lastPickupError);
     }
     if (shipmentPayload.estimatedDelivery) {
         nextShipmentInfo.estimatedDelivery = shipmentPayload.estimatedDelivery;

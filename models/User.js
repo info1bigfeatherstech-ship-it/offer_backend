@@ -59,6 +59,15 @@ const userSchema = new mongoose.Schema(
         deviceInfo: {
           type: String,
              default: 'Unknown'
+        },
+        /** Short-lived: allows one concurrent/replayed refresh after rotation (race-safe). */
+        previousToken: {
+          type: String,
+          select: false
+        },
+        previousTokenValidUntil: {
+          type: Date,
+          select: false
         }
       }
     ],

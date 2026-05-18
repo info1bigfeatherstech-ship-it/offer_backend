@@ -123,6 +123,13 @@ router.post(
   adminFulfillment.adminBulkFulfillmentSchedulePickup
 );
 
+router.get(
+  '/admin/fulfillment/pickup-calendar',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentPickupCalendar
+);
+
 router.post(
   '/admin/items/bulk-documents/tax-invoices-zip',
   verifyToken,
@@ -138,6 +145,13 @@ router.post(
 );
 
 router.post(
+  '/admin/items/bulk-documents/manifests-zip',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkManifestsZip
+);
+
+router.post(
   '/admin/items/:orderId/fulfillment/ensure-shipment',
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
@@ -149,6 +163,13 @@ router.post(
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
   adminFulfillment.adminFulfillmentAssignShip
+);
+
+router.post(
+  '/admin/items/:orderId/fulfillment/sync-shiprocket',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentSyncShiprocket
 );
 
 router.post(
@@ -170,6 +191,20 @@ router.get(
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
   adminFulfillment.adminFulfillmentShippingLabelFile
+);
+
+router.post(
+  '/admin/items/:orderId/fulfillment/manifest',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentManifest
+);
+
+router.get(
+  '/admin/items/:orderId/fulfillment/manifest-file',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentManifestFile
 );
 
 router.post(

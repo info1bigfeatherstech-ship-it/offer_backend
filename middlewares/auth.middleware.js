@@ -5,6 +5,11 @@ const tokenStore = require('../config/tokenBlacklist');
 const User = require('../models/User');
 const { normalizeAllowedStorefronts } = require('./admin-storefront-scope.middleware');
 
+const normalizePortalClaim = (rawPortal) => {
+  const normalized = String(rawPortal || '').trim().toLowerCase();
+  return normalized || null;
+};
+
 /**
  * Verify JWT Token Middleware
  * Checks for valid JWT token in Authorization header (Bearer token)
@@ -92,10 +97,12 @@ const verifyToken = async (req, res, next) => {
 
     req.userId = decoded.id;
     req.userType = user.userType || 'user';
+    req.authPortal = normalizePortalClaim(decoded.portal);
     req.user = {
       id: decoded.id,
       role: String(resolvedRole).toLowerCase(),
-      allowedStorefronts: normalizeAllowedStorefronts(user.allowedStorefronts)
+      allowedStorefronts: normalizeAllowedStorefronts(user.allowedStorefronts),
+      portal: req.authPortal || undefined
     };
     req.userRole = req.user.role;
 
