@@ -12,6 +12,7 @@ const {
   paymentLabelForUi
 } = require('../constants/adminOrderFulfillmentBuckets');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
+const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmentUi');
 
 const MAX_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
 const DEFAULT_RANGE_DAYS = 30;
@@ -247,10 +248,37 @@ function mapOrderRow(order) {
   const hasAwb = Boolean(si.awbCode || si.trackingNumber);
   const hasShipmentId = Boolean(si.shipmentId);
   const pickupScheduled = Boolean(si.pickupScheduledAt || si.pickupDate);
+  const hasManifest = Boolean(si.manifestUrl);
+  const hasLabel = Boolean(si.labelUrl);
+  const hasShiprocketOrderId = Boolean(si.shiprocketOrderId);
   const orderStatusLower = String(o.orderStatus || '').toLowerCase();
   const isPending = orderStatusLower === 'pending';
   const fulfillmentPaymentGate = evaluateOrderPaymentForShiprocketFulfillment(o);
   const canConfirmForFulfillment = isPending && fulfillmentPaymentGate.ok === true;
+
+  const rowBase = {
+    orderStatus: o.orderStatus,
+    hasAwb,
+    hasShipmentId,
+    hasManifest,
+    hasLabel,
+    hasShiprocketOrderId,
+    pickupScheduled,
+    pickupDate: si.pickupDate || null,
+    canConfirmForFulfillment,
+    shipmentInfo: si,
+    fulfillmentPaymentGate: fulfillmentPaymentGate.ok
+      ? { ok: true, reason: fulfillmentPaymentGate.reason }
+      : {
+          ok: false,
+          code: fulfillmentPaymentGate.code,
+          message: fulfillmentPaymentGate.message
+        }
+  };
+  const fulfillmentUi = buildListRowFulfillmentUi({
+    ...o,
+    ...rowBase
+  });
 
   return {
     orderId: o.orderId,
@@ -271,15 +299,21 @@ function mapOrderRow(order) {
     amountPaidInr: financials.amountPaidInr,
     hasAwb,
     hasShipmentId,
+    hasManifest,
+    hasLabel,
+    hasShiprocketOrderId,
     pickupScheduled,
+    pickupDate: si.pickupDate || null,
+    courier: si.courier || null,
+    providerStatus: si.providerStatus || null,
+    awbCode: si.awbCode || si.trackingNumber || null,
     canConfirmForFulfillment,
-    fulfillmentPaymentGate: fulfillmentPaymentGate.ok
-      ? { ok: true, reason: fulfillmentPaymentGate.reason }
-      : {
-          ok: false,
-          code: fulfillmentPaymentGate.code,
-          message: fulfillmentPaymentGate.message
-        }
+    courierOpsLine1: fulfillmentUi.courierOpsLine1,
+    courierOpsLine2: fulfillmentUi.courierOpsLine2,
+    actionCapabilities: fulfillmentUi.actionCapabilities,
+    primaryAction: fulfillmentUi.primaryAction,
+    primaryActionLabel: fulfillmentUi.primaryActionLabel,
+    fulfillmentPaymentGate: rowBase.fulfillmentPaymentGate
   };
 }
 

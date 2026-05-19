@@ -96,6 +96,9 @@ const orderSchema = new mongoose.Schema(
       providerStatus: String,
       estimatedDelivery: String,
       labelUrl: String,
+      /** Shiprocket handover manifest PDF URL */
+      manifestUrl: { type: String, default: null },
+      manifestGeneratedAt: Date,
       shippedAt: Date,
       outForDeliveryAt: Date,
       deliveredAt: Date,

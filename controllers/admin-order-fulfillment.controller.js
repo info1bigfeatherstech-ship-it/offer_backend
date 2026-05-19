@@ -107,17 +107,273 @@ function normalizeBulkOrderIds(body) {
 }
 
 /**
+ * Build shipment payload from Shiprocket orders/show snapshot.
+ * @param {ReturnType<typeof ShiprocketService.extractForwardOrderSnapshot>} snapshot
+ */
+function isOrderPickupBookedOnShiprocket(shipmentInfo) {
+  const si = shipmentInfo || {};
+  if (si.pickupDate || si.pickupScheduledAt) return true;
+  if (ShiprocketService.isPickupAlreadyScheduledMessage(si.lastPickupError)) return true;
+  if (ShiprocketService.isPickupAlreadyScheduledMessage(si.providerStatus)) return true;
+  return false;
+}
+
+function shipmentPayloadFromForwardSnapshot(snapshot) {
+  if (!snapshot) return {};
+  const payload = {};
+  if (snapshot.shipmentId) payload.shipmentId = snapshot.shipmentId;
+  if (snapshot.shiprocketOrderId) payload.shiprocketOrderId = snapshot.shiprocketOrderId;
+  if (snapshot.awbCode) payload.awbCode = snapshot.awbCode;
+  if (snapshot.trackingNumber) payload.trackingNumber = snapshot.trackingNumber;
+  if (snapshot.courier) payload.courier = snapshot.courier;
+  if (snapshot.labelUrl) payload.labelUrl = snapshot.labelUrl;
+  if (snapshot.manifestUrl) payload.manifestUrl = snapshot.manifestUrl;
+  if (snapshot.providerStatus) payload.providerStatus = snapshot.providerStatus;
+  return payload;
+}
+
+/**
+ * Persist courier pickup day from Shiprocket only (never admin-selected dates).
+ */
+async function persistPickupDateFromShiprocket(order, snap, trigger) {
+  const freshOrder = await Order.findOne({ orderId: order.orderId });
+  if (!freshOrder) return { success: false, pickupDate: null, source: 'none' };
+
+  const shipmentId = freshOrder.shipmentInfo?.shipmentId || snap?.shipmentId;
+
+  const resolved = await ShiprocketService.resolveAuthoritativePickupDate({
+    shipmentId,
+    shiprocketOrderId: freshOrder.shipmentInfo?.shiprocketOrderId || snap?.shiprocketOrderId,
+    channelOrderId: freshOrder.orderId
+  });
+
+  const payload = {};
+  if (
+    resolved.success &&
+    resolved.pickupDate &&
+    ShiprocketService.isPlausibleCourierPickupYmd(resolved.pickupDate)
+  ) {
+    payload.pickupDate = resolved.pickupDate;
+  } else if (
+    freshOrder.shipmentInfo?.pickupDate &&
+    !ShiprocketService.isPlausibleCourierPickupYmd(freshOrder.shipmentInfo.pickupDate)
+  ) {
+    payload.pickupDate = null;
+  }
+
+  if (snap?.pickupScheduled || resolved.success) {
+    if (!order.shipmentInfo?.pickupScheduledAt) {
+      payload.pickupScheduledAt = new Date();
+    }
+    payload.lastPickupError = null;
+  }
+
+  if (Object.keys(payload).length === 0) return resolved;
+
+  if (Object.keys(payload).length > 0) {
+    await applyUpsertShipmentInfo({
+      order: freshOrder,
+      shipmentPayload: payload,
+      trigger: trigger || 'admin_pickup_date_resolve',
+      allowOrderStatusUpdate: false
+    });
+  }
+  return resolved;
+}
+
+/**
+ * Pull authoritative pickup / label / ids from Shiprocket and persist on the order.
+ * @param {import('mongoose').Document} order
+ * @param {string} trigger
+ */
+async function syncShipmentFromShiprocket(order, trigger) {
+  const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
+    shiprocketOrderId: order.shipmentInfo?.shiprocketOrderId,
+    channelOrderId: order.orderId
+  });
+  if (!lookup.success || !lookup.snapshot) {
+    return { success: false, code: lookup.code || 'SYNC_FAILED', message: lookup.message || 'Sync failed' };
+  }
+
+  const snap = lookup.snapshot;
+  const payload = shipmentPayloadFromForwardSnapshot(snap);
+
+  await applyUpsertShipmentInfo({
+    order,
+    shipmentPayload: payload,
+    trigger: trigger || 'admin_shiprocket_sync',
+    allowOrderStatusUpdate: false
+  });
+
+  const pickupResolved = await persistPickupDateFromShiprocket(
+    order,
+    snap,
+    `${trigger || 'admin_shiprocket_sync'}_pickup_date`
+  );
+
+  if (pickupResolved.success && pickupResolved.pickupDate) {
+    snap.pickupDate = pickupResolved.pickupDate;
+  }
+
+  return {
+    success: true,
+    snapshot: snap,
+    pickupDate: pickupResolved.pickupDate || null,
+    pickupDateSource: pickupResolved.source || null
+  };
+}
+
+/** Clear queue errors and backfill pickup booked timestamp when Shiprocket already has pickup/manifest. */
+async function repairPickupStateAfterShiprocketSync(order, snap) {
+  await persistPickupDateFromShiprocket(order, snap, 'admin_pickup_state_repair');
+
+  let fresh = await Order.findOne({ orderId: order.orderId });
+  if (!fresh) return null;
+  const si = fresh.shipmentInfo || {};
+  const queueErr = ShiprocketService.isPickupAlreadyScheduledMessage(si.lastPickupError);
+  const manifestDone = Boolean(si.manifestUrl);
+  const needsBookedAt = (queueErr || manifestDone || isOrderPickupBookedOnShiprocket(si)) && !si.pickupScheduledAt;
+  const needsErrorClear = queueErr;
+
+  if (!needsBookedAt && !needsErrorClear) return fresh;
+
+  const payload = {};
+  if (needsErrorClear) payload.lastPickupError = null;
+  if (needsBookedAt) payload.pickupScheduledAt = new Date();
+  if (manifestDone && !si.providerStatus) {
+    payload.providerStatus = 'pickup_scheduled';
+  }
+
+  await applyUpsertShipmentInfo({
+    order: fresh,
+    shipmentPayload: payload,
+    trigger: 'admin_pickup_state_repair',
+    allowOrderStatusUpdate: false
+  });
+  return Order.findOne({ orderId: order.orderId });
+}
+
+/**
+ * Resolve Shiprocket numeric order id; optionally backfill from orders/show.
+ * @param {import('mongoose').Document} order
+ */
+async function resolveShiprocketOrderIdForOrder(order) {
+  const existing = order.shipmentInfo?.shiprocketOrderId
+    ? String(order.shipmentInfo.shiprocketOrderId).trim()
+    : '';
+  if (existing) return existing;
+
+  const synced = await syncShipmentFromShiprocket(order, 'admin_resolve_shiprocket_order_id');
+  if (synced.success && synced.snapshot?.shiprocketOrderId) {
+    return String(synced.snapshot.shiprocketOrderId).trim();
+  }
+  return '';
+}
+
+/**
+ * Shared pickup scheduling outcome — persists SR-confirmed dates and syncs on conflicts.
+ * @returns {Promise<{ success: boolean, skipped?: boolean, code?: string|null, message: string, pickupDate?: string, alreadyScheduled?: boolean }>}
+ */
+async function applyPickupScheduleOutcome(order, { sched, requestedPickupDate, trigger }) {
+  const requested = String(requestedPickupDate || '').trim();
+
+  if (sched.success) {
+    let confirmedDate =
+      ShiprocketService.parsePickupDateFromScheduleResponse(sched.raw, null) || sched.pickupDate || null;
+    const synced = await syncShipmentFromShiprocket(order, `${trigger || 'admin_schedule_pickup'}_sync`);
+    if (!confirmedDate && synced.pickupDate) confirmedDate = synced.pickupDate;
+    if (!confirmedDate) {
+      const auth = await ShiprocketService.resolveAuthoritativePickupDate({
+        shipmentId: order.shipmentInfo?.shipmentId,
+        shiprocketOrderId: order.shipmentInfo?.shiprocketOrderId,
+        channelOrderId: order.orderId
+      });
+      if (auth.success && auth.pickupDate) confirmedDate = auth.pickupDate;
+    }
+    const dateAdjusted = Boolean(requested && confirmedDate && confirmedDate !== requested);
+    if (confirmedDate) {
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          pickupDate: confirmedDate,
+          pickupScheduledAt: new Date(),
+          lastPickupError: null,
+          providerStatus: sched.providerStatus || order.shipmentInfo?.providerStatus
+        },
+        trigger: trigger || 'admin_schedule_pickup',
+        allowOrderStatusUpdate: false
+      });
+    } else {
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          pickupScheduledAt: new Date(),
+          lastPickupError: null,
+          providerStatus: sched.providerStatus || order.shipmentInfo?.providerStatus
+        },
+        trigger: trigger || 'admin_schedule_pickup',
+        allowOrderStatusUpdate: false
+      });
+    }
+    const message = !confirmedDate
+      ? 'Pickup scheduled on Shiprocket. Refresh sync to load the courier pickup day.'
+      : dateAdjusted
+        ? `Pickup scheduled. You selected ${requested}; Shiprocket confirmed ${confirmedDate}.`
+        : `Pickup scheduled for ${confirmedDate}.`;
+    return {
+      success: true,
+      skipped: false,
+      code: null,
+      message,
+      pickupDate: confirmedDate,
+      requestedPickupDate: requested,
+      dateAdjusted
+    };
+  }
+
+  const schedMsg =
+    sched.message ||
+    (sched.details && typeof sched.details === 'object'
+      ? sched.details.message || sched.details.error || sched.details.payload
+      : null);
+  if (ShiprocketService.isPickupAlreadyScheduledMessage(schedMsg)) {
+    const synced = await syncShipmentFromShiprocket(order, `${trigger || 'admin_schedule_pickup'}_already`);
+    const fresh = await Order.findOne({ orderId: order.orderId });
+    const savedDate = synced.pickupDate || fresh?.shipmentInfo?.pickupDate || null;
+    return {
+      success: true,
+      skipped: true,
+      alreadyScheduled: true,
+      code: 'PICKUP_ALREADY_ON_SHIPROCKET',
+      message: savedDate
+        ? `Pickup is already scheduled on Shiprocket (${savedDate}).`
+        : 'Pickup is already scheduled on Shiprocket. Use Refresh from Shiprocket to load the courier pickup day.',
+      pickupDate: savedDate
+    };
+  }
+
+  order.shipmentInfo = {
+    ...(order.shipmentInfo || {}),
+    lastPickupError: sched.message || 'Pickup schedule failed'
+  };
+  order.markModified('shipmentInfo');
+  await order.save();
+
+  return {
+    success: false,
+    skipped: false,
+    code: sched.code || 'PICKUP_FAILED',
+    message: sched.message || 'Pickup schedule failed',
+    details: sched.details || null
+  };
+}
+
+/**
  * Fetch Shiprocket label PDF bytes (same rules as single-label download).
  * @param {import('mongoose').Document} order — populated staff order
  * @returns {Promise<Buffer>}
  */
 async function fetchShiprocketLabelPdfBuffer(order) {
-  const shipmentId = order.shipmentInfo?.shipmentId;
-  if (!shipmentId) {
-    const e = new Error('No shipment_id on order.');
-    e.code = 'SHIPMENT_ID_MISSING';
-    throw e;
-  }
   const gate = evaluateOrderPaymentForShiprocketFulfillment(order);
   if (!gate.ok) {
     const e = new Error(gate.message || 'Payment rules do not allow this shipment action.');
@@ -132,18 +388,37 @@ async function fetchShiprocketLabelPdfBuffer(order) {
     e.code = 'AWB_REQUIRED';
     throw e;
   }
-  let labelUrl = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
+
+  const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+  if (!shiprocketOrderId) {
+    const e = new Error(
+      'No Shiprocket order id on this order. Use Ship now to create the forward order on Shiprocket first.'
+    );
+    e.code = 'SHIPROCKET_ORDER_ID_MISSING';
+    throw e;
+  }
+
+  const cachedUrl = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
+  let labelUrl =
+    cachedUrl && !ShiprocketService.isLikelyTaxInvoiceUrl(cachedUrl) ? cachedUrl : '';
+
   if (!labelUrl) {
-    const label = await ShiprocketService.generateShippingLabel({ shipmentId });
+    const label = await ShiprocketService.generateShippingLabel({
+      shiprocketOrderId,
+      channelOrderId: order.orderId,
+      shipmentId: order.shipmentInfo?.shipmentId
+    });
     if (!label.success || !label.labelUrl) {
       const e = new Error(label.message || 'Could not get shipping label URL');
       e.code = label.code || 'LABEL_FAILED';
+      e.details = label.details || null;
       throw e;
     }
     await applyUpsertShipmentInfo({
       order,
       shipmentPayload: {
         labelUrl: label.labelUrl,
+        shiprocketOrderId: label.shiprocketOrderId || shiprocketOrderId,
         providerStatus: order.shipmentInfo?.providerStatus
       },
       trigger: 'admin_shipping_label_pdf',
@@ -167,6 +442,89 @@ async function fetchShiprocketLabelPdfBuffer(order) {
     e.code = 'LABEL_EMPTY_BODY';
     throw e;
   }
+  return buf;
+}
+
+/**
+ * Fetch Shiprocket manifest PDF bytes (generate + print flow).
+ * @param {import('mongoose').Document} order
+ * @returns {Promise<Buffer>}
+ */
+async function fetchShiprocketManifestPdfBuffer(order) {
+  const gate = evaluateOrderPaymentForShiprocketFulfillment(order);
+  if (!gate.ok) {
+    const e = new Error(gate.message || 'Payment rules do not allow this shipment action.');
+    e.code = gate.code || 'PAYMENT_REQUIRED';
+    throw e;
+  }
+  const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
+  if (!hasAwb) {
+    const e = new Error('Assign AWB before downloading a manifest.');
+    e.code = 'AWB_REQUIRED';
+    throw e;
+  }
+  const shipmentId = order.shipmentInfo?.shipmentId;
+  if (!shipmentId) {
+    const e = new Error('No shipment_id on order.');
+    e.code = 'SHIPMENT_ID_MISSING';
+    throw e;
+  }
+
+  let manifestUrl = order.shipmentInfo?.manifestUrl ? String(order.shipmentInfo.manifestUrl).trim() : '';
+  if (!manifestUrl) {
+    const generated = await ShiprocketService.generateManifest({ shipmentId });
+    if (!generated.success) {
+      const e = new Error(generated.message || 'Manifest generation failed');
+      e.code = generated.code || 'MANIFEST_GENERATE_FAILED';
+      e.details = generated.details || null;
+      throw e;
+    }
+    const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+    const printed = await ShiprocketService.printManifest({
+      shiprocketOrderId,
+      channelOrderId: order.orderId
+    });
+    if (!printed.success) {
+      const e = new Error(printed.message || 'Manifest print failed');
+      e.code = printed.code || 'MANIFEST_PRINT_FAILED';
+      e.details = printed.details || null;
+      throw e;
+    }
+    manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
+    if (!manifestUrl) {
+      const e = new Error('Shiprocket did not return a manifest URL.');
+      e.code = 'MANIFEST_URL_MISSING';
+      throw e;
+    }
+    await applyUpsertShipmentInfo({
+      order,
+      shipmentPayload: {
+        manifestUrl,
+        manifestGeneratedAt: new Date(),
+        shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId || undefined
+      },
+      trigger: 'admin_manifest_pdf',
+      allowOrderStatusUpdate: false
+    });
+  }
+
+  const external = await axios.get(manifestUrl, {
+    responseType: 'arraybuffer',
+    timeout: 45000,
+    maxContentLength: 25 * 1024 * 1024,
+    headers: {
+      Accept: 'application/pdf,application/octet-stream,*/*',
+      'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+    },
+    validateStatus: (s) => s >= 200 && s < 400
+  });
+  const buf = Buffer.from(external.data || []);
+  if (!buf.length) {
+    const e = new Error('Manifest download returned empty body');
+    e.code = 'MANIFEST_EMPTY_BODY';
+    throw e;
+  }
+  await syncShipmentFromShiprocket(order, 'admin_manifest_pdf_sync');
   return buf;
 }
 
@@ -314,6 +672,8 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       trigger: 'admin_assign_awb',
       allowOrderStatusUpdate: Boolean(assign.awbCode || assign.trackingNumber)
     });
+
+    await syncShipmentFromShiprocket(order, 'admin_assign_awb_sync');
 
     let fresh = await Order.findOne({ orderId: order.orderId });
     const hasAwb = Boolean(fresh?.shipmentInfo?.awbCode || fresh?.shipmentInfo?.trackingNumber);
@@ -498,6 +858,7 @@ async function runBulkSchedulePickupSingle(orderId, pickupDateYmd) {
   }
 
   if (order.shipmentInfo?.pickupScheduledAt || order.shipmentInfo?.pickupDate) {
+    await syncShipmentFromShiprocket(order, 'admin_bulk_pickup_refresh');
     return {
       orderId: id,
       success: true,
@@ -512,32 +873,42 @@ async function runBulkSchedulePickupSingle(orderId, pickupDateYmd) {
     return { orderId: id, success: false, skipped: false, code: 'INVALID_PICKUP_DATE', message: dateCheck.message };
   }
 
-  const sched = await ShiprocketService.schedulePickup({ shipmentId, pickupDate });
-  if (!sched.success) {
-    order.shipmentInfo = { ...(order.shipmentInfo || {}), lastPickupError: sched.message || 'pickup failed' };
-    order.markModified('shipmentInfo');
-    await order.save();
+  const srDateCheck = await ShiprocketService.validatePickupDateForSchedule(pickupDate);
+  if (!srDateCheck.ok) {
     return {
       orderId: id,
       success: false,
       skipped: false,
-      code: sched.code || 'PICKUP_FAILED',
-      message: sched.message || 'Pickup schedule failed',
-      details: sched.details || null
+      code: srDateCheck.code || 'PICKUP_DATE_NOT_ALLOWED',
+      message: srDateCheck.message || 'Pickup date not allowed by Shiprocket settings.'
     };
   }
 
-  order.shipmentInfo = {
-    ...(order.shipmentInfo || {}),
-    pickupDate,
-    pickupScheduledAt: new Date(),
-    lastPickupError: null,
-    providerStatus: sched.providerStatus || order.shipmentInfo?.providerStatus
-  };
-  order.markModified('shipmentInfo');
-  await order.save();
+  const sched = await ShiprocketService.schedulePickup({ shipmentId, pickupDate: srDateCheck.date });
+  const outcome = await applyPickupScheduleOutcome(order, {
+    sched,
+    requestedPickupDate: pickupDate,
+    trigger: 'admin_bulk_schedule_pickup'
+  });
 
-  return { orderId: id, success: true, skipped: false, code: null, message: 'Pickup scheduled.' };
+  if (!outcome.success) {
+    return {
+      orderId: id,
+      success: false,
+      skipped: false,
+      code: outcome.code || 'PICKUP_FAILED',
+      message: outcome.message || 'Pickup schedule failed',
+      details: outcome.details || null
+    };
+  }
+
+  return {
+    orderId: id,
+    success: true,
+    skipped: Boolean(outcome.skipped),
+    code: outcome.code || null,
+    message: outcome.message || 'Pickup scheduled.'
+  };
   } catch (err) {
     logger.error('runBulkSchedulePickupSingle', { orderId, message: err?.message, stack: err?.stack });
     return {
@@ -687,6 +1058,39 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
   }
 };
 
+/** POST /orders/admin/items/:orderId/fulfillment/sync-shiprocket — refresh pickup/label/manifest from Shiprocket */
+exports.adminFulfillmentSyncShiprocket = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+    const hasSr =
+      order.shipmentInfo?.shiprocketOrderId ||
+      order.shipmentInfo?.shipmentId ||
+      order.shipmentInfo?.awbCode;
+    if (!hasSr) {
+      return jsonError(res, 400, 'SHIPROCKET_ORDER_MISSING', 'No Shiprocket shipment on this order yet.');
+    }
+    const synced = await syncShipmentFromShiprocket(order, 'admin_manual_sync');
+    const repaired = await repairPickupStateAfterShiprocketSync(order, synced.snapshot);
+    const si = repaired?.shipmentInfo || {};
+    const pickupMsg = si.pickupDate
+      ? `Courier pickup day updated to ${si.pickupDate} (from Shiprocket orders/show).`
+      : 'Pickup is on Shiprocket but courier day could not be loaded. Confirm on Shiprocket order details, then refresh again.';
+    return res.json({
+      success: true,
+      synced: synced.success,
+      message: synced.success ? pickupMsg : synced.message || 'Sync completed with warnings.',
+      pickupDate: si.pickupDate || null,
+      pickupDateSource: synced.pickupDateSource || null,
+      order: repaired || (await Order.findOne({ orderId: order.orderId }))
+    });
+  } catch (error) {
+    logger.error('adminFulfillmentSyncShiprocket', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'FULFILLMENT_SYNC_FAILED', error.message || 'Server error');
+  }
+};
+
 /** POST /orders/admin/items/:orderId/fulfillment/schedule-pickup  body: { pickupDate: "YYYY-MM-DD" } */
 exports.adminFulfillmentSchedulePickup = async (req, res) => {
   try {
@@ -700,37 +1104,59 @@ exports.adminFulfillmentSchedulePickup = async (req, res) => {
     if (!(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber)) {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB (ship) before scheduling pickup.');
     }
+    if (isOrderPickupBookedOnShiprocket(order.shipmentInfo)) {
+      await syncShipmentFromShiprocket(order, 'admin_schedule_pickup_refresh');
+      const freshEarly = await Order.findOne({ orderId: order.orderId });
+      const booked = isOrderPickupBookedOnShiprocket(freshEarly?.shipmentInfo);
+      if (booked) {
+        return res.json({
+          success: true,
+          alreadyScheduled: true,
+          message: freshEarly?.shipmentInfo?.pickupDate
+            ? `Pickup is already scheduled (${freshEarly.shipmentInfo.pickupDate}).`
+            : 'Pickup is already scheduled on Shiprocket.',
+          pickupDate: freshEarly?.shipmentInfo?.pickupDate || null,
+          order: freshEarly
+        });
+      }
+    }
+
     const pickupDate = String(req.body?.pickupDate || '').trim();
     const dateCheck = pickupDateNotInPast(pickupDate);
     if (!dateCheck.ok) {
       return jsonError(res, 400, 'INVALID_PICKUP_DATE', dateCheck.message);
     }
 
-    const sched = await ShiprocketService.schedulePickup({ shipmentId, pickupDate });
-    if (!sched.success) {
-      order.shipmentInfo = { ...(order.shipmentInfo || {}), lastPickupError: sched.message || 'pickup failed' };
-      order.markModified('shipmentInfo');
-      await order.save();
-      return jsonError(res, 502, sched.code || 'PICKUP_FAILED', sched.message || 'Pickup schedule failed', {
-        details: sched.details || null
-      });
+    const srDateCheck = await ShiprocketService.validatePickupDateForSchedule(pickupDate);
+    if (!srDateCheck.ok) {
+      return jsonError(res, 400, srDateCheck.code || 'PICKUP_DATE_NOT_ALLOWED', srDateCheck.message);
     }
 
-    order.shipmentInfo = {
-      ...(order.shipmentInfo || {}),
-      pickupDate,
-      pickupScheduledAt: new Date(),
-      lastPickupError: null,
-      providerStatus: sched.providerStatus || order.shipmentInfo?.providerStatus
-    };
-    order.markModified('shipmentInfo');
-    await order.save();
+    const sched = await ShiprocketService.schedulePickup({
+      shipmentId,
+      pickupDate: srDateCheck.date
+    });
+    const outcome = await applyPickupScheduleOutcome(order, {
+      sched,
+      requestedPickupDate: srDateCheck.date,
+      trigger: 'admin_schedule_pickup'
+    });
+
+    if (!outcome.success) {
+      return jsonError(res, 502, outcome.code || 'PICKUP_FAILED', outcome.message || 'Pickup schedule failed', {
+        details: outcome.details || null
+      });
+    }
 
     const fresh = await Order.findOne({ orderId: order.orderId });
     return res.json({
       success: true,
-      message: 'Pickup scheduled',
-      pickupDate,
+      message: outcome.message || 'Pickup scheduled',
+      pickupDate: outcome.pickupDate || fresh?.shipmentInfo?.pickupDate || null,
+      pickupDateSource: outcome.pickupDateSource || null,
+      requestedPickupDate: outcome.requestedPickupDate || srDateCheck.date,
+      dateAdjusted: Boolean(outcome.dateAdjusted),
+      alreadyScheduled: Boolean(outcome.alreadyScheduled),
       order: fresh,
       raw: sched.raw || null
     });
@@ -746,15 +1172,24 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
-    const shipmentId = order.shipmentInfo?.shipmentId;
-    if (!shipmentId) {
-      return jsonError(res, 400, 'SHIPMENT_ID_MISSING', 'No shipment_id on order.');
-    }
     const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
     if (!hasAwb) {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label from Shiprocket.');
     }
-    const label = await ShiprocketService.generateShippingLabel({ shipmentId });
+    const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+    if (!shiprocketOrderId) {
+      return jsonError(
+        res,
+        400,
+        'SHIPROCKET_ORDER_ID_MISSING',
+        'No Shiprocket order id on this order. Use Ship now first.'
+      );
+    }
+    const label = await ShiprocketService.generateShippingLabel({
+      shiprocketOrderId,
+      channelOrderId: order.orderId,
+      shipmentId: order.shipmentInfo?.shipmentId
+    });
     if (!label.success) {
       return jsonError(res, 502, label.code || 'LABEL_FAILED', label.message || 'Label generation failed', {
         details: label.details || null
@@ -764,6 +1199,7 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
       order,
       shipmentPayload: {
         labelUrl: label.labelUrl,
+        shiprocketOrderId: label.shiprocketOrderId || shiprocketOrderId,
         providerStatus: order.shipmentInfo?.providerStatus
       },
       trigger: 'admin_shipping_label',
@@ -802,8 +1238,8 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
         status: fetchErr.response?.status
       });
       const code = fetchErr.code || 'LABEL_FILE_FAILED';
-      if (code === 'SHIPMENT_ID_MISSING') {
-        return jsonError(res, 400, code, fetchErr.message || 'No shipment_id on order.');
+      if (code === 'SHIPROCKET_ORDER_ID_MISSING') {
+        return jsonError(res, 400, code, fetchErr.message || 'No Shiprocket order id on order.');
       }
       if (code === 'AWB_REQUIRED') {
         return jsonError(res, 400, code, fetchErr.message || 'Assign AWB first.');
@@ -995,6 +1431,70 @@ exports.adminBulkTaxInvoicesZip = async (req, res) => {
   }
 };
 
+/** POST /orders/admin/items/bulk-documents/manifests-zip — ZIP of Shiprocket manifest PDFs */
+exports.adminBulkManifestsZip = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+
+    const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
+      try {
+        const order = await loadOrderDocByOrderId(oid);
+        if (!order) {
+          return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
+        }
+        const st = String(order.orderStatus || '').toLowerCase();
+        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+          return {
+            orderId: oid,
+            success: false,
+            code: 'SKIP_BAD_STATUS',
+            message: `Cannot download manifest for status ${order.orderStatus}`
+          };
+        }
+        const pdfBuf = await fetchShiprocketManifestPdfBuffer(order);
+        const entryName = safeZipEntryBase(oid, '-manifest.pdf');
+        return { orderId: oid, success: true, entryName, pdfBuf };
+      } catch (err) {
+        const code = err.code || 'MANIFEST_FAILED';
+        return { orderId: oid, success: false, code, message: err?.message || String(err) };
+      }
+    });
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    if (succeeded.length === 0) {
+      return jsonError(res, 400, 'BULK_MANIFESTS_NONE', 'No manifests could be added to the ZIP.', {
+        failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+      });
+    }
+
+    const zip = new AdmZip();
+    const manifest = {
+      type: 'shiprocket_manifests',
+      generatedAt: new Date().toISOString(),
+      summary: { total: results.length, succeeded: succeeded.length, failed: failed.length },
+      succeeded: succeeded.map((r) => ({ orderId: r.orderId, file: r.entryName })),
+      failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
+    };
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+    for (const row of succeeded) {
+      zip.addFile(row.entryName, row.pdfBuf);
+    }
+    const buf = zip.toBuffer();
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="shiprocket-manifests-bulk-${Date.now()}.zip"`);
+    return res.status(200).send(buf);
+  } catch (error) {
+    logger.error('adminBulkManifestsZip', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_MANIFESTS_ZIP_FAILED', error.message || 'Server error');
+  }
+};
+
 /** POST /orders/admin/items/bulk-documents/shipping-labels-zip — ZIP of label PDFs + manifest.json */
 exports.adminBulkShippingLabelsZip = async (req, res) => {
   try {
@@ -1129,6 +1629,131 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
   } catch (error) {
     logger.error('adminReturnReversePickupRetry', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'RETURN_RETRY_FAILED', error.message || 'Server error');
+  }
+};
+
+/** GET /orders/admin/fulfillment/pickup-calendar — allowed dates from Shiprocket panel rules */
+exports.adminFulfillmentPickupCalendar = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const daysAhead = Math.min(Math.max(7, Number(req.query?.daysAhead) || 45), 90);
+    const forceRefresh = String(req.query?.refresh || '').toLowerCase() === '1';
+    const cal = await ShiprocketService.getPickupCalendar({ daysAhead, forceRefresh });
+    const prefs = cal.preferences || {};
+    return res.json({
+      success: true,
+      preferences: prefs,
+      calendar: cal.calendar,
+      scheduleFromShiprocketPanel: Boolean(prefs.hasScheduleRules),
+      scheduleRulesMessage: prefs.hasScheduleRules
+        ? 'Pickup dates follow your Shiprocket panel schedule.'
+        : ShiprocketService.enabled
+          ? 'Could not read pickup day rules from Shiprocket API. Update pickup preferences in the Shiprocket panel, then refresh this page.'
+          : 'Shiprocket is disabled in server config.'
+    });
+  } catch (error) {
+    logger.error('adminFulfillmentPickupCalendar', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'PICKUP_CALENDAR_FAILED', error.message || 'Server error');
+  }
+};
+
+/** POST /orders/admin/items/:orderId/fulfillment/manifest — generate + print manifest, save URL */
+exports.adminFulfillmentManifest = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber)) {
+      return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before generating a manifest.');
+    }
+    const shipmentId = order.shipmentInfo?.shipmentId;
+    if (!shipmentId) {
+      return jsonError(res, 400, 'SHIPMENT_ID_MISSING', 'No shipment_id on order.');
+    }
+
+    const generated = await ShiprocketService.generateManifest({ shipmentId });
+    if (!generated.success) {
+      return jsonError(res, 502, generated.code || 'MANIFEST_GENERATE_FAILED', generated.message, {
+        details: generated.details || null
+      });
+    }
+
+    const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+    const printed = await ShiprocketService.printManifest({
+      shiprocketOrderId,
+      channelOrderId: order.orderId
+    });
+    if (!printed.success) {
+      return jsonError(res, 502, printed.code || 'MANIFEST_PRINT_FAILED', printed.message, {
+        details: printed.details || null
+      });
+    }
+
+    const manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
+    if (!manifestUrl) {
+      return jsonError(res, 502, 'MANIFEST_URL_MISSING', 'Shiprocket did not return a manifest URL.');
+    }
+
+    await applyUpsertShipmentInfo({
+      order,
+      shipmentPayload: {
+        manifestUrl,
+        manifestGeneratedAt: new Date(),
+        shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId || undefined
+      },
+      trigger: 'admin_manifest',
+      allowOrderStatusUpdate: false
+    });
+    await syncShipmentFromShiprocket(order, 'admin_manifest_sync');
+
+    const fresh = await Order.findOne({ orderId: order.orderId });
+    return res.json({
+      success: true,
+      manifestUrl,
+      order: fresh
+    });
+  } catch (error) {
+    logger.error('adminFulfillmentManifest', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'FULFILLMENT_MANIFEST_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * GET /orders/admin/items/:orderId/fulfillment/manifest-file
+ * Proxies Shiprocket manifest PDF for admin download.
+ */
+exports.adminFulfillmentManifestFile = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+
+    let buf;
+    try {
+      buf = await fetchShiprocketManifestPdfBuffer(order);
+    } catch (fetchErr) {
+      const code = fetchErr.code || 'MANIFEST_FILE_FAILED';
+      if (code === 'AWB_REQUIRED' || code === 'SHIPMENT_ID_MISSING' || code === 'SHIPROCKET_ORDER_ID_MISSING') {
+        return jsonError(res, 400, code, fetchErr.message);
+      }
+      const payHttp = fulfillmentPaymentBlockHttpStatus(code);
+      if (payHttp === 403) {
+        return jsonError(res, 403, code, fetchErr.message, {
+          details: fetchErr.details != null ? fetchErr.details : null
+        });
+      }
+      return jsonError(res, 502, code, fetchErr.message || 'Manifest error', {
+        details: fetchErr.details || null
+      });
+    }
+
+    const safe = String(order.orderId || 'order').replace(/[^\w.-]+/g, '_').slice(0, 80);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Shiprocket-manifest-${safe}.pdf"`);
+    return res.status(200).send(buf);
+  } catch (error) {
+    logger.error('adminFulfillmentManifestFile', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'MANIFEST_FILE_FAILED', error.message || 'Server error');
   }
 };
 
