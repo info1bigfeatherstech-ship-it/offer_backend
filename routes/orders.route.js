@@ -214,6 +214,13 @@ router.post(
   adminFulfillment.adminFulfillmentCancelShipment
 );
 
+router.post(
+  '/admin/items/:orderId/fulfillment/retry-pickup',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminFulfillmentRetryPickup
+);
+
 router.get(
   '/admin/items/:orderId/fulfillment/couriers',
   verifyToken,

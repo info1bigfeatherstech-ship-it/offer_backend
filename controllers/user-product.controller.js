@@ -594,7 +594,7 @@ const getProductBySlug = async (req, res) => {
 // };
 const searchProducts = async (req, res) => {
   try {
-    const q = req.query.q || "";
+    const q = String(req.query.q || "").trim();
 
     if (!q) {
       return res.status(400).json({
@@ -625,6 +625,7 @@ const searchProducts = async (req, res) => {
       : [];
 
     const cacheKey = cacheConfig.generateKey("SEARCH", {
+      v: "code-prefix-v2",
       q,
       page,
       limit,
@@ -645,8 +646,33 @@ const searchProducts = async (req, res) => {
       return res.json(cachedData);
     }
 
+    // Build search filter.
+    // If query looks like a product code (e.g. 0053 / 0053-1), prefer productCode-family match.
+    const escapeRegex = (value) =>
+      String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedQ = escapeRegex(q);
+    const searchRegex = { $regex: escapedQ, $options: "i" };
+    const baseCode = q.split("-")[0].trim();
+    const escapedBaseCode = escapeRegex(baseCode);
+    const productCodePrefixRegex = {
+      $regex: `^${escapedBaseCode}(?:-|$)`,
+      $options: "i",
+    };
+    const looksLikeProductCode = /^[a-z0-9-]+$/i.test(q) && /\d/.test(q);
+
+    const searchOrClauses = looksLikeProductCode
+      ? [{ "variants.productCode": productCodePrefixRegex }]
+      : [
+          { name: searchRegex },
+          { title: searchRegex },
+          { "variants.productCode": searchRegex },
+          { "variants.productCode": productCodePrefixRegex },
+        ];
+
     const extraClauses = [
-      { $text: { $search: q } },
+      {
+        $or: searchOrClauses,
+      },
     ];
 
     // tag filter
@@ -684,25 +710,9 @@ const searchProducts = async (req, res) => {
       ...extraClauses
     );
 
-    // ✅ ADD THIS
-    if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter }
-      }).select('product').lean();
-
-      const taggedProductIds = taggedProducts.map(t => t.product);
-      filters._id = { $in: taggedProductIds };
-    }
-    // const filters = mongoCatalogAnd(storefront, { $text: { $search: q } });
-
     const total = await Product.countDocuments(filters);
 
-    const products = await Product.find(filters, {
-      score: { $meta: "textScore" },
-    })
-      .sort({
-        score: { $meta: "textScore" },
-      })
+    const products = await Product.find(filters)
       .skip(skip)
       .limit(limit)
       .populate("category")

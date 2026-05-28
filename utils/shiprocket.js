@@ -1211,6 +1211,55 @@ class ShiprocketService {
   }
 
   /**
+   * POST /external/courier/generate/pickup — retry failed pickup (status: retry).
+   * @see https://apidocs.shiprocket.in/
+   */
+  async retryPickup({ shipmentId }) {
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (!sid) {
+      return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid shipment_id is required' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        providerStatus: 'pickup_retry_mock',
+        raw: { mock: true, status: 'retry' }
+      };
+    }
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/courier/generate/pickup`,
+        data: {
+          shipment_id: sid,
+          status: 'retry'
+        },
+        timeout: 30000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+      const confirmedDate = ShiprocketService.parsePickupDateFromScheduleResponse(data, null);
+      return {
+        success: true,
+        pickupDate: confirmedDate,
+        providerStatus: data.pickup_status || data.status || 'pickup_scheduled',
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      logger.error('[Shiprocket] retryPickup failed:', err.response?.data || err.message);
+      return {
+        success: false,
+        code: 'PICKUP_RETRY_FAILED',
+        message: ShiprocketService.formatAxiosError(err),
+        details: err.response?.data || null
+      };
+    }
+  }
+
+  /**
    * GET /external/orders/show/{id} — full forward-order snapshot for DB sync.
    * @returns {Promise<{ success: boolean, snapshot?: object, code?: string, message?: string }>}
    */

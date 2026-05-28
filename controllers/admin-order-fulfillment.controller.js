@@ -19,9 +19,24 @@ const {
   runAdminApproveOrderSingle,
   runAdminCancelOrderSingle
 } = require('../services/adminOrderApproval.service');
+const {
+  buildShipmentOpsView,
+  evaluateAndPersistShipmentOps,
+  assertShipmentOpsAction
+} = require('../services/shipmentOps');
 
 function jsonError(res, status, code, message, extras = {}) {
   return res.status(status).json({ success: false, code, message, ...extras });
+}
+
+function requireShipmentOpsAction(order, actionKey, res) {
+  const check = assertShipmentOpsAction(order, actionKey);
+  if (check.ok) return check.view;
+  jsonError(res, 409, check.code || 'SHIPMENT_OPS_ACTION_BLOCKED', check.message, {
+    opsState: check.opsState || null,
+    blockReasons: check.blockReasons || null
+  });
+  return null;
 }
 
 async function loadStaffOrder(req, res, orderId) {
@@ -130,6 +145,50 @@ function shipmentPayloadFromForwardSnapshot(snapshot) {
   if (snapshot.manifestUrl) payload.manifestUrl = snapshot.manifestUrl;
   if (snapshot.providerStatus) payload.providerStatus = snapshot.providerStatus;
   return payload;
+}
+
+/**
+ * After remote cancel, sync Shiprocket and clear stale forward-shipment fields so Ship now can run again.
+ * @param {import('mongoose').Document} order
+ */
+async function finalizeShipmentAfterRemoteCancel(order) {
+  await syncShipmentFromShiprocket(order, 'admin_cancel_shipment_sync');
+
+  let fresh = await Order.findOne({ orderId: order.orderId });
+  if (!fresh) return null;
+
+  const si = fresh.shipmentInfo || {};
+  const providerStatus = String(si.providerStatus || '').toLowerCase();
+  const resetLike =
+    /cancel|auto cancel|pickupcancel|new|reset|pickup exception|pickup error/.test(providerStatus) ||
+    !(si.awbCode || si.trackingNumber);
+
+  if (resetLike) {
+    fresh.shipmentInfo = {
+      ...si,
+      awbCode: null,
+      trackingNumber: null,
+      courier: null,
+      assignedCourierId: null,
+      pickupDate: null,
+      pickupScheduledAt: null,
+      manifestUrl: null,
+      labelUrl: null,
+      manifestGeneratedAt: null,
+      lastPickupError: null,
+      lastSyncAt: new Date(),
+      lastSyncSource: 'admin_cancel_shipment_clear',
+      providerStatus: si.providerStatus || 'cancelled_on_shiprocket'
+    };
+    fresh.markModified('shipmentInfo');
+    await fresh.save();
+    fresh = await Order.findOne({ orderId: order.orderId });
+  }
+
+  if (fresh) {
+    await evaluateAndPersistShipmentOps(fresh, { source: 'admin_cancel_shipment' });
+  }
+  return fresh;
 }
 
 /**
@@ -1029,6 +1088,7 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'shipNow', res)) return;
     const courierId = req.body?.courierId != null ? Number(req.body.courierId) : null;
     const assignRes = await runAssignShipFromOrder(order, courierId);
     if (!assignRes.success) {
@@ -1073,7 +1133,9 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
     }
     const synced = await syncShipmentFromShiprocket(order, 'admin_manual_sync');
     const repaired = await repairPickupStateAfterShiprocketSync(order, synced.snapshot);
-    const si = repaired?.shipmentInfo || {};
+    const freshOrder = repaired || (await Order.findOne({ orderId: order.orderId }));
+    const si = freshOrder?.shipmentInfo || {};
+    const shipmentOps = buildShipmentOpsView(freshOrder, { source: 'admin_manual_sync' });
     const pickupMsg = si.pickupDate
       ? `Courier pickup day updated to ${si.pickupDate} (from Shiprocket orders/show).`
       : 'Pickup is on Shiprocket but courier day could not be loaded. Confirm on Shiprocket order details, then refresh again.';
@@ -1083,7 +1145,8 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
       message: synced.success ? pickupMsg : synced.message || 'Sync completed with warnings.',
       pickupDate: si.pickupDate || null,
       pickupDateSource: synced.pickupDateSource || null,
-      order: repaired || (await Order.findOne({ orderId: order.orderId }))
+      shipmentOps,
+      order: freshOrder
     });
   } catch (error) {
     logger.error('adminFulfillmentSyncShiprocket', { message: error.message, stack: error.stack });
@@ -1104,6 +1167,7 @@ exports.adminFulfillmentSchedulePickup = async (req, res) => {
     if (!(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber)) {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB (ship) before scheduling pickup.');
     }
+    if (!requireShipmentOpsAction(order, 'schedulePickup', res)) return;
     if (isOrderPickupBookedOnShiprocket(order.shipmentInfo)) {
       await syncShipmentFromShiprocket(order, 'admin_schedule_pickup_refresh');
       const freshEarly = await Order.findOne({ orderId: order.orderId });
@@ -1172,6 +1236,7 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'downloadLabel', res)) return;
     const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
     if (!hasAwb) {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label from Shiprocket.');
@@ -1226,6 +1291,7 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'downloadLabel', res)) return;
 
     let buf;
     try {
@@ -1285,12 +1351,11 @@ exports.adminFulfillmentCancelShipment = async (req, res) => {
   try {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'cancelShipment', res)) return;
     const srOid = order.shipmentInfo?.shiprocketOrderId;
     if (!srOid) {
       return jsonError(res, 400, 'SHIPROCKET_ORDER_ID_MISSING', 'No Shiprocket order id stored; cannot cancel remotely.');
-    }
-    if (order.shipmentInfo?.pickupScheduledAt || order.shipmentInfo?.pickupDate) {
-      return jsonError(res, 409, 'PICKUP_ALREADY_SCHEDULED', 'Pickup already scheduled; cancellation may need Shiprocket support.');
     }
     if (order.orderStatus === 'shipped' || order.orderStatus === 'out_for_delivery' || order.orderStatus === 'delivered') {
       return jsonError(res, 409, 'ORDER_TOO_FAR', 'Cannot cancel shipment at this order stage.');
@@ -1303,20 +1368,81 @@ exports.adminFulfillmentCancelShipment = async (req, res) => {
       });
     }
 
-    order.shipmentInfo = {
-      ...(order.shipmentInfo || {}),
-      lastSyncAt: new Date(),
-      lastSyncSource: 'admin_cancel_shipment',
-      providerStatus: 'cancel_requested',
-      lastError: null
-    };
-    order.markModified('shipmentInfo');
-    await order.save();
+    const fresh = await finalizeShipmentAfterRemoteCancel(order);
+    const ops = fresh ? buildShipmentOpsView(fresh, { source: 'admin_cancel_shipment' }) : null;
 
-    return res.json({ success: true, message: 'Shiprocket cancel request submitted', raw: cancel.raw || null });
+    return res.json({
+      success: true,
+      message:
+        'Shipment cancelled on Shiprocket. Stale AWB/manifest data cleared — use Ship now to book again if needed.',
+      raw: cancel.raw || null,
+      order: fresh,
+      shipmentOps: ops,
+      readyForReship: Boolean(ops?.actionCapabilities?.shipNow)
+    });
   } catch (error) {
     logger.error('adminFulfillmentCancelShipment', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'FULFILLMENT_CANCEL_FAILED', error.message || 'Server error');
+  }
+};
+
+/** POST /orders/admin/items/:orderId/fulfillment/retry-pickup — Shiprocket pickup retry (status: retry) */
+exports.adminFulfillmentRetryPickup = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'retryPickup', res)) return;
+
+    const shipmentId = order.shipmentInfo?.shipmentId;
+    if (!shipmentId) {
+      return jsonError(
+        res,
+        400,
+        'SHIPMENT_ID_MISSING',
+        'No shipment_id on order. Refresh Shiprocket sync first.'
+      );
+    }
+
+    const retry = await ShiprocketService.retryPickup({ shipmentId });
+    if (!retry.success) {
+      return jsonError(res, 502, retry.code || 'PICKUP_RETRY_FAILED', retry.message || 'Pickup retry failed', {
+        details: retry.details || null
+      });
+    }
+
+    const payload = {
+      providerStatus: retry.providerStatus || 'pickup_scheduled',
+      lastPickupError: null
+    };
+    if (retry.pickupDate) {
+      payload.pickupDate = retry.pickupDate;
+      payload.pickupScheduledAt = new Date();
+    }
+
+    await applyUpsertShipmentInfo({
+      order,
+      shipmentPayload: payload,
+      trigger: 'admin_retry_pickup',
+      allowOrderStatusUpdate: false
+    });
+
+    await syncShipmentFromShiprocket(order, 'admin_retry_pickup_sync');
+    const fresh = await Order.findOne({ orderId: order.orderId });
+    const ops = fresh ? buildShipmentOpsView(fresh, { source: 'admin_retry_pickup' }) : null;
+
+    return res.json({
+      success: true,
+      message: retry.pickupDate
+        ? `Pickup retry submitted. Courier day: ${retry.pickupDate}.`
+        : 'Pickup retry submitted on Shiprocket. Refresh tracking if status does not update.',
+      pickupDate: retry.pickupDate || fresh?.shipmentInfo?.pickupDate || null,
+      order: fresh,
+      shipmentOps: ops
+    });
+  } catch (error) {
+    logger.error('adminFulfillmentRetryPickup', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'FULFILLMENT_RETRY_PICKUP_FAILED', error.message || 'Server error');
   }
 };
 
@@ -1663,6 +1789,7 @@ exports.adminFulfillmentManifest = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'generateManifest', res)) return;
     if (!(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber)) {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before generating a manifest.');
     }
@@ -1727,6 +1854,7 @@ exports.adminFulfillmentManifestFile = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+    if (!requireShipmentOpsAction(order, 'downloadManifest', res)) return;
 
     let buf;
     try {

@@ -464,6 +464,18 @@ async function upsertShipmentInfo({
     order.shipmentInfo = nextShipmentInfo;
     order.markModified('shipmentInfo');
     await order.save();
+
+    try {
+        const { evaluateAndPersistShipmentOps } = require('../services/shipmentOps');
+        await evaluateAndPersistShipmentOps(order, { source: trigger || 'upsert_shipment' });
+    } catch (opsErr) {
+        logger.warn('shipmentOps reconcile failed after upsertShipmentInfo', {
+            orderId: order.orderId,
+            trigger,
+            message: opsErr?.message || String(opsErr)
+        });
+    }
+
     return true;
 }
 
@@ -2319,6 +2331,11 @@ exports.getOrder = async (req, res) => {
         };
         if (isOrderStaff) {
             payload.fulfillmentPaymentGate = evaluateOrderPaymentForShiprocketFulfillment(order);
+            const { buildShipmentOpsView } = require('../services/shipmentOps');
+            transformedOrder.shipmentOps = buildShipmentOpsView(order, {
+                fulfillmentPaymentGate: payload.fulfillmentPaymentGate,
+                source: 'get_order'
+            });
         }
 
         return res.json(payload);
@@ -2801,6 +2818,11 @@ exports.trackOrder = async (req, res) => {
             source: trackingSource,
             timeline: buildLiveTimelineFromEvents(liveTracking?.events, fallbackTimeline)
         };
+
+        if (isOrderStaffRequest(req)) {
+            const { buildShipmentOpsView } = require('../services/shipmentOps');
+            tracking.shipmentOps = buildShipmentOpsView(order, { source: 'track_order' });
+        }
 
         return res.json({
             success: true,

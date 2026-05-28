@@ -112,6 +112,12 @@ const orderSchema = new mongoose.Schema(
       createAttemptCount: { type: Number, default: 0 },
       rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] }
     },
+
+    /** Cached shipment ops view (list/detail actions + provider state classification) */
+    shipmentOps: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
     
     // For returns
     returnInfo: {

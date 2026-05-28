@@ -313,6 +313,13 @@ function mapOrderRow(order) {
     actionCapabilities: fulfillmentUi.actionCapabilities,
     primaryAction: fulfillmentUi.primaryAction,
     primaryActionLabel: fulfillmentUi.primaryActionLabel,
+    opsState: fulfillmentUi.opsState || null,
+    opsStateLabel: fulfillmentUi.opsStateLabel || null,
+    blockReasons: fulfillmentUi.blockReasons || {},
+    nextStepMessage: fulfillmentUi.nextStepMessage || null,
+    riskFlags: fulfillmentUi.riskFlags || {},
+    externalLinks: fulfillmentUi.externalLinks || {},
+    syncHealth: fulfillmentUi.syncHealth || 'unknown',
     fulfillmentPaymentGate: rowBase.fulfillmentPaymentGate
   };
 }
