@@ -69,13 +69,76 @@ function collectForwardOrderTexts(root, shipment) {
 /**
  * @param {{ statusCode?: number|null, statusLabel?: string|null, statusMessage?: string|null, texts?: string[], awbCode?: string|null, hadLocalAwb?: boolean }} input
  */
+function isForwardProgressStatus(statusLabel, statusCode) {
+  const cls = classifyForwardStatusCode(statusCode, statusLabel);
+  if (
+    cls === CLASSIFICATION.AWB_ASSIGNED ||
+    cls === CLASSIFICATION.PICKUP_SCHEDULED ||
+    cls === CLASSIFICATION.MANIFEST ||
+    cls === CLASSIFICATION.IN_TRANSIT ||
+    cls === CLASSIFICATION.OUT_FOR_DELIVERY ||
+    cls === CLASSIFICATION.DELIVERED
+  ) {
+    return true;
+  }
+  const label = normalizeText(statusLabel);
+  return /pickup generated|pickup scheduled|pickup queued|ready to ship|awb assigned|manifest|in transit|out for delivery|delivered|shipped/.test(
+    label
+  );
+}
+
+function isStaleCancelTimelineStatus(value) {
+  return /pickupcancelled|pickup cancelled|auto cancel|shipment reset on shiprocket/.test(normalizeText(value));
+}
+
+/**
+ * Drop prior-cycle cancel rows when Shiprocket already shows forward progress.
+ * @param {Array<object>|null|undefined} events
+ * @param {string|null|undefined} providerStatus
+ * @returns {Array<object>}
+ */
+function sanitizeTrackingEventsForProvider(events, providerStatus) {
+  const list = Array.isArray(events) ? [...events] : [];
+  if (list.length === 0) return list;
+  if (!isForwardProgressStatus(providerStatus, null)) return list;
+
+  const filtered = list.filter((event) => {
+    const status = event?.status || event?.description || '';
+    return !isStaleCancelTimelineStatus(status);
+  });
+
+  if (filtered.length > 0) return filtered;
+
+  return [
+    {
+      status: String(providerStatus || 'Shipment update').trim(),
+      description: null,
+      location: null,
+      at: new Date()
+    }
+  ];
+}
+
 function detectForwardOrderReset(input) {
+  const statusCode = Number(input.statusCode);
+  const label = normalizeText(input.statusLabel);
+  const hasAwb = Boolean(input.awbCode && String(input.awbCode).trim());
+
+  if (hasAwb && isForwardProgressStatus(input.statusLabel, input.statusCode)) {
+    if (!Number.isFinite(statusCode) || !CANCEL_STATUS_CODES.has(statusCode)) {
+      return { resetDetected: false, reason: null, classification: null };
+    }
+  }
+
   const texts = Array.isArray(input.texts) ? [...input.texts] : [];
-  if (input.statusLabel) texts.push(normalizeText(input.statusLabel));
+  if (input.statusLabel) texts.push(label);
   if (input.statusMessage) texts.push(normalizeText(input.statusMessage));
 
   const classification = classifySignalTexts(texts);
   if (classification === CLASSIFICATION.PROVIDER_RESET) {
+    if (hasAwb && isForwardProgressStatus(input.statusLabel, input.statusCode)) {
+      return { resetDetected: false, reason: null, classification: null };
+    }
     return {
       resetDetected: true,
       reason: input.statusMessage || input.statusLabel || 'Shipment reset on Shiprocket',
@@ -83,7 +146,6 @@ function detectForwardOrderReset(input) {
     };
   }
 
-  const statusCode = Number(input.statusCode);
   if (Number.isFinite(statusCode) && CANCEL_STATUS_CODES.has(statusCode)) {
     return {
       resetDetected: true,
@@ -93,7 +155,6 @@ function detectForwardOrderReset(input) {
   }
 
   const combined = texts.join(' ');
-  const label = normalizeText(input.statusLabel);
 
   if (
     /^new$/.test(label) &&
@@ -187,6 +248,9 @@ module.exports = {
   collectForwardOrderTexts,
   detectForwardOrderReset,
   classifyForwardStatusCode,
+  isForwardProgressStatus,
+  isStaleCancelTimelineStatus,
+  sanitizeTrackingEventsForProvider,
   mapProviderStatusToOrderStatus,
   isProviderStatusInTransit
 };

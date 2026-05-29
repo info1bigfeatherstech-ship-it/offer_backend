@@ -67,7 +67,8 @@ function testListUiPickupScheduled() {
       providerStatus: 'PICKUP SCHEDULED'
     }
   });
-  assert.strictEqual(ui.courierOpsLine1, 'Pickup scheduled');
+  assert.strictEqual(ui.courierOpsLine1, 'PICKUP SCHEDULED');
+  assert.match(String(ui.courierOpsLine2 || ''), /For 18 May 2026/);
   assert.strictEqual(ui.primaryAction, 'generateManifest');
 }
 
@@ -159,6 +160,32 @@ function testAwbAssignedIgnoresStalePickupDate() {
   assert.strictEqual(view.actionCapabilities.downloadLabel, false);
 }
 
+function testPickupScheduledWithLabelStillNeedsManifest() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Xpressbees Surface',
+      pickupDate: '2026-05-30',
+      pickupScheduledAt: new Date('2026-05-29'),
+      providerStatus: 'Pickup Generated',
+      providerSnapshot: { pickupScheduled: true, statusLabel: 'PICKUP SCHEDULED' },
+      labelUrl: 'https://example.com/label.pdf',
+      manifestUrl: null
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.PICKUP_SCHEDULED);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.primaryAction, 'generateManifest');
+  assert.strictEqual(view.actionCapabilities.downloadLabel, false);
+  assert.strictEqual(view.actionCapabilities.schedulePickup, false);
+  assert.match(String(view.courierOpsLine1), /pickup scheduled/i);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -166,6 +193,7 @@ function run() {
   testAutoCancelMessageClassification();
   testAwbAssignedStaysProcessing();
   testAwbAssignedIgnoresStalePickupDate();
+  testPickupScheduledWithLabelStillNeedsManifest();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');

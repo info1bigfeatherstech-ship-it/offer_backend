@@ -8,7 +8,10 @@ const ShiprocketService = require('../utils/shiprocket');
 const { evaluateAndPersistShipmentOps, buildShipmentOpsView } = require('./shipmentOps');
 const {
   collectForwardOrderTexts,
-  detectForwardOrderReset
+  detectForwardOrderReset,
+  classifyForwardStatusCode,
+  isForwardProgressStatus,
+  sanitizeTrackingEventsForProvider
 } = require('./shipmentOps/shiprocketStatusMap');
 
 /**
@@ -92,6 +95,15 @@ function buildPayloadFromSnapshot(snapshot, order) {
     awbCode: snapshot.awbCode,
     hadLocalAwb
   });
+
+  if (
+    reset.resetDetected &&
+    snapshot.awbCode &&
+    isForwardProgressStatus(snapshot.providerStatus, snapshot.statusCode)
+  ) {
+    reset.resetDetected = false;
+    reset.reason = null;
+  }
 
   if (reset.resetDetected) {
     return {
@@ -314,11 +326,18 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
             trigger: `${source}_tracking_reset`
           });
         } else {
+          const providerStatus =
+            trackingResult.currentStatus || order.shipmentInfo?.providerStatus || null;
+          const sanitizedEvents = sanitizeTrackingEventsForProvider(
+            trackingResult.events,
+            providerStatus
+          );
           await applyUpsertShipmentInfo({
             order,
             shipmentPayload: {
               ...trackingResult,
-              providerStatus: trackingResult.currentStatus || order.shipmentInfo?.providerStatus
+              events: sanitizedEvents,
+              providerStatus
             },
             trigger: `${source}_tracking`,
             allowOrderStatusUpdate
@@ -371,11 +390,81 @@ function detectResetFromWebhookPayload(payload, order) {
   });
 }
 
+/**
+ * Align local pickup fields with Shiprocket before scheduling pickup.
+ * Clears stale pickupDate from cancelled/re-shipped cycles when SR still shows AWB / Ready to ship.
+ * @param {import('mongoose').Document} order
+ * @param {string} [trigger]
+ */
+async function ensureForwardPickupStateForSchedule(order, trigger) {
+  const { applyUpsertShipmentInfo } = require('../controllers/order.controller');
+  const { CLASSIFICATION } = require('./shipmentOps/normalizeProviderSignals');
+  const si = order?.shipmentInfo || {};
+  const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
+    shiprocketOrderId: si.shiprocketOrderId,
+    channelOrderId: order.orderId
+  });
+  const snap = lookup.success ? lookup.snapshot : null;
+  const forwardClass = classifyForwardStatusCode(snap?.statusCode, snap?.providerStatus);
+  const awbOnlyOnShiprocket =
+    forwardClass === CLASSIFICATION.AWB_ASSIGNED ||
+    /awb\s*assigned|ready\s*to\s*ship/i.test(String(snap?.providerStatus || ''));
+
+  if (snap?.pickupScheduled === true && !awbOnlyOnShiprocket) {
+    const pickupDate = snap.pickupDate || null;
+    if (pickupDate) {
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          pickupDate,
+          pickupScheduledAt: si.pickupScheduledAt || new Date(),
+          lastPickupError: null,
+          providerStatus: snap.providerStatus || si.providerStatus
+        },
+        trigger: trigger || 'pickup_state_sync',
+        allowOrderStatusUpdate: false
+      });
+    }
+    return { booked: true, pickupDate, snapshot: snap, cleared: false };
+  }
+
+  let freshOrder = await Order.findOne({ orderId: order.orderId });
+  if (!freshOrder) return { booked: false, snapshot: snap, cleared: false };
+
+  const fsi = freshOrder.shipmentInfo || {};
+  const hasStale = Boolean(
+    fsi.pickupDate ||
+      fsi.pickupScheduledAt ||
+      ShiprocketService.isPickupAlreadyScheduledMessage(fsi.lastPickupError)
+  );
+
+  if (hasStale || snap?.pickupScheduled === false || awbOnlyOnShiprocket) {
+    await applyUpsertShipmentInfo({
+      order: freshOrder,
+      shipmentPayload: {
+        pickupDate: null,
+        pickupScheduledAt: null,
+        lastPickupError: null,
+        providerSnapshot: snap?.providerSnapshot || fsi.providerSnapshot || null
+      },
+      trigger: trigger || 'clear_stale_pickup_before_schedule',
+      allowOrderStatusUpdate: false
+    });
+    await evaluateAndPersistShipmentOps(freshOrder, {
+      source: trigger || 'clear_stale_pickup_before_schedule'
+    });
+    return { booked: false, snapshot: snap, cleared: true };
+  }
+
+  return { booked: false, snapshot: snap, cleared: false };
+}
+
 module.exports = {
   applyLocalShipmentReset,
   buildPayloadFromSnapshot,
   persistPickupDateFromSnapshot,
   reconcileOrderFromShiprocket,
   detectResetFromWebhookPayload,
-  detectForwardOrderReset
+  detectForwardOrderReset,
+  ensureForwardPickupStateForSchedule
 };

@@ -87,11 +87,12 @@ function buildCourierOpsDisplay({ opsState, order }) {
         line2: providerStatus || 'Sync required',
       };
     case OPS_STATES.PICKUP_SCHEDULED: {
+      const mirrorLabel = /pickup scheduled/i.test(providerStatus) ? providerStatus : 'PICKUP SCHEDULED';
       const parts = [];
-      if (pickupDate) parts.push(formatPickupDateHuman(pickupDate));
+      if (pickupDate) parts.push(`For ${formatPickupDateHuman(pickupDate)}`);
       if (courier) parts.push(courier);
       if (!pickupDate && awb) parts.push(`AWB ${maskAwb(awb)}`);
-      return { line1: 'Pickup scheduled', line2: parts.length ? parts.join(' · ') : null };
+      return { line1: mirrorLabel, line2: parts.length ? parts.join(' · ') : null };
     }
     case OPS_STATES.MANIFEST_READY:
       return { line1: 'Manifest ready', line2: courier || null };

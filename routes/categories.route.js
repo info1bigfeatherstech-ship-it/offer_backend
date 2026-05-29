@@ -7,6 +7,7 @@ const categoryController = require('../controllers/category.controller');
 
 // Public category endpoints
 router.get('/categories', categoryController.getAllCategories);
+router.get('/admin/categories',  categoryController.getAdminAllCategories);
 router.get('/categories/:id', categoryController.getCategoryById);
 
 // Admin routes for reordering and visibility

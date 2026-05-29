@@ -877,8 +877,10 @@ class ShiprocketService {
 
     const {
       collectForwardOrderTexts,
-      detectForwardOrderReset
+      detectForwardOrderReset,
+      classifyForwardStatusCode
     } = require('../services/shipmentOps/shiprocketStatusMap');
+    const { CLASSIFICATION } = require('../services/shipmentOps/normalizeProviderSignals');
     const signalTexts = collectForwardOrderTexts(root, sh0);
     const statusMessage = [
       root.status_message,
@@ -903,16 +905,43 @@ class ShiprocketService {
       hadLocalAwb: false
     });
 
-    const pickupScheduled =
-      Boolean(pickupDate) ||
-      statusCode === 4 ||
-      statusCode === 12 ||
-      statusCode === 13 ||
-      statusCode === 14 ||
-      statusCode === 15 ||
-      /pickup\s*scheduled|pickup\s*queued|in\s+pickup\s+queue|manifested/i.test(statusLabel);
+    const forwardClass = classifyForwardStatusCode(
+      Number.isFinite(statusCode) ? statusCode : null,
+      statusLabel
+    );
 
-    const providerStatus = statusLabel || (pickupScheduled ? 'pickup_scheduled' : null);
+    let effectivePickupDate = pickupDate;
+    let pickupScheduled;
+
+    if (
+      forwardClass === CLASSIFICATION.PICKUP_SCHEDULED ||
+      forwardClass === CLASSIFICATION.MANIFEST
+    ) {
+      pickupScheduled = true;
+    } else if (
+      forwardClass === CLASSIFICATION.AWB_ASSIGNED ||
+      forwardClass === CLASSIFICATION.PROVIDER_RESET ||
+      resetInfo.resetDetected
+    ) {
+      // Re-shipped after auto-cancel: orders/show may retain stale pickup fields from the prior cycle.
+      pickupScheduled = false;
+      effectivePickupDate = null;
+    } else {
+      pickupScheduled =
+        Boolean(pickupDate) ||
+        statusCode === 4 ||
+        statusCode === 12 ||
+        statusCode === 13 ||
+        statusCode === 14 ||
+        statusCode === 15 ||
+        /pickup\s*scheduled|pickup\s*queued|in\s+pickup\s+queue|manifested/i.test(statusLabel);
+    }
+
+    const providerStatus = ShiprocketService.resolveMirrorProviderStatusFromOrderShow(root, {
+      pickupScheduled,
+      pickupDate: effectivePickupDate,
+      statusLabel
+    });
 
     const providerSnapshot = {
       statusCode: Number.isFinite(statusCode) ? statusCode : null,
@@ -940,7 +969,7 @@ class ShiprocketService {
       courier: courier != null && String(courier).trim() ? String(courier).trim() : null,
       labelUrl: labelUrl != null && String(labelUrl).trim() ? String(labelUrl).trim() : null,
       manifestUrl: manifestUrl != null && String(manifestUrl).trim() ? String(manifestUrl).trim() : null,
-      pickupDate,
+      pickupDate: effectivePickupDate,
       pickupScheduled,
       providerStatus,
       statusCode: Number.isFinite(statusCode) ? statusCode : null,
@@ -970,6 +999,32 @@ class ShiprocketService {
   /** Parse "For 18 May 2026" from Shiprocket panel copy — explicit pattern only. */
   static parsePickupDateFromHumanText(value) {
     return ShiprocketService.parseShiprocketDateToken(value);
+  }
+
+  /**
+   * Match Shiprocket seller panel status column (not internal AWB sub-status like "Pickup Generated").
+   * @param {object|null|undefined} root
+   * @param {{ pickupScheduled?: boolean, pickupDate?: string|null, statusLabel?: string|null }} [opts]
+   */
+  static resolveMirrorProviderStatusFromOrderShow(root, opts = {}) {
+    const pickupScheduled = Boolean(opts.pickupScheduled);
+    const pickupDate = opts.pickupDate ? String(opts.pickupDate).trim() : '';
+    const statusLabel = String(opts.statusLabel || '').trim();
+    const sh0 = root && typeof root === 'object' ? ShiprocketService.getPrimaryShipment(root) || {} : {};
+    const pickupStatusText = [root?.pickup_status, sh0?.pickup_status]
+      .filter(Boolean)
+      .map((x) => String(x).trim())
+      .join(' ');
+
+    if (pickupScheduled) {
+      if (/pickup\s*scheduled/i.test(pickupStatusText)) {
+        return /pickup\s*scheduled/i.test(statusLabel) ? statusLabel : 'PICKUP SCHEDULED';
+      }
+      if (/pickup\s*scheduled/i.test(statusLabel)) return statusLabel;
+      if (pickupDate) return 'PICKUP SCHEDULED';
+    }
+
+    return statusLabel || (pickupScheduled ? 'PICKUP SCHEDULED' : null);
   }
 
   /**
@@ -1744,13 +1799,15 @@ class ShiprocketService {
       if (!sid && lookup.snapshot.shipmentId) {
         sid = this.parseNumericShipmentId(lookup.snapshot.shipmentId);
       }
-      const fromShow =
-        lookup.snapshot.pickupDate ||
-        (lookup.raw
-          ? ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(lookup.raw)
-          : null);
-      if (fromShow && ShiprocketService.isPlausibleCourierPickupYmd(fromShow)) {
-        return { success: true, pickupDate: fromShow, source: 'orders_show', shipmentId: sid };
+      if (lookup.snapshot.pickupScheduled === true) {
+        const fromShow =
+          lookup.snapshot.pickupDate ||
+          (lookup.raw
+            ? ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(lookup.raw)
+            : null);
+        if (fromShow && ShiprocketService.isPlausibleCourierPickupYmd(fromShow)) {
+          return { success: true, pickupDate: fromShow, source: 'orders_show', shipmentId: sid };
+        }
       }
       if (lookup.snapshot.pickupScheduled === false || allowPickupListFallback === false) {
         return {

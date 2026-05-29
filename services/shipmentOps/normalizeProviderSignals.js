@@ -40,9 +40,20 @@ function collectSignalTexts(input) {
   push(input?.providerStatus);
 
   const events = Array.isArray(input?.rawEvents) ? input.rawEvents : [];
+  const providerForward = input?.providerStatus
+    ? classifySignalTexts([normalizeText(input.providerStatus)])
+    : CLASSIFICATION.UNKNOWN;
   for (const event of events) {
-    push(event?.status);
-    push(event?.description);
+    const statusText = event?.status || event?.description;
+    if (
+      (providerForward === CLASSIFICATION.PICKUP_SCHEDULED ||
+        providerForward === CLASSIFICATION.AWB_ASSIGNED ||
+        providerForward === CLASSIFICATION.MANIFEST) &&
+      /pickupcancelled|pickup cancelled|auto cancel|shipment reset on shiprocket/.test(normalizeText(statusText))
+    ) {
+      continue;
+    }
+    push(statusText);
     push(event?.message);
   }
 

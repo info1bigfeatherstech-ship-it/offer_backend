@@ -119,7 +119,8 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       caps.generateManifest =
         awb && shipmentId && artifactsValid && !terminal && !inTransit && st !== 'delivered';
       caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
-      caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
+      caps.downloadLabel =
+        awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
       caps.syncShiprocket = shiprocket && !terminal;
       caps.refreshTracking = awb;
       caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
@@ -252,7 +253,7 @@ function buildNextStepMessage(opsState, blockReasons, primaryAction) {
         ? 'Assign courier and AWB on Shiprocket (Ship now).'
         : 'Complete payment or approval before shipping.';
     case OPS_STATES.PICKUP_SCHEDULED:
-      return 'Pickup is booked. Generate manifest, then download label.';
+      return 'Pickup booked on Shiprocket. Generate manifest next (same as Shiprocket panel).';
     case OPS_STATES.AWB_ASSIGNED:
       return 'AWB assigned. Schedule pickup on Shiprocket.';
     default:

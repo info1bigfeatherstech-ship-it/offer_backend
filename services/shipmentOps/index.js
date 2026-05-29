@@ -50,6 +50,13 @@ function buildShipmentOpsView(orderInput, options = {}) {
   });
   const courierOps = buildCourierOpsDisplay({ opsState, order });
   const externalLinks = buildExternalLinks(order);
+  let primaryActionLabel = policy.primaryActionLabel;
+  if (
+    policy.primaryAction === ACTION_KEYS.generateManifest &&
+    opsState === OPS_STATES.PICKUP_SCHEDULED
+  ) {
+    primaryActionLabel = 'Download manifest';
+  }
 
   return {
     opsState,
@@ -58,7 +65,7 @@ function buildShipmentOpsView(orderInput, options = {}) {
     courierOpsLine1: courierOps.line1,
     courierOpsLine2: courierOps.line2,
     primaryAction: policy.primaryAction,
-    primaryActionLabel: policy.primaryActionLabel,
+    primaryActionLabel,
     actionCapabilities: policy.actionCapabilities,
     blockReasons: policy.blockReasons,
     nextStepMessage: policy.nextStepMessage,

@@ -141,7 +141,8 @@ function computeOpsState(order) {
     const hasManifest = artifactsValid && Boolean(si.manifestUrl);
     const hasLabel = artifactsValid && Boolean(si.labelUrl);
 
-    if (hasLabel) return OPS_STATES.LABEL_READY;
+    // Shiprocket: AWB often creates label early — manifest is still the next panel step.
+    if (hasManifest && hasLabel) return OPS_STATES.LABEL_READY;
     if (hasManifest) return OPS_STATES.MANIFEST_READY;
     return OPS_STATES.PICKUP_SCHEDULED;
   }

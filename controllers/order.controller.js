@@ -2825,13 +2825,20 @@ function enrichPreTransitTrackingTimeline(timeline, orderDoc) {
 
     const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
     const { OPS_STATES } = require('../services/shipmentOps/constants');
+    const {
+        isStaleCancelTimelineStatus,
+        isForwardProgressStatus
+    } = require('../services/shipmentOps/shiprocketStatusMap');
     const opsState = computeOpsState(orderDoc);
-    const preTransit = [
-        OPS_STATES.AWB_ASSIGNED,
-        OPS_STATES.READY_TO_SHIP,
-        OPS_STATES.PICKUP_SCHEDULED
+    const preInTransit = ![
+        OPS_STATES.IN_TRANSIT,
+        OPS_STATES.OUT_FOR_DELIVERY,
+        OPS_STATES.DELIVERED,
+        OPS_STATES.CANCELLED,
+        OPS_STATES.PROVIDER_RESET,
+        OPS_STATES.PAYMENT_FAILED
     ].includes(opsState);
-    if (!preTransit) return timeline;
+    if (!preInTransit) return timeline;
 
     const si = orderDoc.shipmentInfo || {};
     const providerStatus = String(si.providerStatus || '').trim();
@@ -2848,12 +2855,18 @@ function enrichPreTransitTrackingTimeline(timeline, orderDoc) {
     const hasCurrentStatus = timeline.some((event) => norm(event.status) === providerNorm);
     const onlyStaleCancel =
         timeline.length > 0 &&
-        timeline.every((event) => /pickupcancelled|pickup cancelled|auto cancel/.test(norm(event.status)));
+        timeline.every((event) => isStaleCancelTimelineStatus(event.status || event.description));
 
-    if (hasCurrentStatus && !onlyStaleCancel) return timeline;
+    if (hasCurrentStatus && !onlyStaleCancel) {
+        return timeline.filter((event) => !isStaleCancelTimelineStatus(event.status || event.description));
+    }
+
+    if (!isForwardProgressStatus(providerStatus, si.providerSnapshot?.statusCode)) {
+        return timeline;
+    }
 
     const filtered = timeline.filter(
-        (event) => !/pickupcancelled|pickup cancelled/.test(norm(event.status))
+        (event) => !isStaleCancelTimelineStatus(event.status || event.description)
     );
     const currentEvent = {
         status: providerStatus,
@@ -2907,7 +2920,14 @@ exports.trackOrder = async (req, res) => {
                     shipmentId: trackShipmentId
                 });
                 if (trackingResult?.success) {
-                    liveTracking = trackingResult;
+                    const { sanitizeTrackingEventsForProvider } = require('../services/shipmentOps/shiprocketStatusMap');
+                    const providerStatus =
+                        trackingResult.currentStatus || orderDoc.shipmentInfo?.providerStatus || null;
+                    liveTracking = {
+                        ...trackingResult,
+                        events: sanitizeTrackingEventsForProvider(trackingResult.events, providerStatus),
+                        currentStatus: providerStatus || trackingResult.currentStatus
+                    };
                 } else if (trackingResult?.message) {
                     logger.warn('Live tracking fallback to internal timeline', {
                         orderId: orderDoc.orderId,
