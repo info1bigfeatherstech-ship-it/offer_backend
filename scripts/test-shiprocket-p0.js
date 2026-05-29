@@ -253,12 +253,28 @@ function testBuildPickupCalendarBlocksSunday() {
   assert.ok(sundays.every((d) => d.allowed === false));
 }
 
+function testExtractForwardOrderAutoCancelSnapshot() {
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    status: 'NEW',
+    status_message: 'Shipment auto-cancelled due to no pickup done in 10 days from pickup generated date',
+    shipments: {
+      id: 1346591722,
+      awb: '',
+      status: 'NEW'
+    }
+  });
+  assert.strictEqual(snap.resetDetected, true);
+  assert.ok(/auto[- ]?cancel/i.test(String(snap.resetReason || snap.statusMessage || '')));
+}
+
 function run() {
   testNormalizeYmdDate();
   testCourierPickupDateGuards();
   testOrdersShowShipmentObjectShape();
   testInstanceDelegatesUsedByControllers();
   testExtractForwardOrderSnapshot();
+  testExtractForwardOrderAutoCancelSnapshot();
   testPickupAlreadyScheduledMessage();
   testParsePickupDateFromScheduleResponse();
   testParseNumericShiprocketOrderId();

@@ -80,9 +80,92 @@ function testAwaitingApproval() {
   assert.strictEqual(view.actionCapabilities.accept, false);
 }
 
+function testProviderResetFromSnapshot() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: 'AWBOLD',
+      providerStatus: 'Pickup Generated',
+      providerSnapshot: {
+        resetDetected: true,
+        resetReason: 'Shipment auto-cancelled due to no pickup done in 10 days',
+        statusLabel: 'NEW'
+      }
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.PROVIDER_RESET);
+}
+
+function testAutoCancelMessageClassification() {
+  const { detectForwardOrderReset } = require('../services/shiprocketReconcile.service');
+  const reset = detectForwardOrderReset({
+    statusLabel: 'NEW',
+    statusMessage: 'Shipment auto-cancelled due to no pickup done in 10 days',
+    texts: ['shipment auto cancelled due to no pickup done in 10 days'],
+    awbCode: null,
+    hadLocalAwb: true
+  });
+  assert.strictEqual(reset.resetDetected, true);
+}
+
+function testAwbAssignedStaysProcessing() {
+  const { mapProviderStatusToOrderStatus } = require('../services/shipmentOps/shiprocketStatusMap');
+  assert.strictEqual(mapProviderStatusToOrderStatus('AWB Assigned'), 'processing');
+  assert.strictEqual(mapProviderStatusToOrderStatus('Ready To Ship'), 'processing');
+  assert.strictEqual(mapProviderStatusToOrderStatus('In Transit'), 'shipped');
+
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Xpressbees Surface',
+      providerStatus: 'AWB Assigned',
+      labelUrl: 'https://example.com/label.pdf',
+      rawEvents: [{ status: 'PickupCancelled', description: 'PickupCancelled', at: new Date() }]
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.AWB_ASSIGNED);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.primaryAction, 'schedulePickup');
+  assert.strictEqual(view.courierOpsLine1, 'AWB assigned');
+}
+
+function testAwbAssignedIgnoresStalePickupDate() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Xpressbees Surface',
+      pickupDate: '2026-05-18',
+      pickupScheduledAt: new Date('2026-05-18'),
+      providerStatus: 'AWB Assigned',
+      providerSnapshot: { pickupScheduled: false, statusLabel: 'AWB Assigned' },
+      labelUrl: 'https://example.com/label.pdf',
+      rawEvents: [{ status: 'PickupCancelled', description: 'PickupCancelled', at: new Date() }]
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.AWB_ASSIGNED);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.primaryAction, 'schedulePickup');
+  assert.strictEqual(view.actionCapabilities.schedulePickup, true);
+  assert.strictEqual(view.actionCapabilities.downloadLabel, false);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
+  testProviderResetFromSnapshot();
+  testAutoCancelMessageClassification();
+  testAwbAssignedStaysProcessing();
+  testAwbAssignedIgnoresStalePickupDate();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');

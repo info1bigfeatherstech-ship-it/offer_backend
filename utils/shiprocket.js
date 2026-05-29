@@ -221,11 +221,31 @@ class ShiprocketService {
         };
       }
 
-      const best = list.reduce((a, b) => {
-        const ra = Number(a.rate) || Number(a.freight_charge) || Infinity;
-        const rb = Number(b.rate) || Number(b.freight_charge) || Infinity;
-        return rb < ra ? b : a;
-      });
+      const { filterActiveCouriers, pickCheapestActiveCourier } = require('../services/courierPolicy.service');
+      const activeList = filterActiveCouriers(list);
+      if (!activeList.length) {
+        return {
+          isDeliverable: false,
+          deliveryCharges: 0,
+          estimatedDays: null,
+          courierName: null,
+          message: 'No active courier available for this route (inactive couriers excluded)',
+          mock: false
+        };
+      }
+
+      const picked = pickCheapestActiveCourier(activeList, { codRequired: codAmount > 0 });
+      if (!picked) {
+        return {
+          isDeliverable: false,
+          deliveryCharges: 0,
+          estimatedDays: null,
+          courierName: null,
+          message: 'No courier available for this route',
+          mock: false
+        };
+      }
+      const best = picked.courier;
 
       const rate = Number(best.rate ?? best.freight_charge ?? best.estimated_delivery_days) || 0;
       const days =
@@ -233,20 +253,13 @@ class ShiprocketService {
           ? String(best.estimated_delivery_days)
           : best.etd || '3–5';
 
-      const companyIdRaw =
-        best.courier_company_id ??
-        best.courier_id ??
-        best.company_id ??
-        best.id ??
-        null;
-      const companyId =
-        companyIdRaw != null && Number.isFinite(Number(companyIdRaw)) ? Number(companyIdRaw) : null;
+      const companyId = picked.courierCompanyId;
 
       return {
         isDeliverable: true,
         deliveryCharges: Math.max(0, rate),
         estimatedDays: days,
-        courierName: best.courier_name || best.airline_name || 'Courier',
+        courierName: picked.courierName,
         courierCompanyId: companyId,
         codAvailable:
           best.cod === 1 ||
@@ -842,10 +855,17 @@ class ShiprocketService {
     const courier =
       root.courier_name ?? sh0.courier_name ?? sh0.courier ?? root.courier ?? null;
     const labelUrl = root.label_url ?? sh0.label_url ?? null;
+    const manifestUrl =
+      root.manifest_url ??
+      sh0.manifest_url ??
+      root.manifest ??
+      sh0.manifest ??
+      null;
 
     const pickupDate = ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(root);
 
-    const statusCode = Number(root.status_code ?? root.current_status_id ?? sh0.status ?? NaN);
+    const statusCodeRaw = root.status_code ?? root.current_status_id ?? sh0.status ?? sh0.status_code;
+    const statusCode = Number(statusCodeRaw);
     const statusLabel = String(
       root.status ??
         root.shipment_status ??
@@ -854,6 +874,35 @@ class ShiprocketService {
         root.sr_status_label ??
         ''
     ).trim();
+
+    const {
+      collectForwardOrderTexts,
+      detectForwardOrderReset
+    } = require('../services/shipmentOps/shiprocketStatusMap');
+    const signalTexts = collectForwardOrderTexts(root, sh0);
+    const statusMessage = [
+      root.status_message,
+      root.message,
+      root.comment,
+      root.remark,
+      sh0.status_message,
+      sh0.message,
+      sh0.comment,
+      sh0.remark
+    ]
+      .map((x) => (x != null ? String(x).trim() : ''))
+      .filter(Boolean)
+      .join(' · ');
+
+    const resetInfo = detectForwardOrderReset({
+      statusCode: Number.isFinite(statusCode) ? statusCode : null,
+      statusLabel,
+      statusMessage: statusMessage || null,
+      texts: signalTexts,
+      awbCode: awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null,
+      hadLocalAwb: false
+    });
+
     const pickupScheduled =
       Boolean(pickupDate) ||
       statusCode === 4 ||
@@ -864,6 +913,17 @@ class ShiprocketService {
       /pickup\s*scheduled|pickup\s*queued|in\s+pickup\s+queue|manifested/i.test(statusLabel);
 
     const providerStatus = statusLabel || (pickupScheduled ? 'pickup_scheduled' : null);
+
+    const providerSnapshot = {
+      statusCode: Number.isFinite(statusCode) ? statusCode : null,
+      statusLabel: providerStatus,
+      statusMessage: statusMessage || null,
+      awbCode: awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null,
+      pickupScheduled,
+      resetDetected: resetInfo.resetDetected,
+      resetReason: resetInfo.reason,
+      syncedAt: new Date().toISOString()
+    };
 
     return {
       shiprocketOrderId:
@@ -879,9 +939,16 @@ class ShiprocketService {
           : null,
       courier: courier != null && String(courier).trim() ? String(courier).trim() : null,
       labelUrl: labelUrl != null && String(labelUrl).trim() ? String(labelUrl).trim() : null,
+      manifestUrl: manifestUrl != null && String(manifestUrl).trim() ? String(manifestUrl).trim() : null,
       pickupDate,
       pickupScheduled,
       providerStatus,
+      statusCode: Number.isFinite(statusCode) ? statusCode : null,
+      statusMessage: statusMessage || null,
+      signalTexts,
+      resetDetected: resetInfo.resetDetected,
+      resetReason: resetInfo.reason,
+      providerSnapshot,
       raw: root
     };
   }
@@ -1022,30 +1089,9 @@ class ShiprocketService {
    * Pick recommended courier_id: cheapest rate among COD-eligible (if COD) else all; tie-break by faster ETD.
    */
   pickRecommendedCourierId(couriers, { codRequired }) {
-    if (!Array.isArray(couriers) || couriers.length === 0) return null;
-    const needCod = Boolean(codRequired);
-    const filtered = needCod
-      ? couriers.filter(
-          (c) =>
-            c.cod === 1 ||
-            c.cod === true ||
-            c.is_cod_available === 1 ||
-            c.is_cod_available === true
-        )
-      : couriers;
-    const pool = filtered.length ? filtered : couriers;
-    const scored = pool.map((c) => {
-      const rate = Number(c.rate ?? c.freight_charge ?? Infinity);
-      const etd = Number(c.estimated_delivery_days ?? c.etd ?? c.etd_hours ?? 999);
-      return { c, rate: Number.isFinite(rate) ? rate : Infinity, etd: Number.isFinite(etd) ? etd : 999 };
-    });
-    scored.sort((a, b) => {
-      if (a.rate !== b.rate) return a.rate - b.rate;
-      return a.etd - b.etd;
-    });
-    const top = scored[0]?.c;
-    const cid = top?.courier_company_id;
-    return cid != null ? Number(cid) : null;
+    const { pickCheapestActiveCourier } = require('../services/courierPolicy.service');
+    const picked = pickCheapestActiveCourier(couriers, { codRequired });
+    return picked?.courierCompanyId ?? null;
   }
 
   /**
@@ -1683,7 +1729,12 @@ class ShiprocketService {
    * Authoritative courier pickup day — Shiprocket panel is source of truth (never admin UI date).
    * Priority: GET orders/show (pickup_scheduled_date) → pickup list API when available.
    */
-  async resolveAuthoritativePickupDate({ shipmentId, shiprocketOrderId, channelOrderId } = {}) {
+  async resolveAuthoritativePickupDate({
+    shipmentId,
+    shiprocketOrderId,
+    channelOrderId,
+    allowPickupListFallback = true
+  } = {}) {
     let sid = this.parseNumericShipmentId(shipmentId);
     const oid = this.parseNumericShiprocketOrderId(shiprocketOrderId);
     const cid = channelOrderId != null ? String(channelOrderId).trim() : '';
@@ -1700,6 +1751,14 @@ class ShiprocketService {
           : null);
       if (fromShow && ShiprocketService.isPlausibleCourierPickupYmd(fromShow)) {
         return { success: true, pickupDate: fromShow, source: 'orders_show', shipmentId: sid };
+      }
+      if (lookup.snapshot.pickupScheduled === false || allowPickupListFallback === false) {
+        return {
+          success: false,
+          pickupDate: null,
+          source: 'orders_show_no_pickup',
+          shipmentId: sid
+        };
       }
     }
 

@@ -10,6 +10,11 @@ const {
   isProductListedOnStorefront,
   isVariantListedOnStorefront
 } = require('../utils/storefrontCatalog');
+const {
+  resolveCartItemProductId,
+  resolveCartItemVariantId,
+  loadProductForCartItem
+} = require('./cartSanitize.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -126,14 +131,29 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
   const orderItems = [];
 
   for (const cartItem of cart.items) {
-    let pq = Product.findById(cartItem.productId).select(
+    const productId = resolveCartItemProductId(cartItem);
+    const variantId = resolveCartItemVariantId(cartItem);
+    if (!productId) {
+      const err = new Error('Product not available');
+      err.statusCode = 404;
+      err.code = 'CART_LINE_INVALID';
+      throw err;
+    }
+
+    let pq = Product.findById(productId).select(
       'name slug variants shipping hsnCode gstRate isFragile status channelStatus'
     );
     if (session) pq = pq.session(session);
-    const product = await pq;
+    let product = await pq;
+
+    if (!product) {
+      product = await loadProductForCartItem(cartItem, storefront);
+    }
+
     if (!product) {
       const err = new Error('Product not available');
       err.statusCode = 404;
+      err.code = 'PRODUCT_NOT_FOUND';
       throw err;
     }
 
@@ -144,7 +164,7 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
       throw err;
     }
 
-    const variant = findVariant(product, cartItem.variantId);
+    const variant = findVariant(product, variantId || cartItem.variantId);
     if (!variant || !isVariantListedOnStorefront(variant, storefront)) {
       const err = new Error('Variant not found');
       err.statusCode = 404;

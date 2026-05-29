@@ -79,7 +79,7 @@ function buildCourierOpsDisplay({ opsState, order }) {
     case OPS_STATES.PROVIDER_RESET:
       return {
         line1: 'Shipment reset on Shiprocket',
-        line2: providerStatus || 'Use Ship now after refresh',
+        line2: si.providerSnapshot?.resetReason || providerStatus || 'Refresh sync, then Ship now',
       };
     case OPS_STATES.NEEDS_MANUAL_REVIEW:
       return {
@@ -101,7 +101,8 @@ function buildCourierOpsDisplay({ opsState, order }) {
       const parts = [];
       if (courier) parts.push(courier);
       if (awb) parts.push(`AWB ${maskAwb(awb)}`);
-      return { line1: 'AWB assigned', line2: parts.length ? parts.join(' · ') : null };
+      const line1 = /ready to ship/i.test(providerStatus) ? 'Ready to ship' : 'AWB assigned';
+      return { line1, line2: parts.length ? parts.join(' · ') : null };
     }
     case OPS_STATES.IN_TRANSIT:
       return {

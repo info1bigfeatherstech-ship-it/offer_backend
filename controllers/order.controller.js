@@ -341,32 +341,8 @@ function normalizeTerminalUnpaidFinancials(orderLike) {
 }
 
 function mapExternalShipmentStatusToOrderStatus(rawStatus) {
-    const status = String(rawStatus || '').trim().toLowerCase();
-    if (!status) return null;
-
-    // Guard: "created" states are NOT shipped.
-    if (['shipment_created', 'order_created', 'created', 'new'].includes(status)) return null;
-
-    // Avoid overly-broad "ship" substring matching (e.g. "shipment_created").
-    const shippedKeywords = [
-        'shipped',
-        'picked up',
-        'manifest',
-        'awb assigned',
-        'awb_assigned',
-        'in transit',
-        'transit',
-        'booked'
-    ];
-    const outForDeliveryKeywords = ['out for delivery', 'ofd'];
-    const deliveredKeywords = ['deliver', 'completed'];
-    const cancelledKeywords = ['cancel', 'undelivered', 'rto', 'return to origin', 'reverse'];
-
-    if (deliveredKeywords.some((keyword) => status.includes(keyword))) return 'delivered';
-    if (outForDeliveryKeywords.some((keyword) => status.includes(keyword))) return 'out_for_delivery';
-    if (cancelledKeywords.some((keyword) => status.includes(keyword))) return 'cancelled';
-    if (shippedKeywords.some((keyword) => status.includes(keyword))) return 'shipped';
-    return null;
+    const { mapProviderStatusToOrderStatus } = require('../services/shipmentOps/shiprocketStatusMap');
+    return mapProviderStatusToOrderStatus(rawStatus);
 }
 
 function normalizeShipmentEventTimestamp(value) {
@@ -386,10 +362,30 @@ async function upsertShipmentInfo({
         ...(order.shipmentInfo || {})
     };
 
-    const awbCode = shipmentPayload.awbCode || shipmentPayload.trackingNumber || null;
-    if (awbCode) {
-        nextShipmentInfo.trackingNumber = String(awbCode);
-        nextShipmentInfo.awbCode = String(awbCode);
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'awbCode')) {
+        const awbCode = shipmentPayload.awbCode;
+        if (awbCode == null || awbCode === '') {
+            nextShipmentInfo.awbCode = null;
+            nextShipmentInfo.trackingNumber = null;
+        } else {
+            nextShipmentInfo.trackingNumber = String(awbCode);
+            nextShipmentInfo.awbCode = String(awbCode);
+        }
+    } else if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'trackingNumber')) {
+        const trackingNumber = shipmentPayload.trackingNumber;
+        if (trackingNumber == null || trackingNumber === '') {
+            nextShipmentInfo.trackingNumber = null;
+            nextShipmentInfo.awbCode = null;
+        } else {
+            nextShipmentInfo.trackingNumber = String(trackingNumber);
+            nextShipmentInfo.awbCode = String(trackingNumber);
+        }
+    } else {
+        const awbCode = shipmentPayload.awbCode || shipmentPayload.trackingNumber || null;
+        if (awbCode) {
+            nextShipmentInfo.trackingNumber = String(awbCode);
+            nextShipmentInfo.awbCode = String(awbCode);
+        }
     }
     if (shipmentPayload.shipmentId != null) {
         nextShipmentInfo.shipmentId = String(shipmentPayload.shipmentId);
@@ -397,17 +393,50 @@ async function upsertShipmentInfo({
     if (shipmentPayload.shiprocketOrderId != null) {
         nextShipmentInfo.shiprocketOrderId = String(shipmentPayload.shiprocketOrderId);
     }
-    if (shipmentPayload.assignedCourierId != null) {
-        nextShipmentInfo.assignedCourierId = String(shipmentPayload.assignedCourierId);
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'assignedCourierId')) {
+        nextShipmentInfo.assignedCourierId =
+            shipmentPayload.assignedCourierId == null || shipmentPayload.assignedCourierId === ''
+                ? null
+                : String(shipmentPayload.assignedCourierId);
     }
-    if (shipmentPayload.courier) {
-        nextShipmentInfo.courier = shipmentPayload.courier;
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'courier')) {
+        nextShipmentInfo.courier =
+            shipmentPayload.courier == null || shipmentPayload.courier === ''
+                ? null
+                : shipmentPayload.courier;
     }
-    if (shipmentPayload.labelUrl) {
-        nextShipmentInfo.labelUrl = shipmentPayload.labelUrl;
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'labelUrl')) {
+        nextShipmentInfo.labelUrl =
+            shipmentPayload.labelUrl == null || shipmentPayload.labelUrl === ''
+                ? null
+                : shipmentPayload.labelUrl;
     }
-    if (shipmentPayload.manifestUrl) {
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'manifestUrl')) {
+        nextShipmentInfo.manifestUrl =
+            shipmentPayload.manifestUrl == null || shipmentPayload.manifestUrl === ''
+                ? null
+                : shipmentPayload.manifestUrl;
+    } else if (shipmentPayload.manifestUrl) {
         nextShipmentInfo.manifestUrl = shipmentPayload.manifestUrl;
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierAssignNote')) {
+        nextShipmentInfo.courierAssignNote =
+            shipmentPayload.courierAssignNote == null || shipmentPayload.courierAssignNote === ''
+                ? null
+                : String(shipmentPayload.courierAssignNote);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierSubstitutedFromId')) {
+        nextShipmentInfo.courierSubstitutedFromId =
+            shipmentPayload.courierSubstitutedFromId == null ? null : Number(shipmentPayload.courierSubstitutedFromId);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierSubstitutedFromName')) {
+        nextShipmentInfo.courierSubstitutedFromName =
+            shipmentPayload.courierSubstitutedFromName == null || shipmentPayload.courierSubstitutedFromName === ''
+                ? null
+                : String(shipmentPayload.courierSubstitutedFromName);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'providerSnapshot')) {
+        nextShipmentInfo.providerSnapshot = shipmentPayload.providerSnapshot || null;
     }
     if (shipmentPayload.manifestGeneratedAt) {
         nextShipmentInfo.manifestGeneratedAt = new Date(shipmentPayload.manifestGeneratedAt);
@@ -419,6 +448,8 @@ async function upsertShipmentInfo({
     }
     if (shipmentPayload.pickupScheduledAt) {
         nextShipmentInfo.pickupScheduledAt = new Date(shipmentPayload.pickupScheduledAt);
+    } else if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'pickupScheduledAt')) {
+        nextShipmentInfo.pickupScheduledAt = null;
     }
     if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'lastPickupError')) {
         nextShipmentInfo.lastPickupError =
@@ -438,7 +469,11 @@ async function upsertShipmentInfo({
     nextShipmentInfo.lastSyncSource = trigger || 'system';
     nextShipmentInfo.lastError = null;
 
-    if (Array.isArray(shipmentPayload.events) && shipmentPayload.events.length > 0) {
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'events')) {
+        nextShipmentInfo.rawEvents = Array.isArray(shipmentPayload.events)
+            ? shipmentPayload.events.slice(0, 50)
+            : [];
+    } else if (Array.isArray(shipmentPayload.events) && shipmentPayload.events.length > 0) {
         nextShipmentInfo.rawEvents = shipmentPayload.events.slice(0, 50);
     }
 
@@ -1809,6 +1844,9 @@ exports.shiprocketWebhook = async (req, res) => {
             null;
         const mappedReturnStatus = mapReturnCarrierStatus(providerStatus);
 
+        const { detectResetFromWebhookPayload, applyLocalShipmentReset } = require('../services/shiprocketReconcile.service');
+        const resetCheck = detectResetFromWebhookPayload(payload, order);
+
         const eventTimestamp = normalizeShipmentEventTimestamp(
             payload.event_time ||
             payload.updated_at ||
@@ -1828,19 +1866,39 @@ exports.shiprocketWebhook = async (req, res) => {
             raw: payload
         });
 
-        await upsertShipmentInfo({
-            order,
-            shipmentPayload: {
-                awbCode: payload.awb_code || payload.awb || order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber,
-                shipmentId: payload.shipment_id || order.shipmentInfo?.shipmentId || null,
-                courier: payload.courier_name || payload.courier || order.shipmentInfo?.courier || null,
-                providerStatus,
-                events: nextEvents.slice(-50),
-                estimatedDelivery: payload.estimated_delivery_date || order.shipmentInfo?.estimatedDelivery || null
-            },
-            trigger: 'shiprocket_webhook',
-            allowOrderStatusUpdate: true
-        });
+        if (resetCheck.resetDetected) {
+            await applyLocalShipmentReset(order, {
+                reason: resetCheck.reason || providerStatus || 'Shipment reset on Shiprocket',
+                trigger: 'shiprocket_webhook_reset',
+                appendEvent: false
+            });
+            const freshAfterReset = await Order.findOne({ orderId: order.orderId });
+            if (freshAfterReset) {
+                freshAfterReset.shipmentInfo = {
+                    ...(freshAfterReset.shipmentInfo || {}),
+                    rawEvents: nextEvents.slice(-50),
+                    lastSyncAt: new Date(),
+                    lastSyncSource: 'shiprocket_webhook'
+                };
+                freshAfterReset.markModified('shipmentInfo');
+                await freshAfterReset.save();
+            }
+        } else {
+            await upsertShipmentInfo({
+                order,
+                shipmentPayload: {
+                    awbCode: payload.awb_code || payload.awb || undefined,
+                    trackingNumber: payload.awb_code || payload.awb || undefined,
+                    shipmentId: payload.shipment_id || undefined,
+                    courier: payload.courier_name || payload.courier || undefined,
+                    providerStatus,
+                    events: nextEvents.slice(-50),
+                    estimatedDelivery: payload.estimated_delivery_date || order.shipmentInfo?.estimatedDelivery || null
+                },
+                trigger: 'shiprocket_webhook',
+                allowOrderStatusUpdate: true
+            });
+        }
 
         if (mappedReturnStatus && order.returnInfo && String(order.returnInfo.status || '').trim()) {
             const previousReturnStatus = String(order.returnInfo.status || '').toLowerCase();
@@ -2762,66 +2820,121 @@ function buildLiveTimelineFromEvents(events, fallbackTimeline) {
     return normalized.length > 0 ? normalized : fallbackTimeline;
 }
 
+function enrichPreTransitTrackingTimeline(timeline, orderDoc) {
+    if (!orderDoc || !Array.isArray(timeline)) return timeline;
+
+    const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
+    const { OPS_STATES } = require('../services/shipmentOps/constants');
+    const opsState = computeOpsState(orderDoc);
+    const preTransit = [
+        OPS_STATES.AWB_ASSIGNED,
+        OPS_STATES.READY_TO_SHIP,
+        OPS_STATES.PICKUP_SCHEDULED
+    ].includes(opsState);
+    if (!preTransit) return timeline;
+
+    const si = orderDoc.shipmentInfo || {};
+    const providerStatus = String(si.providerStatus || '').trim();
+    if (!providerStatus) return timeline;
+
+    const norm = (value) =>
+        String(value || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[_-]+/g, ' ')
+            .replace(/\s+/g, ' ');
+
+    const providerNorm = norm(providerStatus);
+    const hasCurrentStatus = timeline.some((event) => norm(event.status) === providerNorm);
+    const onlyStaleCancel =
+        timeline.length > 0 &&
+        timeline.every((event) => /pickupcancelled|pickup cancelled|auto cancel/.test(norm(event.status)));
+
+    if (hasCurrentStatus && !onlyStaleCancel) return timeline;
+
+    const filtered = timeline.filter(
+        (event) => !/pickupcancelled|pickup cancelled/.test(norm(event.status))
+    );
+    const currentEvent = {
+        status: providerStatus,
+        completed: true,
+        timestamp: si.lastSyncAt || new Date(),
+        location: null,
+        description:
+            opsState === OPS_STATES.AWB_ASSIGNED ? 'Schedule pickup on Shiprocket to continue.' : null
+    };
+    return [...filtered, currentEvent].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+}
+
 // ========== TRACK ORDER ==========
 exports.trackOrder = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const order = await Order.findOne({ orderId: orderId });
+        let orderDoc = await Order.findOne({ orderId: orderId });
 
-        if (!order) {
+        if (!orderDoc) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
-        if (!canViewOrderForRequest(req, order, isOrderStaffRequest(req))) {
+        if (!canViewOrderForRequest(req, orderDoc, isOrderStaffRequest(req))) {
             return buildUnauthorizedOrderResponse(res);
         }
 
-        const fallbackTimeline = buildDefaultOrderTimeline(order);
+        const awbCode = orderDoc.shipmentInfo?.awbCode || orderDoc.shipmentInfo?.trackingNumber || null;
+        const shipmentId = orderDoc.shipmentInfo?.shipmentId || null;
         let liveTracking = null;
         let trackingSource = 'internal';
 
-        const awbCode = order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || null;
-        const shipmentId = order.shipmentInfo?.shipmentId || null;
-        if (awbCode || shipmentId) {
-            const trackingResult = await ShiprocketService.getTracking({
-                awbCode,
-                shipmentId
+        if (awbCode || shipmentId || orderDoc.shipmentInfo?.shiprocketOrderId) {
+            const { reconcileOrderFromShiprocket } = require('../services/shiprocketReconcile.service');
+            const reconcileResult = await reconcileOrderFromShiprocket(orderDoc, {
+                source: isOrderStaffRequest(req) ? 'admin_track_order' : 'track_order',
+                mode: awbCode || shipmentId ? 'full' : 'forward',
+                allowOrderStatusUpdate: true
             });
-            if (trackingResult?.success) {
-                liveTracking = trackingResult;
+            if (reconcileResult.success) {
+                orderDoc = reconcileResult.order || (await Order.findOne({ orderId: orderDoc.orderId }));
                 trackingSource = 'shiprocket';
-                await upsertShipmentInfo({
-                    order,
-                    shipmentPayload: {
-                        ...trackingResult,
-                        providerStatus: trackingResult.currentStatus
-                    },
-                    trigger: 'track_order_live_sync',
-                    allowOrderStatusUpdate: true
+            }
+
+            const trackAwb = orderDoc.shipmentInfo?.awbCode || orderDoc.shipmentInfo?.trackingNumber || awbCode;
+            const trackShipmentId = orderDoc.shipmentInfo?.shipmentId || shipmentId;
+            if (trackAwb || trackShipmentId) {
+                const trackingResult = await ShiprocketService.getTracking({
+                    awbCode: trackAwb,
+                    shipmentId: trackShipmentId
                 });
-            } else if (trackingResult?.message) {
-                logger.warn('Live tracking fallback to internal timeline', {
-                    orderId: order.orderId,
-                    reason: trackingResult.message
-                });
+                if (trackingResult?.success) {
+                    liveTracking = trackingResult;
+                } else if (trackingResult?.message) {
+                    logger.warn('Live tracking fallback to internal timeline', {
+                        orderId: orderDoc.orderId,
+                        reason: trackingResult.message
+                    });
+                }
             }
         }
 
+        const fallbackTimeline = buildDefaultOrderTimeline(orderDoc);
+        const rawTimeline = buildLiveTimelineFromEvents(liveTracking?.events, fallbackTimeline);
+
         const tracking = {
-            orderId: order.orderId,
-            currentStatus: order.orderStatus,
-            trackingNumber: order.shipmentInfo?.trackingNumber || null,
-            courier: order.shipmentInfo?.courier || null,
-            estimatedDelivery: order.shipmentInfo?.estimatedDelivery || null,
-            providerStatus: order.shipmentInfo?.providerStatus || null,
-            lastSyncedAt: order.shipmentInfo?.lastSyncAt || null,
+            orderId: orderDoc.orderId,
+            currentStatus: orderDoc.orderStatus,
+            trackingNumber: orderDoc.shipmentInfo?.trackingNumber || null,
+            courier: orderDoc.shipmentInfo?.courier || null,
+            estimatedDelivery: orderDoc.shipmentInfo?.estimatedDelivery || null,
+            providerStatus: orderDoc.shipmentInfo?.providerStatus || null,
+            lastSyncedAt: orderDoc.shipmentInfo?.lastSyncAt || null,
             source: trackingSource,
-            timeline: buildLiveTimelineFromEvents(liveTracking?.events, fallbackTimeline)
+            timeline: enrichPreTransitTrackingTimeline(rawTimeline, orderDoc)
         };
 
         if (isOrderStaffRequest(req)) {
             const { buildShipmentOpsView } = require('../services/shipmentOps');
-            tracking.shipmentOps = buildShipmentOpsView(order, { source: 'track_order' });
+            tracking.shipmentOps = buildShipmentOpsView(orderDoc, { source: 'track_order' });
         }
 
         return res.json({

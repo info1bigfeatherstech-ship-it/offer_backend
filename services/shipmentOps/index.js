@@ -4,8 +4,8 @@
 
 const Order = require('../../models/Order');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../../utils/orderFulfillmentPaymentGate');
-const { OPS_STATE_LABELS, ACTION_KEYS } = require('./constants');
-const { computeOpsState } = require('./computeOpsState');
+const { OPS_STATE_LABELS, ACTION_KEYS, OPS_STATES } = require('./constants');
+const { computeOpsState, hasAwb } = require('./computeOpsState');
 const { buildActionPolicy } = require('./actionPolicy');
 const {
   buildCourierOpsDisplay,
@@ -78,11 +78,42 @@ function buildShipmentOpsView(orderInput, options = {}) {
 }
 
 /**
+ * Shiprocket reset → re-ship queue: move order back to Confirmed tab (no AWB yet).
+ * @param {import('mongoose').Document|object} orderDoc
+ * @returns {boolean} whether orderStatus was reverted
+ */
+function maybeRevertOrderStatusForProviderReset(orderDoc) {
+  if (!orderDoc || typeof orderDoc !== 'object') return false;
+
+  const opsState = computeOpsState(orderDoc);
+  if (opsState !== OPS_STATES.PROVIDER_RESET) return false;
+
+  const st = String(orderDoc.orderStatus || '').toLowerCase();
+  if (!['processing', 'shipped', 'out_for_delivery'].includes(st)) return false;
+
+  const si = orderDoc.shipmentInfo && typeof orderDoc.shipmentInfo === 'object' ? orderDoc.shipmentInfo : {};
+  if (hasAwb(si)) return false;
+
+  orderDoc.orderStatus = 'confirmed';
+  orderDoc.shipmentInfo = {
+    ...si,
+    shippedAt: null,
+    outForDeliveryAt: null,
+    reshipQueuedAt: si.reshipQueuedAt || new Date()
+  };
+  if (typeof orderDoc.markModified === 'function') {
+    orderDoc.markModified('shipmentInfo');
+  }
+  return true;
+}
+
+/**
  * @param {import('mongoose').Document} orderDoc
  * @param {{ source?: string }} [options]
  */
 async function evaluateAndPersistShipmentOps(orderDoc, options = {}) {
   if (!orderDoc) return null;
+  maybeRevertOrderStatusForProviderReset(orderDoc);
   const view = buildShipmentOpsView(orderDoc, options);
   orderDoc.shipmentOps = view;
   orderDoc.markModified('shipmentOps');
@@ -144,5 +175,6 @@ module.exports = {
   evaluateAndPersistShipmentOps,
   reconcileShipmentOpsByOrderId,
   assertShipmentOpsAction,
+  maybeRevertOrderStatusForProviderReset,
   toPlainOrder,
 };

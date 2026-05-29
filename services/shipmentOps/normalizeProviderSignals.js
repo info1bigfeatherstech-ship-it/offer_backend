@@ -64,7 +64,7 @@ function classifySignalTexts(texts) {
   }
 
   if (
-    /auto\s*cancel|auto\s*cancelled|pickup\s*cancel|pickupcancelled|pickup\s*cancelled|shipment\s*cancel|order\s*cancel|cancelled\s*by\s*courier|pickup\s*not\s*done/.test(
+    /auto\s*cancel|auto\s*cancelled|shipment\s*auto\s*cancel|pickup\s*cancel|pickupcancelled|pickup\s*cancelled|shipment\s*cancel|order\s*cancel|cancelled\s*by\s*courier|pickup\s*not\s*done|no\s*pickup\s*done\s*in\s*\d+\s*days/.test(
       combined
     )
   ) {
@@ -79,7 +79,7 @@ function classifySignalTexts(texts) {
     return CLASSIFICATION.DELIVERED;
   }
 
-  if (/in\s*transit|picked\s*up|dispatched|shipped|manifested/.test(combined)) {
+  if (/in\s*transit|picked\s*up|dispatched|\bshipped\b/.test(combined)) {
     return CLASSIFICATION.IN_TRANSIT;
   }
 
@@ -91,7 +91,7 @@ function classifySignalTexts(texts) {
     return CLASSIFICATION.MANIFEST;
   }
 
-  if (/awb\s*assigned|assigned|booked/.test(combined)) {
+  if (/awb\s*assigned|ready\s*to\s*ship|courier\s*assigned|assigned|booked/.test(combined)) {
     return CLASSIFICATION.AWB_ASSIGNED;
   }
 
@@ -102,12 +102,29 @@ function classifySignalTexts(texts) {
  * @param {{ providerStatus?: string|null, rawEvents?: Array<object>|null }} input
  */
 function normalizeProviderSignals(input) {
-  const texts = collectSignalTexts(input || {});
-  const classification = classifySignalTexts(texts);
+  const providerRaw = input?.providerStatus ? String(input.providerStatus).trim() : '';
+  const providerTexts = providerRaw ? [normalizeText(providerRaw)] : [];
+  const fromProvider = providerTexts.length ? classifySignalTexts(providerTexts) : CLASSIFICATION.UNKNOWN;
+
+  const allTexts = collectSignalTexts(input || {});
+  const fromAll = classifySignalTexts(allTexts);
+
+  let classification = fromAll;
+  if (fromProvider !== CLASSIFICATION.UNKNOWN) {
+    classification = fromProvider;
+  }
+  if (
+    fromProvider === CLASSIFICATION.AWB_ASSIGNED ||
+    fromProvider === CLASSIFICATION.PICKUP_SCHEDULED ||
+    fromProvider === CLASSIFICATION.MANIFEST
+  ) {
+    classification = fromProvider;
+  }
+
   return {
     classification,
-    texts,
-    providerStatusRaw: input?.providerStatus ? String(input.providerStatus).trim() : null,
+    texts: allTexts,
+    providerStatusRaw: providerRaw || null,
   };
 }
 
