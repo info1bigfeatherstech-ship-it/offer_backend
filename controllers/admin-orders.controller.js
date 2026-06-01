@@ -118,6 +118,26 @@ exports.getOrdersList = async (req, res) => {
       Order.countDocuments(filter)
     ]);
 
+    const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
+    const { OPS_STATES } = require('../services/shipmentOps/constants');
+    const { evaluateAndPersistShipmentOps } = require('../services/shipmentOps');
+
+    for (const doc of orders) {
+      const st = String(doc.orderStatus || '').toLowerCase();
+      const hasAwb = Boolean(doc.shipmentInfo?.awbCode || doc.shipmentInfo?.trackingNumber);
+      if (!hasAwb && ['processing', 'shipped', 'out_for_delivery'].includes(st)) {
+        if (computeOpsState(doc) === OPS_STATES.PROVIDER_RESET) {
+          const live = await Order.findById(doc._id);
+          if (live) {
+            await evaluateAndPersistShipmentOps(live, { source: 'admin_list_reship_repair' });
+            doc.orderStatus = live.orderStatus;
+            doc.shipmentInfo = live.shipmentInfo;
+            doc.shipmentOps = live.shipmentOps;
+          }
+        }
+      }
+    }
+
     const rows = orders.map((doc) => mapOrderRow(doc));
 
     return res.json({

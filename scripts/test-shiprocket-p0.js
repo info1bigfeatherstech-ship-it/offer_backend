@@ -253,12 +253,96 @@ function testBuildPickupCalendarBlocksSunday() {
   assert.ok(sundays.every((d) => d.allowed === false));
 }
 
+function testExtractForwardOrderAutoCancelSnapshot() {
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    status: 'NEW',
+    status_message: 'Shipment auto-cancelled due to no pickup done in 10 days from pickup generated date',
+    shipments: {
+      id: 1346591722,
+      awb: '',
+      status: 'NEW'
+    }
+  });
+  assert.strictEqual(snap.resetDetected, true);
+  assert.ok(/auto[- ]?cancel/i.test(String(snap.resetReason || snap.statusMessage || '')));
+}
+
+function testAwbAssignedIgnoresStalePickupFieldsAfterReship() {
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    shipment_id: 1346591722,
+    status: 'AWB Assigned',
+    awb: '14112362507328',
+    courier_name: 'Xpressbees Surface',
+    pickup_scheduled_date: '18-May-2026',
+    pickup_status: 'For 18 May 2026',
+    label_url: 'https://example.com/label.pdf'
+  });
+  assert.strictEqual(snap.pickupScheduled, false);
+  assert.strictEqual(snap.pickupDate, null);
+  assert.strictEqual(snap.providerStatus, 'AWB Assigned');
+  assert.strictEqual(snap.providerSnapshot.pickupScheduled, false);
+}
+
+function testMirrorProviderStatusWhenPickupScheduled() {
+  const status = ShiprocketService.resolveMirrorProviderStatusFromOrderShow(
+    {
+      status: 'Pickup Generated',
+      pickup_status: 'PICKUP SCHEDULED For 30 May 2026',
+      pickup_scheduled_date: '30-May-2026'
+    },
+    { pickupScheduled: true, pickupDate: '2026-05-30', statusLabel: 'Pickup Generated' }
+  );
+  assert.strictEqual(status, 'PICKUP SCHEDULED');
+}
+
+function testForwardProgressIgnoresStalePickupCancelledInResetDetection() {
+  const { detectForwardOrderReset, sanitizeTrackingEventsForProvider } = require('../services/shipmentOps/shiprocketStatusMap');
+  const reset = detectForwardOrderReset({
+    statusLabel: 'Pickup Generated',
+    statusCode: 4,
+    awbCode: '14112362507328',
+    hadLocalAwb: true,
+    texts: ['PickupCancelled', 'PickupCancelled']
+  });
+  assert.strictEqual(reset.resetDetected, false);
+
+  const resetOfp = detectForwardOrderReset({
+    statusLabel: 'Out For Pickup',
+    awbCode: '14112362507328',
+    hadLocalAwb: true,
+    texts: ['PickupCancelled', 'Out For Pickup']
+  });
+  assert.strictEqual(resetOfp.resetDetected, false);
+
+  const events = sanitizeTrackingEventsForProvider(
+    [{ status: 'PickupCancelled', description: 'PickupCancelled', at: '2026-05-25' }],
+    'Pickup Generated'
+  );
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].status, 'Pickup Generated');
+
+  const eventsOfp = sanitizeTrackingEventsForProvider(
+    [
+      { status: 'PickupCancelled', description: 'PickupCancelled', at: '2026-05-25' },
+      { status: 'OFP', description: 'Out For Pickup', at: '2026-05-30' }
+    ],
+    'Out For Pickup'
+  );
+  assert.strictEqual(eventsOfp.some((e) => /pickupcancelled/i.test(String(e.status || ''))), false);
+}
+
 function run() {
   testNormalizeYmdDate();
   testCourierPickupDateGuards();
   testOrdersShowShipmentObjectShape();
   testInstanceDelegatesUsedByControllers();
   testExtractForwardOrderSnapshot();
+  testExtractForwardOrderAutoCancelSnapshot();
+  testAwbAssignedIgnoresStalePickupFieldsAfterReship();
+  testForwardProgressIgnoresStalePickupCancelledInResetDetection();
+  testMirrorProviderStatusWhenPickupScheduled();
   testPickupAlreadyScheduledMessage();
   testParsePickupDateFromScheduleResponse();
   testParseNumericShiprocketOrderId();

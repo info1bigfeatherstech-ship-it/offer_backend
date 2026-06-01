@@ -93,6 +93,10 @@ const orderSchema = new mongoose.Schema(
       trackingNumber: String,
       courier: String,
       assignedCourierId: { type: String, default: null },
+      /** Set when Ship Now assigns a different courier because checkout quote was inactive/blocked */
+      courierAssignNote: { type: String, default: null },
+      courierSubstitutedFromId: { type: Number, default: null },
+      courierSubstitutedFromName: { type: String, default: null },
       providerStatus: String,
       estimatedDelivery: String,
       labelUrl: String,
@@ -111,6 +115,12 @@ const orderSchema = new mongoose.Schema(
       lastPickupError: { type: String, default: null },
       createAttemptCount: { type: Number, default: 0 },
       rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] }
+    },
+
+    /** Cached shipment ops view (list/detail actions + provider state classification) */
+    shipmentOps: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
     },
     
     // For returns

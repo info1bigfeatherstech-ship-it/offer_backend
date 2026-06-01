@@ -8,6 +8,7 @@ const {
   isProductListedOnStorefront,
   isVariantListedOnStorefront
 } = require('../utils/storefrontCatalog');
+const { sanitizeCartItems } = require('../services/cartSanitize.service');
 
 const CART_PRODUCT_SELECT =
   'name slug title description brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt variants';
@@ -155,6 +156,11 @@ const getcart = async (req, res) => {
 
   try {
     const storefront = storefrontOrDefault(req);
+
+    let cartDoc = await Cart.findOne({ userId });
+    if (cartDoc?.items?.length) {
+      await sanitizeCartItems(cartDoc, storefront, { persist: true });
+    }
 
     const cart = await Cart.findOne({ userId })
       .populate({
@@ -646,11 +652,21 @@ const mergecart = async (req, res) => {
     if (!cart) cart = new Cart({ userId, items: [] });
 
     for (const incoming of items) {
-      const { productId, variantId, quantity } = incoming;
-      if (!productId || !variantId || quantity <= 0) continue;
+      let { productId, variantId, quantity, productSlug } = incoming;
+      if ((!productId && !productSlug) || !variantId || quantity <= 0) continue;
 
-      const product = await Product.findById(productId).select(CART_PRODUCT_SELECT);
+      let product = null;
+      if (productId && mongoose.Types.ObjectId.isValid(String(productId))) {
+        product = await Product.findById(productId).select(CART_PRODUCT_SELECT);
+      }
+      if (!product && productSlug) {
+        product = await Product.findOne(
+          mongoCatalogAnd(storefront, { slug: String(productSlug).toLowerCase().trim() })
+        ).select(CART_PRODUCT_SELECT);
+      }
       if (!product || !isProductListedOnStorefront(product, storefront)) continue;
+
+      productId = product._id;
 
       const variant = product.variants.find(v => String(v._id) === String(variantId));
       if (!variant || !isVariantListedOnStorefront(variant, storefront)) continue;

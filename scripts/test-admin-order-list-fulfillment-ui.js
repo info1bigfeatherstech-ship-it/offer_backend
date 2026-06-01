@@ -12,8 +12,11 @@ const {
 function testProcessingPickupScheduled() {
   const ops = buildCourierOpsDisplay({
     orderStatus: 'processing',
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' },
     shipmentInfo: {
       awbCode: '369445882047',
+      shipmentId: '1',
+      shiprocketOrderId: '2',
       courier: 'Amazon Prepaid Surface 500g',
       pickupDate: '2026-05-18',
       providerStatus: 'PICKUP SCHEDULED'
@@ -27,15 +30,14 @@ function testProcessingPickupScheduled() {
 function testConfirmedReadyToShip() {
   const ops = buildCourierOpsDisplay({
     orderStatus: 'confirmed',
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' },
     shipmentInfo: {}
   });
   assert.strictEqual(ops.line1, 'Ready to ship');
   const caps = buildRowActionCapabilities({
     orderStatus: 'confirmed',
-    hasAwb: false,
-    hasShipmentId: false,
-    pickupScheduled: false,
-    canConfirmForFulfillment: false
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' },
+    shipmentInfo: {}
   });
   assert.strictEqual(caps.shipNow, true);
   assert.strictEqual(caps.schedulePickup, false);
@@ -44,15 +46,11 @@ function testConfirmedReadyToShip() {
 function testListRowUi() {
   const ui = buildListRowFulfillmentUi({
     orderStatus: 'processing',
-    hasAwb: true,
-    hasShipmentId: true,
-    hasManifest: false,
-    hasLabel: false,
-    hasShiprocketOrderId: true,
-    pickupScheduled: true,
-    pickupDate: '2026-05-18',
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' },
     shipmentInfo: {
       awbCode: 'AWB1',
+      shipmentId: '1',
+      shiprocketOrderId: '2',
       courier: 'Amazon',
       pickupDate: '2026-05-18',
       providerStatus: 'PICKUP SCHEDULED'
@@ -63,10 +61,29 @@ function testListRowUi() {
   assert.strictEqual(ui.actionCapabilities.downloadManifest, false);
 }
 
+function testPickupExceptionListUi() {
+  const ui = buildListRowFulfillmentUi({
+    orderStatus: 'processing',
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' },
+    shipmentInfo: {
+      awbCode: 'AWB1',
+      shipmentId: '1',
+      shiprocketOrderId: '2',
+      pickupDate: '2026-05-18',
+      providerStatus: 'Pickup Exception'
+    }
+  });
+  assert.strictEqual(ui.courierOpsLine1, 'Pickup exception — action required');
+  assert.strictEqual(ui.actionCapabilities.generateManifest, false);
+  assert.strictEqual(ui.actionCapabilities.retryPickup, true);
+  assert.strictEqual(ui.primaryAction, 'retryPickup');
+}
+
 function run() {
   testProcessingPickupScheduled();
   testConfirmedReadyToShip();
   testListRowUi();
+  testPickupExceptionListUi();
   console.log('All admin order list fulfillment UI tests passed.');
 }
 

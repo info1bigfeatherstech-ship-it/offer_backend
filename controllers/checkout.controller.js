@@ -28,6 +28,7 @@ const {
   buildClientCodAvailability
 } = require('../utils/checkoutPaymentPolicy');
 const logger = require('../utils/logger');
+const { sanitizeCartItems } = require('../services/cartSanitize.service');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 
@@ -250,6 +251,24 @@ exports.quoteCheckout = async (req, res) => {
     const cartDoc = await Cart.findOne({ userId });
     if (!cartDoc?.items?.length) {
       return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'cart is empty');
+    }
+
+    const { removed: removedCartLines } = await sanitizeCartItems(cartDoc, storefront, {
+      persist: true
+    });
+    if (removedCartLines.length > 0) {
+      logger.warn('quoteCheckout removed stale cart lines', {
+        userId: String(userId),
+        removedCount: removedCartLines.length
+      });
+    }
+    if (!cartDoc.items.length) {
+      return respondCheckoutInputError(
+        res,
+        400,
+        'CART_EMPTY',
+        'Your cart had outdated items that were removed. Please add products again.'
+      );
     }
 
     const finalTotals = await buildFinalTotals({
@@ -482,6 +501,11 @@ exports.confirmCheckout = async (req, res) => {
 
     const cartDoc = await Cart.findOne({ userId });
     if (!cartDoc?.items?.length) {
+      return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'Cart is empty. Regenerate quote.');
+    }
+
+    await sanitizeCartItems(cartDoc, storefront, { persist: true });
+    if (!cartDoc.items.length) {
       return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'Cart is empty. Regenerate quote.');
     }
 

@@ -41,7 +41,7 @@ const imageUpload = multer({
 
 const uploadProductImages = imageUpload.any();
 const uploadSingleImage = imageUpload.single('image');
-
+                
 
 // ===============================
 // CSV / EXCEL UPLOAD

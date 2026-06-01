@@ -45,6 +45,41 @@ async function processAndUploadCategoryImage(buffer, { nameHint, uniqueSuffix })
 
 
 // =============================================
+// GET /admin/categories - WITH CACHE (ALL statuses)
+// =============================================
+const getAdminAllCategories = async (req, res) => {
+  try {
+    // Skip cache — admin always needs fresh + complete data
+    let categories = await Category.find()
+      .sort({ order: 1, name: 1 })
+      .lean();
+
+    // Add isHidden flag, reset children
+    categories = categories.map(cat => ({
+      ...cat,
+      isHidden: cat.status === 'inactive',
+      children: []
+    }));
+
+    // Return flat list — no tree building (tree was causing empty array bug
+    // because all cats were going into children, roots was always [])
+    return res.status(200).json({
+      success: true,
+      count: categories.length,
+      categories: categories
+    });
+
+  } catch (error) {
+    console.error('Get admin categories error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error fetching categories',
+      error: error.message
+    });
+  }
+};
+
+// =============================================
 // GET /categories - WITH CACHE
 // =============================================
 const getAllCategories = async (req, res) => {
@@ -509,5 +544,6 @@ module.exports = {
   deleteCategory,
   reorderCategories,
   toggleCategoryVisibility,
-  getAllCategoriesAdmin
+  getAllCategoriesAdmin,
+  getAdminAllCategories
 };

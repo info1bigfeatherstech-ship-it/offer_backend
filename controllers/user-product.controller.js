@@ -152,101 +152,7 @@ async function attachAppliedTagsToProduct(product) {
 // =============================================
 // GET /products/all - WITH CACHE
 // =============================================
-// const getProducts = async (req, res) => {
-//   try {
-//     const page = Math.max(1, parseInt(req.query.page) || 1);
-//     const limit = Math.max(1, parseInt(req.query.limit) || 12);
-//     const skip = (page - 1) * limit;
 
-//     const storefront = storefrontFrom(req);
-//     const extraClauses = [];
-//     if (req.query.category) {
-//       const cat = await Category.findOne({
-//         slug: String(req.query.category).toLowerCase()
-//       }).select('_id');
-//       if (cat) extraClauses.push({ category: cat._id });
-//     }
-//     if (req.query.featured === 'true') extraClauses.push({ isFeatured: true });
-
-//     let sortOption = { createdAt: -1 };
-//     if (req.query.q) {
-//       extraClauses.push({ $text: { $search: String(req.query.q) } });
-//       sortOption = { score: { $meta: 'textScore' } };
-//     }
-
-//     const filters = mongoCatalogAnd(storefront, ...extraClauses);
-
-//     const userType = req.userType || 'user';
-
-//     const cacheKey = cacheConfig.generateKey('PRODUCT', {
-//       page,
-//       limit,
-//       category: req.query.category,
-//       featured: req.query.featured,
-//       q: req.query.q,
-//       userType,
-//       storefront
-//     });
-
-//     const bypassCache = req.query._cb === '1';
-
-//     //  CHECK CACHE FIRST
-//     const cachedData = bypassCache ? null : await cacheService.get(cacheKey);
-//     if (cachedData && !bypassCache) {
-//       res.setHeader('X-Cache', 'HIT');
-//       setApiCacheHeaders(res);
-//       return res.json(cachedData);
-//     }
-
-//     const projection = req.query.q
-//       ? { score: { $meta: 'textScore' } }
-//       : undefined;
-
-//     const [total, products] = await Promise.all([
-//       Product.countDocuments(filters),
-//       Product.find(filters, projection)
-//         .sort(sortOption)
-//         .skip(skip)
-//         .limit(limit)
-//         .populate('category')
-//         .lean({ virtuals: true })
-//     ]);
-
-//     const productsWithData = products.map((product) =>
-//       decorateProductForStorefront(product, userType, storefront)
-//     );
-
-//     const responseData = {
-//       success: true,
-//       pagination: {
-//         total,
-//         page,
-//         limit,
-//         totalPages: Math.ceil(total / limit),
-//         hasNextPage: page * limit < total,
-//         hasPrevPage: page > 1
-//       },
-//       products: productsWithData,
-//       userType,
-//       storefront
-//     };
-
-//     //  STORE IN CACHE
-//     await cacheService.set(cacheKey, responseData, cacheConfig.ttl.PRODUCT_LIST);
-
-//     res.setHeader('X-Cache', 'MISS');
-//     setApiCacheHeaders(res);
-
-//     return res.json(responseData);
-
-//   } catch (err) {
-//     console.error('getProducts:', err);
-//     return res.status(500).json({ 
-//       success: false, 
-//       message: 'Server error' 
-//     });
-//   }
-// };
 const getProducts = async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -276,39 +182,7 @@ console.table(
     // ✅ category filter
     const storefront = storefrontFrom(req);
     const currentUserType = req.userType || "user";
-    // const allProducts = await Product.find({}).lean();
-    // console.table(
-    //   allProducts.map((p) => ({
-    //     name: p.name,
-    //     sale: p.variants?.[0]?.price?.sale,
-    //     base: p.variants?.[0]?.price?.base,
-    //   }))
-    // );
-
-    /*
-    // price filter (currently disabled)
-    const priceQuery = {};
-
-    if (req.query.minPrice) {
-      priceQuery.$gte = Number(req.query.minPrice);
-    }
-
-    if (req.query.maxPrice) {
-      priceQuery.$lte = Number(req.query.maxPrice);
-    }
-
-    if (Object.keys(priceQuery).length > 0) {
-      extraClauses.push({
-        variants: {
-          $elemMatch: {
-            "price.sale": priceQuery,
-          },
-        },
-      });
-    }
-    */
-
-    // category filter
+      // category filter
     if (req.query.category) {
       const categoryDoc = await Category.findOne({
         slug: String(req.query.category).toLowerCase(),
@@ -525,76 +399,9 @@ const getProductBySlug = async (req, res) => {
 // =============================================
 // GET /products/search - WITH CACHE
 // =============================================
-// const searchProducts = async (req, res) => {
-//   try {
-//     const q = req.query.q || '';
-//     if (!q) {
-//       return res.status(400).json({ 
-//         success: false, 
-//         message: 'Query required' 
-//       });
-//     }
-
-//     const page = Math.max(1, parseInt(req.query.page) || 1);
-//     const limit = Math.max(1, parseInt(req.query.limit) || 12);
-//     const skip = (page - 1) * limit;
-//     const userType = req.userType || 'user';
-//     const storefront = storefrontFrom(req);
-
-//     const cacheKey = cacheConfig.generateKey('SEARCH', { q, page, limit, userType, storefront });
-
-//     const bypassCache = req.query._cb === '1';
-
-//     //  CHECK CACHE FIRST
-//     const cachedData = bypassCache ? null : await cacheService.get(cacheKey);
-//     if (cachedData && !bypassCache) {
-//       res.setHeader('X-Cache', 'HIT');
-//       setApiCacheHeaders(res);
-//       return res.json(cachedData);
-//     }
-
-//     const filters = mongoCatalogAnd(storefront, { $text: { $search: q } });
-
-//     const total = await Product.countDocuments(filters);
-//     const products = await Product.find(filters, { score: { $meta: 'textScore' } })
-//       .sort({ score: { $meta: 'textScore' } })
-//       .skip(skip)
-//       .limit(limit)
-//       .populate('category')
-//       .lean({ virtuals: true });
-
-//     const productsWithData = products.map((product) =>
-//       decorateProductForStorefront(product, userType, storefront)
-//     );
-
-//     const responseData = {
-//       success: true,
-//       total,
-//       page,
-//       limit,
-//       products: productsWithData,
-//       userType,
-//       storefront
-//     };
-
-//     //  STORE IN CACHE
-//     await cacheService.set(cacheKey, responseData, cacheConfig.ttl.PRODUCT_SEARCH);
-
-//     res.setHeader('X-Cache', 'MISS');
-//     setApiCacheHeaders(res);
-//     return res.json(responseData);
-
-//   } catch (err) {
-//     console.error('searchProducts:', err);
-//     return res.status(500).json({ 
-//       success: false, 
-//       message: 'Server error' 
-//     });
-//   }
-// };
 const searchProducts = async (req, res) => {
   try {
-    const q = req.query.q || "";
+    const q = String(req.query.q || "").trim();
 
     if (!q) {
       return res.status(400).json({
@@ -625,6 +432,7 @@ const searchProducts = async (req, res) => {
       : [];
 
     const cacheKey = cacheConfig.generateKey("SEARCH", {
+      v: "code-prefix-v2",
       q,
       page,
       limit,
@@ -645,8 +453,33 @@ const searchProducts = async (req, res) => {
       return res.json(cachedData);
     }
 
+    // Build search filter.
+    // If query looks like a product code (e.g. 0053 / 0053-1), prefer productCode-family match.
+    const escapeRegex = (value) =>
+      String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedQ = escapeRegex(q);
+    const searchRegex = { $regex: escapedQ, $options: "i" };
+    const baseCode = q.split("-")[0].trim();
+    const escapedBaseCode = escapeRegex(baseCode);
+    const productCodePrefixRegex = {
+      $regex: `^${escapedBaseCode}(?:-|$)`,
+      $options: "i",
+    };
+    const looksLikeProductCode = /^[a-z0-9-]+$/i.test(q) && /\d/.test(q);
+
+    const searchOrClauses = looksLikeProductCode
+      ? [{ "variants.productCode": productCodePrefixRegex }]
+      : [
+          { name: searchRegex },
+          { title: searchRegex },
+          { "variants.productCode": searchRegex },
+          { "variants.productCode": productCodePrefixRegex },
+        ];
+
     const extraClauses = [
-      { $text: { $search: q } },
+      {
+        $or: searchOrClauses,
+      },
     ];
 
     // tag filter
@@ -684,25 +517,9 @@ const searchProducts = async (req, res) => {
       ...extraClauses
     );
 
-    // ✅ ADD THIS
-    if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter }
-      }).select('product').lean();
-
-      const taggedProductIds = taggedProducts.map(t => t.product);
-      filters._id = { $in: taggedProductIds };
-    }
-    // const filters = mongoCatalogAnd(storefront, { $text: { $search: q } });
-
     const total = await Product.countDocuments(filters);
 
-    const products = await Product.find(filters, {
-      score: { $meta: "textScore" },
-    })
-      .sort({
-        score: { $meta: "textScore" },
-      })
+    const products = await Product.find(filters)
       .skip(skip)
       .limit(limit)
       .populate("category")
@@ -749,88 +566,6 @@ const searchProducts = async (req, res) => {
   }
 };
 
-
-// =============================================
-// GET /products/category/:slug - WITH CACHE
-// =============================================
-// const getProductsByCategory = async (req, res) => {
-//   try {
-//     const { slug } = req.params;
-//     const page = Math.max(1, parseInt(req.query.page) || 1);
-//     const limit = Math.max(1, parseInt(req.query.limit) || 12);
-//     const skip = (page - 1) * limit;
-//     const userType = req.userType || 'user';
-//     const storefront = storefrontFrom(req);
-
-//     const cacheKey = cacheConfig.generateKey('PRODUCT', {
-//       categorySlug: slug,
-//       page,
-//       limit,
-//       userType,
-//       storefront
-//     });
-
-//     const bypassCache = req.query._cb === '1';
-
-//     //  CHECK CACHE FIRST
-//     const cachedData = bypassCache ? null : await cacheService.get(cacheKey);
-//     if (cachedData && !bypassCache) {
-//       res.setHeader('X-Cache', 'HIT');
-//       setApiCacheHeaders(res);
-//       return res.json(cachedData);
-//     }
-
-//     const category = await Category.findOne({ 
-//       slug: String(slug).toLowerCase() 
-//     });
-    
-//     if (!category) {
-//       return res.status(404).json({ 
-//         success: false, 
-//         message: 'Category not found' 
-//       });
-//     }
-
-//     const filters = mongoCatalogAnd(storefront, { category: category._id });
-
-//     const total = await Product.countDocuments(filters);
-//     const products = await Product.find(filters)
-//       .sort({ createdAt: -1 })
-//       .skip(skip)
-//       .limit(limit)
-//       .populate('category')
-//       .lean({ virtuals: true });
-
-//     const productsWithData = products.map((product) =>
-//       decorateProductForStorefront(product, userType, storefront)
-//     );
-
-//     const responseData = {
-//       success: true,
-//       total,
-//       page,
-//       limit,
-//       products: productsWithData,
-//       category,
-//       userType,
-//       storefront
-//     };
-
-//     //  STORE IN CACHE
-//     await cacheService.set(cacheKey, responseData, cacheConfig.ttl.PRODUCT_CATEGORY);
-
-//     res.setHeader('X-Cache', 'MISS');
-//     setApiCacheHeaders(res);
-//     return res.json(responseData);
-
-//   } catch (err) {
-//     console.error('getProductsByCategory:', err);
-//     return res.status(500).json({ 
-//       success: false, 
-//       message: 'Server error' 
-//     });
-//   }
-// };
 const getProductsByCategory = async (req, res) => {
   try {
     const { slug } = req.params;
@@ -986,89 +721,6 @@ const getProductsByCategory = async (req, res) => {
   }
 };   
 
-// =============================================
-// GET /products/featured - WITH CACHE
-// =============================================
-// =============================================
-// GET /products/featured - WITH PAGINATION & CACHE
-// =============================================
-// const getFeaturedProducts = async (req, res) => {
-//   try {
-//     // ✅ ADD PAGINATION SUPPORT
-//     const page = Math.max(1, parseInt(req.query.page) || 1);
-//     const limit = Math.max(1, parseInt(req.query.limit) || 12);
-//     const skip = (page - 1) * limit;
-    
-//     const userType = req.userType || 'user';
-
-//     // ✅ GENERATE CACHE KEY (include page now)
-//     const cacheKey = cacheConfig.generateKey('PRODUCT', { 
-//       featured: true, 
-//       page, 
-//       limit, 
-//       userType 
-//     });
-
-//     // ✅ CHECK CACHE FIRST
-//     const cachedData = await cacheService.get(cacheKey);
-//     if (cachedData) {
-//       res.setHeader('X-Cache', 'HIT');
-//       setApiCacheHeaders(res);
-//       return res.json(cachedData);
-//     }
-
-//     const filters = { 
-//       status: 'active', 
-//       isFeatured: true 
-//     };
-
-//     // ✅ GET TOTAL COUNT FOR PAGINATION
-//     const total = await Product.countDocuments(filters);
-
-//     const products = await Product.find(filters)
-//       .sort({ createdAt: -1 })
-//       .skip(skip)
-//       .limit(limit)
-//       .populate('category')
-//       .lean();
-
-//     const productsWithData = products.map(product => ({
-//       ...product,
-//       variants: product.variants.map(variant => ({
-//         ...variant,
-//         price: getVariantPrice(variant, userType)
-//       }))
-//     }));
-
-//     const responseData = { 
-//       success: true, 
-//       pagination: {
-//         total,
-//         page,
-//         limit,
-//         totalPages: Math.ceil(total / limit),
-//         hasNextPage: page * limit < total,
-//         hasPrevPage: page > 1
-//       },
-//       products: productsWithData,
-//       userType: userType
-//     };
-
-//     // ✅ STORE IN CACHE
-//     await cacheService.set(cacheKey, responseData, cacheConfig.ttl.PRODUCT_FEATURED);
-
-//     res.setHeader('X-Cache', 'MISS');
-//     setApiCacheHeaders(res);
-//     return res.json(responseData);
-
-//   } catch (err) {
-//     console.error('getFeaturedProducts:', err);
-//     return res.status(500).json({ 
-//       success: false, 
-//       message: 'Server error' 
-//     });
-//   }
-// };
 const getFeaturedProducts = async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);

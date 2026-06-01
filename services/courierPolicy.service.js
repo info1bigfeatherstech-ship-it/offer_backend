@@ -1,0 +1,178 @@
+/**
+ * Courier allow/block policy — mirrors couriers marked inactive in Shiprocket / admin config.
+ * Inactive couriers are excluded from checkout quotes; Ship Now falls back to next cheapest active courier.
+ */
+
+const DEFAULT_INACTIVE_NAME_PATTERNS = [
+  /amazon\s+prepaid\s+surface/i,
+  /amazon\s+.*\s+surface/i,
+  /amazon\s+surface/i
+];
+
+let cachedInactiveIds = null;
+let cachedNamePatterns = null;
+
+/**
+ * @returns {number[]}
+ */
+function getInactiveCourierCompanyIds() {
+  if (cachedInactiveIds) return cachedInactiveIds;
+  const raw = String(process.env.SHIPROCKET_INACTIVE_COURIER_IDS || '').trim();
+  cachedInactiveIds = raw
+    ? raw
+        .split(/[,;\s]+/)
+        .map((x) => Number(String(x).trim()))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  return cachedInactiveIds;
+}
+
+/**
+ * @returns {RegExp[]}
+ */
+function getInactiveCourierNamePatterns() {
+  if (cachedNamePatterns) return cachedNamePatterns;
+  const raw = String(process.env.SHIPROCKET_INACTIVE_COURIER_NAME_PATTERNS || '').trim();
+  if (raw) {
+    cachedNamePatterns = raw
+      .split('|')
+      .map((part) => String(part || '').trim())
+      .filter(Boolean)
+      .map((part) => {
+        try {
+          return new RegExp(part, 'i');
+        } catch {
+          return new RegExp(part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        }
+      });
+  } else {
+    cachedNamePatterns = DEFAULT_INACTIVE_NAME_PATTERNS;
+  }
+  return cachedNamePatterns;
+}
+
+/** Test helper — reset env cache between tests. */
+function resetCourierPolicyCache() {
+  cachedInactiveIds = null;
+  cachedNamePatterns = null;
+}
+
+/**
+ * @param {object|null|undefined} courier — Shiprocket serviceability row or { id, name }
+ */
+function getCourierCompanyIdFromRow(courier) {
+  if (!courier || typeof courier !== 'object') return null;
+  if (courier.id != null && courier.name != null && courier.courier_company_id == null) {
+    const n = Number(courier.id);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  const raw =
+    courier.courier_company_id ??
+    courier.courier_id ??
+    courier.company_id ??
+    courier.id ??
+    null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * @param {object|null|undefined} courier
+ */
+function getCourierNameFromRow(courier) {
+  if (!courier || typeof courier !== 'object') return '';
+  return String(courier.courier_name || courier.airline_name || courier.name || '').trim();
+}
+
+/**
+ * @param {{ id?: number|null, name?: string|null }|object|null|undefined} courier
+ */
+function isCourierInactive(courier) {
+  const id = getCourierCompanyIdFromRow(courier);
+  const name = getCourierNameFromRow(courier) || String(courier?.name || '').trim();
+  const inactiveIds = getInactiveCourierCompanyIds();
+  if (id != null && inactiveIds.includes(id)) return true;
+  const patterns = getInactiveCourierNamePatterns();
+  if (!name) return false;
+  return patterns.some((re) => re.test(name));
+}
+
+/**
+ * @param {Array<object>} couriers
+ * @returns {Array<object>}
+ */
+function filterActiveCouriers(couriers) {
+  if (!Array.isArray(couriers)) return [];
+  return couriers.filter((c) => !isCourierInactive(c));
+}
+
+/**
+ * Pick cheapest active courier (same logic as ShiprocketService.pickRecommendedCourierId).
+ * @param {Array<object>} couriers
+ * @param {{ codRequired?: boolean }} [opts]
+ * @returns {{ courier: object, courierCompanyId: number, courierName: string }|null}
+ */
+function pickCheapestActiveCourier(couriers, opts = {}) {
+  const active = filterActiveCouriers(couriers);
+  if (!active.length) return null;
+
+  const needCod = Boolean(opts.codRequired);
+  const filtered = needCod
+    ? active.filter(
+        (c) =>
+          c.cod === 1 ||
+          c.cod === true ||
+          c.is_cod_available === 1 ||
+          c.is_cod_available === true
+      )
+    : active;
+  const pool = filtered.length ? filtered : active;
+
+  const scored = pool.map((c) => {
+    const rate = Number(c.rate ?? c.freight_charge ?? Infinity);
+    const etd = Number(c.estimated_delivery_days ?? c.etd ?? c.etd_hours ?? 999);
+    return { c, rate: Number.isFinite(rate) ? rate : Infinity, etd: Number.isFinite(etd) ? etd : 999 };
+  });
+  scored.sort((a, b) => {
+    if (a.rate !== b.rate) return a.rate - b.rate;
+    return a.etd - b.etd;
+  });
+
+  const top = scored[0]?.c;
+  if (!top) return null;
+  const courierCompanyId = getCourierCompanyIdFromRow(top);
+  if (courierCompanyId == null) return null;
+  return {
+    courier: top,
+    courierCompanyId,
+    courierName: getCourierNameFromRow(top) || 'Courier'
+  };
+}
+
+/**
+ * Build admin-facing note when checkout courier was skipped at assign time.
+ * @param {{ quotedId?: number|null, quotedName?: string|null, assignedId: number, assignedName: string }} params
+ */
+function buildCourierSubstituteNote(params) {
+  const quotedLabel = params.quotedName
+    ? `"${params.quotedName}"${params.quotedId ? ` (ID ${params.quotedId})` : ''}`
+    : params.quotedId
+      ? `ID ${params.quotedId}`
+      : 'checkout courier';
+  return (
+    `Quoted courier ${quotedLabel} is inactive in our shipping policy. ` +
+    `Assigned next cheapest active courier: "${params.assignedName}" (ID ${params.assignedId}).`
+  );
+}
+
+module.exports = {
+  getInactiveCourierCompanyIds,
+  getInactiveCourierNamePatterns,
+  resetCourierPolicyCache,
+  getCourierCompanyIdFromRow,
+  getCourierNameFromRow,
+  isCourierInactive,
+  filterActiveCouriers,
+  pickCheapestActiveCourier,
+  buildCourierSubstituteNote
+};
