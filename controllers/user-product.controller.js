@@ -556,8 +556,9 @@ const searchProducts = async (req, res) => {
 // =============================================
 // GET /products/search - WITH CACHE
 // =============================================
-const searchProducts = async (req, res) => {
+const searchProducts= async (req, res) => {
   try {
+    console.log("with base code")
     const q = String(req.query.q || "").trim();
 
     if (!q) {
