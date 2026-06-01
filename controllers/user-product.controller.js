@@ -396,6 +396,163 @@ const getProductBySlug = async (req, res) => {
   }
 };
 
+
+
+// search working with title name and product code working
+
+const searchProducts = async (req, res) => {
+  try {
+    const q = req.query.q || "";
+
+    if (!q) {
+      return res.status(400).json({
+        success: false,
+        message: "Query required",
+      });
+    }
+
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, parseInt(req.query.limit) || 12);
+    const skip = (page - 1) * limit;
+
+    // ✅ ADD THIS
+
+    //  GENERATE CACHE KEY
+    const currentUserType = req.userType || "user";
+    const currentStorefront = storefrontFrom(req);
+
+    // tags
+    const normalizeTag = (tag) => tag.replace(/_/g, "-");
+
+    const tagsRaw = req.query.tags;
+    const tagsFilter = tagsRaw
+      ? String(tagsRaw)
+          .split(",")
+          .map((t) => normalizeTag(t.trim()))
+          .filter(Boolean)
+      : [];
+
+    const cacheKey = cacheConfig.generateKey("SEARCH", {
+      q,
+      page,
+      limit,
+      tags: tagsFilter.join(","),
+      userType: currentUserType,
+      storefront: currentStorefront,
+    });
+
+    const bypassCache = req.query._cb === "1";
+
+    const cachedData = bypassCache
+      ? null
+      : await cacheService.get(cacheKey);
+
+    if (cachedData) {
+      res.setHeader("X-Cache", "HIT");
+      setApiCacheHeaders(res);
+      return res.json(cachedData);
+    }
+
+    // Build search filter for name, title, and variants.productCode only
+    const searchRegex = { $regex: q, $options: "i" };
+    const extraClauses = [
+      {
+        $or: [
+          { name: searchRegex },
+          { title: searchRegex },
+          { "variants.productCode": searchRegex }
+        ]
+      }
+    ];
+
+    // tag filter
+    if (tagsFilter.length > 0) {
+      const taggedProducts = await ProductTag.find({
+        tags: { $in: tagsFilter },
+      })
+        .select("product")
+        .lean();
+
+      const taggedProductIds = taggedProducts.map(
+        (item) => item.product
+      );
+
+      if (!taggedProductIds.length) {
+        return res.json({
+          success: true,
+          total: 0,
+          page,
+          limit,
+          products: [],
+          userType: currentUserType,
+          storefront: currentStorefront,
+          appliedTags: tagsFilter,
+        });
+      }
+
+      extraClauses.push({
+        _id: { $in: taggedProductIds },
+      });
+    }
+
+    const filters = mongoCatalogAnd(
+      currentStorefront,
+      ...extraClauses
+    );
+
+    const total = await Product.countDocuments(filters);
+
+    const products = await Product.find(filters)
+      .skip(skip)
+      .limit(limit)
+      .populate("category")
+      .lean({ virtuals: true });
+
+    const productsWithData = await attachAppliedTagsToProducts(
+      products.map((product) =>
+        decorateProductForStorefront(
+          product,
+          currentUserType,
+          currentStorefront
+        )
+      )
+    );
+
+    const responseData = {
+      success: true,
+      total,
+      page,
+      limit,
+      products: productsWithData,
+      userType: currentUserType,
+      storefront: currentStorefront,
+      appliedTags: tagsFilter,
+    };
+
+    await cacheService.set(
+      cacheKey,
+      responseData,
+      cacheConfig.ttl.PRODUCT_SEARCH
+    );
+
+    res.setHeader("X-Cache", "MISS");
+    setApiCacheHeaders(res);
+
+    return res.json(responseData);
+  } catch (err) {
+    console.error("searchProducts:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
+  }
+};
+
+
+
+
+
 // =============================================
 // GET /products/search - WITH CACHE
 // =============================================
