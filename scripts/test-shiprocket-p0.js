@@ -308,12 +308,29 @@ function testForwardProgressIgnoresStalePickupCancelledInResetDetection() {
   });
   assert.strictEqual(reset.resetDetected, false);
 
+  const resetOfp = detectForwardOrderReset({
+    statusLabel: 'Out For Pickup',
+    awbCode: '14112362507328',
+    hadLocalAwb: true,
+    texts: ['PickupCancelled', 'Out For Pickup']
+  });
+  assert.strictEqual(resetOfp.resetDetected, false);
+
   const events = sanitizeTrackingEventsForProvider(
     [{ status: 'PickupCancelled', description: 'PickupCancelled', at: '2026-05-25' }],
     'Pickup Generated'
   );
   assert.strictEqual(events.length, 1);
   assert.strictEqual(events[0].status, 'Pickup Generated');
+
+  const eventsOfp = sanitizeTrackingEventsForProvider(
+    [
+      { status: 'PickupCancelled', description: 'PickupCancelled', at: '2026-05-25' },
+      { status: 'OFP', description: 'Out For Pickup', at: '2026-05-30' }
+    ],
+    'Out For Pickup'
+  );
+  assert.strictEqual(eventsOfp.some((e) => /pickupcancelled/i.test(String(e.status || ''))), false);
 }
 
 function run() {

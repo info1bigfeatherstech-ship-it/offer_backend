@@ -81,12 +81,12 @@ function testAwaitingApproval() {
   assert.strictEqual(view.actionCapabilities.accept, false);
 }
 
-function testProviderResetFromSnapshot() {
+function testProviderResetFromSnapshotWhenStillNew() {
   const order = {
     orderStatus: 'processing',
     shipmentInfo: {
       awbCode: 'AWBOLD',
-      providerStatus: 'Pickup Generated',
+      providerStatus: 'NEW',
       providerSnapshot: {
         resetDetected: true,
         resetReason: 'Shipment auto-cancelled due to no pickup done in 10 days',
@@ -95,6 +95,66 @@ function testProviderResetFromSnapshot() {
     }
   };
   assert.strictEqual(computeOpsState(order), OPS_STATES.PROVIDER_RESET);
+}
+
+function testProviderResetSnapshotIgnoredAfterReship() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Xpressbees Surface',
+      pickupDate: '2026-05-30',
+      manifestUrl: 'https://example.com/manifest.pdf',
+      labelUrl: 'https://example.com/label.pdf',
+      providerStatus: 'Pickup Generated',
+      providerSnapshot: {
+        resetDetected: true,
+        resetReason: 'Shipment auto-cancelled due to no pickup done in 10 days',
+        statusLabel: 'NEW',
+        pickupScheduled: true
+      }
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.LABEL_READY);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.downloadLabel, true);
+  assert.strictEqual(view.actionCapabilities.downloadManifest, true);
+  assert.strictEqual(view.actionCapabilities.shipNow, false);
+}
+
+function testOutForPickupKeepsLabelAndManifestDownloads() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '1346591722',
+      shiprocketOrderId: '1350319109',
+      courier: 'Xpressbees Surface',
+      pickupDate: '2026-05-30',
+      pickupScheduledAt: new Date('2026-05-29'),
+      manifestUrl: 'https://example.com/manifest.pdf',
+      labelUrl: 'https://example.com/label.pdf',
+      providerStatus: 'Out For Pickup',
+      rawEvents: [
+        { status: 'OFP', description: 'Out For Pickup', at: '2026-05-30' },
+        { status: 'DRC', description: 'Data Received', at: '2026-05-29' },
+        { status: 'PickupCancelled', description: 'PickupCancelled', at: '2026-05-25' }
+      ]
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.LABEL_READY);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.downloadLabel, true);
+  assert.strictEqual(view.actionCapabilities.downloadManifest, true);
+  assert.strictEqual(view.actionCapabilities.shipNow, false);
+  assert.strictEqual(view.opsState, OPS_STATES.LABEL_READY);
+  assert.match(String(view.providerStatusRaw || ''), /out for pickup/i);
 }
 
 function testAutoCancelMessageClassification() {
@@ -189,7 +249,9 @@ function testPickupScheduledWithLabelStillNeedsManifest() {
 function run() {
   testPickupExceptionState();
   testProviderResetState();
-  testProviderResetFromSnapshot();
+  testProviderResetFromSnapshotWhenStillNew();
+  testProviderResetSnapshotIgnoredAfterReship();
+  testOutForPickupKeepsLabelAndManifestDownloads();
   testAutoCancelMessageClassification();
   testAwbAssignedStaysProcessing();
   testAwbAssignedIgnoresStalePickupDate();

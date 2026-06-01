@@ -61,6 +61,14 @@ function collectSignalTexts(input) {
 }
 
 /**
+ * Courier is en route to collect the parcel (Shiprocket OFP / pre-pickup).
+ * @param {string} text
+ */
+function isOutForPickupStatus(text) {
+  return /out\s*for\s*pickup|\bofp\b/.test(normalizeText(text));
+}
+
+/**
  * @param {string[]} texts
  */
 function classifySignalTexts(texts) {
@@ -72,6 +80,10 @@ function classifySignalTexts(texts) {
     )
   ) {
     return CLASSIFICATION.PICKUP_EXCEPTION;
+  }
+
+  if (isOutForPickupStatus(combined)) {
+    return CLASSIFICATION.PICKUP_SCHEDULED;
   }
 
   if (
@@ -145,4 +157,5 @@ module.exports = {
   normalizeText,
   collectSignalTexts,
   classifySignalTexts,
+  isOutForPickupStatus,
 };

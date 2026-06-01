@@ -82,7 +82,7 @@ function isForwardProgressStatus(statusLabel, statusCode) {
     return true;
   }
   const label = normalizeText(statusLabel);
-  return /pickup generated|pickup scheduled|pickup queued|ready to ship|awb assigned|manifest|in transit|out for delivery|delivered|shipped/.test(
+  return /pickup generated|pickup scheduled|pickup queued|out for pickup|\bofp\b|ready to ship|awb assigned|manifest|in transit|out for delivery|delivered|shipped/.test(
     label
   );
 }
@@ -222,7 +222,7 @@ function mapProviderStatusToOrderStatus(rawStatus) {
   if (/in transit|picked up|dispatched|\bshipped\b/.test(s)) return 'shipped';
 
   if (
-    /awb assigned|ready to ship|pickup scheduled|pickup generated|pickup queue|in pickup queue|manifest|label|courier assigned|booked/.test(
+    /awb assigned|ready to ship|pickup scheduled|pickup generated|pickup queue|in pickup queue|out for pickup|\bofp\b|manifest|label|courier assigned|booked/.test(
       s
     )
   ) {

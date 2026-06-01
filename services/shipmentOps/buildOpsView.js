@@ -87,7 +87,9 @@ function buildCourierOpsDisplay({ opsState, order }) {
         line2: providerStatus || 'Sync required',
       };
     case OPS_STATES.PICKUP_SCHEDULED: {
-      const mirrorLabel = /pickup scheduled/i.test(providerStatus) ? providerStatus : 'PICKUP SCHEDULED';
+      const mirrorLabel = /pickup scheduled|out for pickup|\bofp\b/i.test(providerStatus)
+        ? providerStatus
+        : 'PICKUP SCHEDULED';
       const parts = [];
       if (pickupDate) parts.push(`For ${formatPickupDateHuman(pickupDate)}`);
       if (courier) parts.push(courier);

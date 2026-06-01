@@ -6,6 +6,7 @@ const { OPS_STATES, TERMINAL_ORDER_STATUSES } = require('./constants');
 const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
 const {
   classifyForwardStatusCode,
+  isForwardProgressStatus,
   isProviderStatusInTransit
 } = require('./shiprocketStatusMap');
 
@@ -72,6 +73,36 @@ function areFulfillmentArtifactsValid(shipmentInfo, signalClassification) {
 }
 
 /**
+ * Ignore stale resetDetected flags after a successful re-ship cycle.
+ * @param {object} shipmentInfo
+ */
+function isStaleProviderSnapshotReset(shipmentInfo) {
+  const si = shipmentInfo || {};
+  if (si.providerSnapshot?.resetDetected !== true) return false;
+  if (!hasAwb(si)) return false;
+  const liveStatus = si.providerStatus || si.providerSnapshot?.statusLabel;
+  return isForwardProgressStatus(liveStatus, si.providerSnapshot?.statusCode);
+}
+
+/**
+ * @param {object} shipmentInfo
+ * @returns {string|null}
+ */
+function resolveSnapshotClassification(shipmentInfo) {
+  const si = shipmentInfo || {};
+  if (si.providerSnapshot?.resetDetected === true && !isStaleProviderSnapshotReset(si)) {
+    return CLASSIFICATION.PROVIDER_RESET;
+  }
+  if (si.providerSnapshot?.statusCode != null) {
+    return classifyForwardStatusCode(si.providerSnapshot.statusCode, si.providerSnapshot.statusLabel);
+  }
+  if (si.providerSnapshot?.pickupScheduled) {
+    return CLASSIFICATION.PICKUP_SCHEDULED;
+  }
+  return null;
+}
+
+/**
  * @param {import('mongoose').Document|object} order
  * @returns {string} OPS_STATES value
  */
@@ -79,26 +110,30 @@ function computeOpsState(order) {
   const o = order && typeof order === 'object' ? order : {};
   const orderStatus = String(o.orderStatus || '').toLowerCase();
   const si = o.shipmentInfo && typeof o.shipmentInfo === 'object' ? o.shipmentInfo : {};
-  const snapshotClass =
-    si.providerSnapshot?.resetDetected === true
-      ? CLASSIFICATION.PROVIDER_RESET
-      : si.providerSnapshot?.statusCode != null
-        ? classifyForwardStatusCode(si.providerSnapshot.statusCode, si.providerSnapshot.statusLabel)
-        : si.providerSnapshot?.pickupScheduled
-          ? CLASSIFICATION.PICKUP_SCHEDULED
-          : null;
+  const snapshotClass = resolveSnapshotClassification(si);
 
   const signals = normalizeProviderSignals({
     providerStatus: si.providerStatus,
     rawEvents: si.rawEvents,
   });
 
-  const effectiveClass =
+  let effectiveClass =
     snapshotClass === CLASSIFICATION.PROVIDER_RESET || signals.classification === CLASSIFICATION.PROVIDER_RESET
       ? CLASSIFICATION.PROVIDER_RESET
       : signals.classification !== CLASSIFICATION.UNKNOWN
         ? signals.classification
         : snapshotClass || signals.classification;
+
+  if (
+    effectiveClass === CLASSIFICATION.PROVIDER_RESET &&
+    isStaleProviderSnapshotReset(si)
+  ) {
+    effectiveClass =
+      signals.classification !== CLASSIFICATION.UNKNOWN &&
+      signals.classification !== CLASSIFICATION.PROVIDER_RESET
+        ? signals.classification
+        : CLASSIFICATION.PICKUP_SCHEDULED;
+  }
 
   const providerInTransit = isProviderStatusInTransit(si.providerStatus);
 
@@ -170,5 +205,7 @@ module.exports = {
   hasShiprocketOrderId,
   isPickupBooked,
   areFulfillmentArtifactsValid,
+  isStaleProviderSnapshotReset,
+  resolveSnapshotClassification,
   normalizeProviderSignals,
 };
