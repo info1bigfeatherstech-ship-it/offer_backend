@@ -86,6 +86,8 @@ function appendResetEvent(existing, reason) {
 function buildPayloadFromSnapshot(snapshot, order) {
   const si = order.shipmentInfo || {};
   const hadLocalAwb = Boolean(si.awbCode || si.trackingNumber);
+  const hadLocalPickup = Boolean(si.pickupDate || si.pickupScheduledAt);
+  const hadLocalManifestOrLabel = Boolean(si.manifestUrl || si.labelUrl);
 
   const reset = detectForwardOrderReset({
     statusCode: snapshot.statusCode,
@@ -93,7 +95,11 @@ function buildPayloadFromSnapshot(snapshot, order) {
     statusMessage: snapshot.statusMessage,
     texts: snapshot.signalTexts,
     awbCode: snapshot.awbCode,
-    hadLocalAwb
+    hadLocalAwb,
+    hadLocalPickup,
+    hadLocalManifestOrLabel,
+    apiPickupScheduled: snapshot.pickupScheduled === true || Boolean(snapshot.pickupDate),
+    apiPickupDate: snapshot.pickupDate || null
   });
 
   if (
@@ -103,6 +109,24 @@ function buildPayloadFromSnapshot(snapshot, order) {
   ) {
     reset.resetDetected = false;
     reset.reason = null;
+  }
+
+  if (
+    !reset.resetDetected &&
+    !snapshot.awbCode &&
+    (hadLocalAwb ||
+      hadLocalPickup ||
+      hadLocalManifestOrLabel ||
+      snapshot.resetDetected ||
+      snapshot.pickupScheduled ||
+      snapshot.pickupDate)
+  ) {
+    reset.resetDetected = true;
+    reset.reason =
+      snapshot.resetReason ||
+      snapshot.statusMessage ||
+      reset.reason ||
+      'Stale Shiprocket shipment cycle without AWB';
   }
 
   if (reset.resetDetected) {
@@ -164,6 +188,25 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
 
   const { applyUpsertShipmentInfo } = require('../controllers/order.controller');
   const si = freshOrder.shipmentInfo || {};
+  const hasAwb = Boolean(
+    si.awbCode || si.trackingNumber || (snap?.awbCode && String(snap.awbCode).trim())
+  );
+
+  if (!hasAwb) {
+    if (si.pickupDate || si.pickupScheduledAt) {
+      await applyUpsertShipmentInfo({
+        order: freshOrder,
+        shipmentPayload: {
+          pickupDate: null,
+          pickupScheduledAt: null,
+          lastPickupError: null
+        },
+        trigger: trigger || 'reconcile_clear_stale_pickup_no_awb',
+        allowOrderStatusUpdate: false
+      });
+    }
+    return { success: true, pickupDate: null, source: 'no_awb' };
+  }
 
   if (snap && snap.pickupScheduled === false) {
     if (si.pickupDate || si.pickupScheduledAt) {
