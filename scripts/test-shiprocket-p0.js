@@ -102,8 +102,8 @@ function testParsePickupDateFromScheduleResponse() {
     '2026-05-18'
   );
   assert.strictEqual(
-    ShiprocketService.parsePickupDateFromScheduleResponse(null, '2026-05-17'),
-    '2026-05-17'
+    ShiprocketService.parsePickupDateFromScheduleResponse(null, '2026-05-25'),
+    '2026-05-25'
   );
 }
 
@@ -333,6 +333,32 @@ function testForwardProgressIgnoresStalePickupCancelledInResetDetection() {
   assert.strictEqual(eventsOfp.some((e) => /pickupcancelled/i.test(String(e.status || ''))), false);
 }
 
+function testPickupScheduledWithoutAwbIsStaleCycle() {
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    shipment_id: 1346591722,
+    status: 'PICKUP SCHEDULED',
+    pickup_scheduled_date: '18-May-2026',
+    pickup_status: 'PICKUP SCHEDULED For 18 May 2026',
+    shipments: { id: 1346591722, awb: '', status: 'PICKUP SCHEDULED' }
+  });
+  assert.strictEqual(snap.awbCode, null);
+  assert.strictEqual(snap.pickupScheduled, false);
+  assert.strictEqual(snap.pickupDate, null);
+  assert.strictEqual(snap.resetDetected, true);
+
+  const { detectForwardOrderReset } = require('../services/shipmentOps/shiprocketStatusMap');
+  const reset = detectForwardOrderReset({
+    statusLabel: 'PICKUP SCHEDULED',
+    statusCode: 4,
+    awbCode: null,
+    hadLocalAwb: true,
+    hadLocalPickup: true,
+    texts: ['pickup scheduled for 18 may 2026']
+  });
+  assert.strictEqual(reset.resetDetected, true);
+}
+
 function run() {
   testNormalizeYmdDate();
   testCourierPickupDateGuards();
@@ -342,6 +368,7 @@ function run() {
   testExtractForwardOrderAutoCancelSnapshot();
   testAwbAssignedIgnoresStalePickupFieldsAfterReship();
   testForwardProgressIgnoresStalePickupCancelledInResetDetection();
+  testPickupScheduledWithoutAwbIsStaleCycle();
   testMirrorProviderStatusWhenPickupScheduled();
   testPickupAlreadyScheduledMessage();
   testParsePickupDateFromScheduleResponse();

@@ -228,15 +228,45 @@ async function repairPickupStateAfterShiprocketSync(order, snap) {
   if (!fresh) return null;
 
   const si = fresh.shipmentInfo || {};
+  const hasLocalAwb = Boolean(si.awbCode || si.trackingNumber);
+  const hasLocalForwardArtifacts = Boolean(
+    si.pickupDate || si.pickupScheduledAt || si.manifestUrl || si.labelUrl
+  );
+
   const resetCheck = detectForwardOrderReset({
     statusCode: snap?.statusCode,
-    statusLabel: si.providerStatus,
+    statusLabel: snap?.providerStatus || si.providerStatus,
     statusMessage: snap?.statusMessage,
     texts: snap?.signalTexts,
-    awbCode: si.awbCode,
-    hadLocalAwb: Boolean(si.awbCode || si.trackingNumber)
+    awbCode: snap?.awbCode || null,
+    hadLocalAwb: hasLocalAwb,
+    hadLocalPickup: Boolean(si.pickupDate || si.pickupScheduledAt),
+    hadLocalManifestOrLabel: Boolean(si.manifestUrl || si.labelUrl),
+    apiPickupScheduled: snap?.pickupScheduled === true || Boolean(snap?.pickupDate),
+    apiPickupDate: snap?.pickupDate || null
   });
-  if (snap?.resetDetected || resetCheck.resetDetected) {
+
+  const staleNoAwbCycle =
+    !snap?.awbCode &&
+    !hasLocalAwb &&
+    (hasLocalForwardArtifacts ||
+      snap?.resetDetected ||
+      snap?.pickupScheduled ||
+      snap?.pickupDate ||
+      /pickup\s*scheduled|pickup\s*generated/i.test(String(snap?.providerStatus || '')));
+
+  if (snap?.resetDetected || resetCheck.resetDetected || staleNoAwbCycle) {
+    if (hasLocalAwb || hasLocalForwardArtifacts) {
+      return applyLocalShipmentReset(fresh, {
+        reason:
+          resetCheck.reason ||
+          snap?.resetReason ||
+          snap?.statusMessage ||
+          'Shipment reset on Shiprocket',
+        trigger: 'admin_sync_stale_pickup_reset',
+        appendEvent: true
+      });
+    }
     return fresh;
   }
 

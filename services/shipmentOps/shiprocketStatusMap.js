@@ -67,7 +67,7 @@ function collectForwardOrderTexts(root, shipment) {
 }
 
 /**
- * @param {{ statusCode?: number|null, statusLabel?: string|null, statusMessage?: string|null, texts?: string[], awbCode?: string|null, hadLocalAwb?: boolean }} input
+ * @param {{ statusCode?: number|null, statusLabel?: string|null, statusMessage?: string|null, texts?: string[], awbCode?: string|null, hadLocalAwb?: boolean, hadLocalPickup?: boolean, hadLocalManifestOrLabel?: boolean, apiPickupScheduled?: boolean, apiPickupDate?: string|null }} input
  */
 function isForwardProgressStatus(statusLabel, statusCode) {
   const cls = classifyForwardStatusCode(statusCode, statusLabel);
@@ -123,6 +123,9 @@ function detectForwardOrderReset(input) {
   const statusCode = Number(input.statusCode);
   const label = normalizeText(input.statusLabel);
   const hasAwb = Boolean(input.awbCode && String(input.awbCode).trim());
+  const hadLocalForwardCycle = Boolean(
+    input.hadLocalAwb || input.hadLocalPickup || input.hadLocalManifestOrLabel
+  );
 
   if (hasAwb && isForwardProgressStatus(input.statusLabel, input.statusCode)) {
     if (!Number.isFinite(statusCode) || !CANCEL_STATUS_CODES.has(statusCode)) {
@@ -156,10 +159,21 @@ function detectForwardOrderReset(input) {
 
   const combined = texts.join(' ');
 
+  // Shiprocket invariant: no AWB means no active pickup cycle.
+  if (!hasAwb && hadLocalForwardCycle) {
+    return {
+      resetDetected: true,
+      reason:
+        input.statusMessage ||
+        input.statusLabel ||
+        'AWB cleared on Shiprocket — re-ship required',
+      classification: CLASSIFICATION.PROVIDER_RESET
+    };
+  }
+
   if (
     /^new$/.test(label) &&
-    (/auto\s*cancel|pickup\s*not\s*done|no pickup done/.test(combined) ||
-      (input.hadLocalAwb && !input.awbCode))
+    (/auto\s*cancel|pickup\s*not\s*done|no pickup done/.test(combined) || hadLocalForwardCycle)
   ) {
     return {
       resetDetected: true,

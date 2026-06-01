@@ -902,8 +902,12 @@ class ShiprocketService {
       statusMessage: statusMessage || null,
       texts: signalTexts,
       awbCode: awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null,
-      hadLocalAwb: false
+      hadLocalAwb: false,
+      apiPickupScheduled: Boolean(pickupDate),
+      apiPickupDate: pickupDate
     });
+
+    const trimmedAwb = awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null;
 
     const forwardClass = classifyForwardStatusCode(
       Number.isFinite(statusCode) ? statusCode : null,
@@ -912,12 +916,14 @@ class ShiprocketService {
 
     let effectivePickupDate = pickupDate;
     let pickupScheduled;
+    let resetDetected = resetInfo.resetDetected;
+    let resetReason = resetInfo.reason;
 
     if (
       forwardClass === CLASSIFICATION.PICKUP_SCHEDULED ||
       forwardClass === CLASSIFICATION.MANIFEST
     ) {
-      pickupScheduled = true;
+      pickupScheduled = Boolean(trimmedAwb);
     } else if (
       forwardClass === CLASSIFICATION.AWB_ASSIGNED ||
       forwardClass === CLASSIFICATION.PROVIDER_RESET ||
@@ -928,13 +934,26 @@ class ShiprocketService {
       effectivePickupDate = null;
     } else {
       pickupScheduled =
-        Boolean(pickupDate) ||
-        statusCode === 4 ||
-        statusCode === 12 ||
-        statusCode === 13 ||
-        statusCode === 14 ||
-        statusCode === 15 ||
-        /pickup\s*scheduled|pickup\s*queued|in\s+pickup\s+queue|manifested/i.test(statusLabel);
+        Boolean(trimmedAwb && pickupDate) ||
+        (Boolean(trimmedAwb) &&
+          (statusCode === 4 ||
+            statusCode === 12 ||
+            statusCode === 13 ||
+            statusCode === 14 ||
+            statusCode === 15 ||
+            /pickup\s*scheduled|pickup\s*queued|in\s+pickup\s+queue|manifested/i.test(statusLabel)));
+    }
+
+    // Shiprocket invariant: pickup requires AWB — never mirror stale pickup without AWB.
+    if (!trimmedAwb) {
+      if (pickupScheduled || effectivePickupDate) {
+        resetDetected = true;
+        resetReason =
+          resetReason ||
+          'Pickup scheduled without AWB on Shiprocket — stale shipment cycle';
+      }
+      effectivePickupDate = null;
+      pickupScheduled = false;
     }
 
     const providerStatus = ShiprocketService.resolveMirrorProviderStatusFromOrderShow(root, {
@@ -947,10 +966,10 @@ class ShiprocketService {
       statusCode: Number.isFinite(statusCode) ? statusCode : null,
       statusLabel: providerStatus,
       statusMessage: statusMessage || null,
-      awbCode: awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null,
+      awbCode: trimmedAwb,
       pickupScheduled,
-      resetDetected: resetInfo.resetDetected,
-      resetReason: resetInfo.reason,
+      resetDetected,
+      resetReason,
       syncedAt: new Date().toISOString()
     };
 
@@ -961,7 +980,7 @@ class ShiprocketService {
           : null,
       shipmentId:
         shipmentIdRaw != null && String(shipmentIdRaw).trim() ? String(shipmentIdRaw).trim() : null,
-      awbCode: awbCode != null && String(awbCode).trim() ? String(awbCode).trim() : null,
+      awbCode: trimmedAwb,
       trackingNumber:
         trackingNumber != null && String(trackingNumber).trim()
           ? String(trackingNumber).trim()
@@ -975,8 +994,8 @@ class ShiprocketService {
       statusCode: Number.isFinite(statusCode) ? statusCode : null,
       statusMessage: statusMessage || null,
       signalTexts,
-      resetDetected: resetInfo.resetDetected,
-      resetReason: resetInfo.reason,
+      resetDetected,
+      resetReason,
       providerSnapshot,
       raw: root
     };

@@ -100,7 +100,10 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       break;
 
     case OPS_STATES.READY_TO_SHIP:
-      caps.shipNow = st === 'confirmed' && !awb && gateOk;
+      caps.shipNow =
+        !awb &&
+        gateOk &&
+        (st === 'confirmed' || (st === 'processing' && Boolean(si.shiprocketOrderId)));
       caps.syncShiprocket = shiprocket && gateOk;
       if (!gateOk && fulfillmentPaymentGate?.message) {
         blockReasons.shipNow = fulfillmentPaymentGate.message;

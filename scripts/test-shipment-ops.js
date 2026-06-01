@@ -246,6 +246,86 @@ function testPickupScheduledWithLabelStillNeedsManifest() {
   assert.match(String(view.courierOpsLine1), /pickup scheduled/i);
 }
 
+function testStalePickupScheduledWithoutAwbTriggersReset() {
+  const shiprocketInstance = require('../utils/shiprocket');
+  const ShiprocketService = shiprocketInstance.constructor;
+  const { buildPayloadFromSnapshot } = require('../services/shiprocketReconcile.service');
+
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    shipment_id: 1346591722,
+    status: 'PICKUP SCHEDULED',
+    pickup_scheduled_date: '18-May-2026',
+    pickup_status: 'PICKUP SCHEDULED For 18 May 2026',
+    shipments: { id: 1346591722, awb: '', status: 'PICKUP SCHEDULED' }
+  });
+  assert.strictEqual(snap.awbCode, null);
+  assert.strictEqual(snap.pickupScheduled, false);
+  assert.strictEqual(snap.pickupDate, null);
+  assert.strictEqual(snap.resetDetected, true);
+
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: 'AWBOLD',
+      shiprocketOrderId: '1350319109',
+      shipmentId: '1346591722',
+      pickupDate: '2026-05-18',
+      manifestUrl: 'https://example.com/manifest.pdf',
+      providerStatus: 'PICKUP SCHEDULED'
+    }
+  };
+  const built = buildPayloadFromSnapshot(snap, order);
+  assert.strictEqual(built.reset, true);
+}
+
+function testReadyToShipProcessingAllowsShipNow() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      shiprocketOrderId: '1350319109',
+      shipmentId: '1346591722',
+      providerStatus: 'NEW'
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.READY_TO_SHIP);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.shipNow, true);
+  assert.strictEqual(view.primaryAction, 'shipNow');
+}
+
+function testActiveAwbPickupScheduledDoesNotReset() {
+  const shiprocketInstance = require('../utils/shiprocket');
+  const ShiprocketService = shiprocketInstance.constructor;
+  const { buildPayloadFromSnapshot } = require('../services/shiprocketReconcile.service');
+
+  const snap = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1350319109,
+    shipment_id: 1346591722,
+    status: 'PICKUP SCHEDULED',
+    awb: '14112362507328',
+    pickup_scheduled_date: '30-May-2026',
+    pickup_status: 'PICKUP SCHEDULED For 30 May 2026'
+  });
+  assert.strictEqual(snap.pickupScheduled, true);
+  assert.strictEqual(snap.resetDetected, false);
+
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shiprocketOrderId: '1350319109',
+      shipmentId: '1346591722',
+      pickupDate: '2026-05-30',
+      providerStatus: 'PICKUP SCHEDULED'
+    }
+  };
+  const built = buildPayloadFromSnapshot(snap, order);
+  assert.strictEqual(built.reset, false);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -256,6 +336,9 @@ function run() {
   testAwbAssignedStaysProcessing();
   testAwbAssignedIgnoresStalePickupDate();
   testPickupScheduledWithLabelStillNeedsManifest();
+  testStalePickupScheduledWithoutAwbTriggersReset();
+  testReadyToShipProcessingAllowsShipNow();
+  testActiveAwbPickupScheduledDoesNotReset();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');
