@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront-scope.middleware');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
+const refreshTokenSession = require('../services/refreshTokenSession.service');
 
 // Import from OTP service
 const {
@@ -107,15 +108,13 @@ const generateAccessToken = (userId, userType = 'user', role = 'user', portal = 
 
 const generateRefreshToken = (userId) => {
   return jwt.sign(
-    { id: userId, type: 'refresh' },
+    { id: userId, type: 'refresh', jti: crypto.randomUUID() },
     process.env.REFRESH_TOKEN_SECRET,
     { expiresIn: REFRESH_EXPIRES }
   );
 };
 
-const hashToken = (token) => {
-  return crypto.createHash('sha256').update(token).digest('hex');
-};
+const hashToken = refreshTokenSession.hashRefreshToken;
 
 const normalizePortal = (rawPortal) => {
   const normalized = String(rawPortal || '').trim().toLowerCase();
@@ -205,48 +204,7 @@ const listRefreshCookieCandidates = (req, preferredPortal) => {
   return candidates;
 };
 
-const resolveRefreshSession = async (refreshToken) => {
-  if (!refreshToken) return null;
-
-  let decoded;
-  try {
-    decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
-  } catch {
-    return null;
-  }
-
-  if (decoded.type !== 'refresh') {
-    return null;
-  }
-
-  const hashedToken = hashToken(refreshToken);
-  const user = await User.findById(decoded.id).select(
-    '+refreshTokens.token +refreshTokens.previousToken +refreshTokens.previousTokenValidUntil'
-  );
-  if (!user) {
-    return null;
-  }
-
-  const now = new Date();
-  user.refreshTokens = user.refreshTokens.filter((t) => t.expiresAt > now);
-
-  const tokenIndex = user.refreshTokens.findIndex((t) => {
-    if (t.token === hashedToken) return true;
-    if (
-      t.previousToken === hashedToken &&
-      t.previousTokenValidUntil &&
-      new Date(t.previousTokenValidUntil) > now
-    ) {
-      return true;
-    }
-    return false;
-  });
-  if (tokenIndex === -1) {
-    return null;
-  }
-
-  return { user, tokenIndex, decoded, presentedHash: hashedToken };
-};
+const resolveRefreshSession = (refreshToken) => refreshTokenSession.lookupSession(refreshToken);
 
 const isPrivilegedRole = (role) => {
   return PRIVILEGED_OPERATIONAL_ROLES.has(String(role || '').trim().toLowerCase());
@@ -557,13 +515,9 @@ const verifyOTPAndLogin = async (req, res) => {
       const refreshToken = generateRefreshToken(user._id);
       const hashedRefreshToken = hashToken(refreshToken);
 
-      user.refreshTokens = user.refreshTokens || [];
-      user.refreshTokens = user.refreshTokens.filter(t => t.expiresAt > new Date());
-      user.refreshTokens.push({
-        token: hashedRefreshToken,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+      await refreshTokenSession.appendSession(user._id, {
+        hashedToken: hashedRefreshToken
       });
-      await user.save();
 
       setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
@@ -633,16 +587,12 @@ const verifyOTPAndLogin = async (req, res) => {
 
     const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Unknown';
 
-    user.refreshTokens = user.refreshTokens || [];
-    user.refreshTokens = user.refreshTokens.filter(t => t.expiresAt > new Date());
-    user.refreshTokens.push({
-      token: hashedRefreshToken,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      createdAt: new Date(),
-      deviceInfo: deviceInfo
-    });
-
     await user.save();
+
+    await refreshTokenSession.appendSession(user._id, {
+      hashedToken: hashedRefreshToken,
+      deviceInfo
+    });
 
     setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
@@ -684,7 +634,7 @@ const login = async (req, res) => {
     const portal = normalizePortal(req.body.portal || req.headers['x-auth-portal']);
 
     const user = await User.findOne(buildLoginUserLookup(identifier, portal))
-      .select("+password +refreshTokens name email phone userType role allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
+      .select("+password name email phone userType role allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
 
     if (!user) {
       return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
@@ -722,21 +672,12 @@ const hashedRefreshToken = hashToken(refreshToken);
 // Get device info from request headers
 const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Unknown';
 
-// Remove expired tokens
-user.refreshTokens = user.refreshTokens || [];
-user.refreshTokens = user.refreshTokens.filter(t => t.expiresAt > new Date());
-
-// Add new token
-user.refreshTokens.push({
-  token: hashedRefreshToken,
-  expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-  createdAt: new Date(),
-  deviceInfo: deviceInfo
+await refreshTokenSession.appendSession(user._id, {
+  hashedToken: hashedRefreshToken,
+  deviceInfo
 });
 
-   await user.save();
-
-    setRefreshTokenCookie(req, res, portal || 'ecomm', refreshToken);
+   setRefreshTokenCookie(req, res, portal || 'ecomm', refreshToken);
 
 
     return res.status(200).json({
@@ -954,11 +895,7 @@ const logout = async (req, res) => {
       const hashedToken = hashToken(refreshToken);
       const decoded = jwt.decode(refreshToken);
       if (decoded?.id) {
-        const user = await User.findById(decoded.id);
-        if (user) {
-          user.refreshTokens = user.refreshTokens.filter(t => t.token !== hashedToken);
-          await user.save();
-        }
+        await refreshTokenSession.revokeSessionByTokenHash(decoded.id, hashedToken);
       }
     }
 
@@ -988,12 +925,14 @@ const refreshAccessToken = async (req, res) => {
 
     let session = null;
     let cookieName = null;
+    let presentedRefreshToken = null;
 
     for (const candidate of candidates) {
       const resolved = await resolveRefreshSession(candidate.refreshToken);
       if (resolved) {
         session = resolved;
         cookieName = candidate.cookieName;
+        presentedRefreshToken = candidate.refreshToken;
         break;
       }
     }
@@ -1002,7 +941,7 @@ const refreshAccessToken = async (req, res) => {
       return respondAuthError(res, 401, 'SESSION_EXPIRED', 'Session expired. Please login again.');
     }
 
-    const { user, tokenIndex, presentedHash } = session;
+    const { user, presentedHash, slot, matchKind } = session;
 
     const refreshedPortal =
       refreshPortal ||
@@ -1024,15 +963,8 @@ const refreshAccessToken = async (req, res) => {
       );
     }
 
-    const slot = user.refreshTokens[tokenIndex];
-    const now = new Date();
-    const isRotationReplay =
-      slot.previousToken === presentedHash &&
-      slot.previousTokenValidUntil &&
-      new Date(slot.previousTokenValidUntil) > now;
-
     // Concurrent refresh with already-rotated cookie: issue access token only (no second rotation).
-    if (isRotationReplay) {
+    if (matchKind === 'replay') {
       const newAccessToken = generateAccessToken(user._id, user.userType, user.role, refreshedPortal);
       return res.status(200).json({
         success: true,
@@ -1043,20 +975,25 @@ const refreshAccessToken = async (req, res) => {
     const newAccessToken = generateAccessToken(user._id, user.userType, user.role, refreshedPortal);
     const newRefreshToken = generateRefreshToken(user._id);
     const newHashedToken = hashToken(newRefreshToken);
-
     const deviceInfo = slot.deviceInfo || 'Unknown';
-    const rotatedFromHash = presentedHash || slot.token;
 
-    user.refreshTokens[tokenIndex] = {
-      token: newHashedToken,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      createdAt: new Date(),
-      deviceInfo,
-      previousToken: rotatedFromHash,
-      previousTokenValidUntil: new Date(Date.now() + 60 * 1000)
-    };
+    const rotation = await refreshTokenSession.rotateSession(
+      user._id,
+      presentedHash,
+      newHashedToken,
+      deviceInfo
+    );
 
-    await user.save();
+    if (!rotation.rotated) {
+      const replaySession = await refreshTokenSession.lookupSession(presentedRefreshToken);
+      if (replaySession && replaySession.matchKind === 'replay') {
+        return res.status(200).json({
+          success: true,
+          accessToken: newAccessToken
+        });
+      }
+      return respondAuthError(res, 401, 'SESSION_EXPIRED', 'Session expired. Please login again.');
+    }
 
     setRefreshTokenCookie(req, res, refreshedPortal, newRefreshToken);
 
@@ -1275,18 +1212,12 @@ const hashedRefreshToken = hashToken(refreshToken);
 // Get device info
 const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
 
-// Remove expired tokens
-user.refreshTokens = user.refreshTokens.filter(t => t.expiresAt > new Date());
-
-// Add new token
-user.refreshTokens.push({
-  token: hashedRefreshToken,
-  expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-  createdAt: new Date(),
-  deviceInfo: deviceInfo
-});
-
 await user.save();
+
+await refreshTokenSession.appendSession(user._id, {
+  hashedToken: hashedRefreshToken,
+  deviceInfo
+});
 
 setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
@@ -1315,16 +1246,13 @@ setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 // Get all active devices
 const getActiveDevices = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('refreshTokens');
-    if (!user) {
-      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
+    const devices = await refreshTokenSession.listActiveSessions(req.userId);
+    if (!devices.length) {
+      const user = await User.findById(req.userId).select('_id');
+      if (!user) {
+        return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
+      }
     }
-    const devices = user.refreshTokens.map(token => ({
-      deviceId: token._id,
-      deviceInfo: token.deviceInfo,
-      lastActive: token.createdAt,
-      expiresAt: token.expiresAt
-    }));
     return res.json({ success: true, devices });
   } catch (error) {
     return res.status(500).json({
@@ -1342,12 +1270,11 @@ const logoutDevice = async (req, res) => {
     if (!deviceId) {
       return res.status(400).json({ success: false, code: 'DEVICE_ID_REQUIRED', message: 'deviceId is required' });
     }
-    const user = await User.findById(req.userId);
+    const user = await User.findById(req.userId).select('_id');
     if (!user) {
       return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
     }
-    user.refreshTokens = user.refreshTokens.filter(t => t._id.toString() !== deviceId);
-    await user.save();
+    await refreshTokenSession.revokeSessionByDeviceId(req.userId, deviceId);
     return res.json({ success: true, message: 'Device logged out successfully' });
   } catch (error) {
     return res.status(500).json({
@@ -1361,12 +1288,11 @@ const logoutDevice = async (req, res) => {
 // Logout from all devices
 const logoutAllDevices = async (req, res) => {
   try {
-    const user = await User.findById(req.userId);
+    const user = await User.findById(req.userId).select('_id');
     if (!user) {
       return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
     }
-    user.refreshTokens = [];
-    await user.save();
+    await refreshTokenSession.revokeAllSessions(req.userId);
     clearRefreshTokenCookie(req, res, 'ecomm');
     return res.json({ success: true, message: 'Logged out from all devices' });
   } catch (error) {

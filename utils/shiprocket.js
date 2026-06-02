@@ -826,6 +826,28 @@ class ShiprocketService {
     return null;
   }
 
+  static extractShiprocketPickupIdFromOrderShow(root) {
+    if (!root || typeof root !== 'object') return null;
+    const sh0 = ShiprocketService.getPrimaryShipment(root) || {};
+    const candidates = [
+      root.pickup_id,
+      root.pickupId,
+      sh0.pickup_id,
+      sh0.pickupId,
+      root.response?.pickup_id,
+      sh0.response?.pickup_id
+    ];
+    for (const c of candidates) {
+      const normalized = ShiprocketService.normalizeShiprocketPickupId(c);
+      if (normalized) return normalized;
+    }
+    const statusText = [root.pickup_status, sh0.pickup_status, root.status, sh0.status]
+      .filter(Boolean)
+      .join(' ');
+    const m = /SRPID[-\s]?(\d+)/i.exec(statusText);
+    return m ? `SRPID-${m[1]}` : null;
+  }
+
   /**
    * Map GET /external/orders/show/{id} payload to a stable snapshot for DB sync.
    * @param {object|null} root — normalized order object from Shiprocket
@@ -863,6 +885,7 @@ class ShiprocketService {
       null;
 
     const pickupDate = ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(root);
+    const shiprocketPickupId = ShiprocketService.extractShiprocketPickupIdFromOrderShow(root);
 
     const statusCodeRaw = root.status_code ?? root.current_status_id ?? sh0.status ?? sh0.status_code;
     const statusCode = Number(statusCodeRaw);
@@ -946,7 +969,13 @@ class ShiprocketService {
 
     // Shiprocket invariant: pickup requires AWB — never mirror stale pickup without AWB.
     if (!trimmedAwb) {
-      if (pickupScheduled || effectivePickupDate) {
+      const stalePickupMirror =
+        pickupScheduled ||
+        effectivePickupDate ||
+        forwardClass === CLASSIFICATION.PICKUP_SCHEDULED ||
+        forwardClass === CLASSIFICATION.MANIFEST ||
+        /pickup\s*scheduled|pickup\s*generated|pickup\s*queued|in\s+pickup\s+queue/i.test(statusLabel);
+      if (stalePickupMirror) {
         resetDetected = true;
         resetReason =
           resetReason ||
@@ -990,6 +1019,7 @@ class ShiprocketService {
       manifestUrl: manifestUrl != null && String(manifestUrl).trim() ? String(manifestUrl).trim() : null,
       pickupDate: effectivePickupDate,
       pickupScheduled,
+      shiprocketPickupId,
       providerStatus,
       statusCode: Number.isFinite(statusCode) ? statusCode : null,
       statusMessage: statusMessage || null,
@@ -1622,6 +1652,9 @@ class ShiprocketService {
         } else {
           addShip(item);
           addOrder(item);
+          if (typeof item === 'string' && !/^\d+$/.test(item.trim())) {
+            addChannel(item);
+          }
         }
       }
     }
@@ -1642,6 +1675,22 @@ class ShiprocketService {
     if (Number.isFinite(oid) && oid > 0 && orderIds.has(oid)) return true;
     if (cid && channelIds.has(cid)) return true;
     return false;
+  }
+
+  static extractPickupIdFromBatchNode(node) {
+    if (!node || typeof node !== 'object') return null;
+    return ShiprocketService.normalizeShiprocketPickupId(node.pickup_id ?? node.pickupId ?? null);
+  }
+
+  /** Normalize Shiprocket pickup batch id to `SRPID-48421432`. */
+  static normalizeShiprocketPickupId(value) {
+    if (value == null || value === '') return null;
+    const s = String(value).trim();
+    if (!s) return null;
+    const prefixed = /^SRPID[-\s]?(\d+)$/i.exec(s);
+    if (prefixed) return `SRPID-${prefixed[1]}`;
+    if (/^\d+$/.test(s)) return `SRPID-${s}`;
+    return s;
   }
 
   static extractScheduledDateFromPickupBatchNode(node) {
@@ -1668,18 +1717,21 @@ class ShiprocketService {
 
   static scorePickupBatchNode(node) {
     const pickupIdStr = String(node?.pickup_id ?? node?.pickupId ?? '');
+    const pickupStatus = String(node?.pickup_status || node?.pickup_status_text || '');
     let score = 0;
     if (/srpid/i.test(pickupIdStr)) score += 100;
     if (node?.pickup_scheduled_date) score += 20;
-    if (/pickup\s*scheduled/i.test(String(node?.pickup_status || ''))) score += 10;
+    if (/pickup\s*scheduled/i.test(pickupStatus)) score += 10;
+    if (/pickup\s*completed|completed/i.test(pickupStatus)) score += 15;
     return score;
   }
 
   /**
    * Match panel "Pickups & Manifests" list — pickup batch (SRPID-…) contains many shipments.
-   * Returns the batch scheduled date ("For 18 May 2026"), not admin-selected dates.
+   * Returns scheduled date and pickup id when the shipment/order ref matches a batch row.
+   * @returns {{ pickupDate: string|null, pickupId: string|null, score: number }|null}
    */
-  static findPickupDateInPickupListPayload(data, refs) {
+  static findPickupBatchMatchInPickupListPayload(data, refs) {
     const r = ShiprocketService.normalizePickupListRefs(refs);
     const sid = Number(r.shipmentId);
     const oid = Number(r.shiprocketOrderId);
@@ -1713,10 +1765,21 @@ class ShiprocketService {
 
       if (looksLikePickupBatch && ShiprocketService.nodeMatchesPickupRefs(node, r)) {
         const scheduled = ShiprocketService.extractScheduledDateFromPickupBatchNode(node);
-        if (scheduled && ShiprocketService.isPlausibleCourierPickupYmd(scheduled)) {
-          const score = ShiprocketService.scorePickupBatchNode(node);
-          if (!best || score > best.score || (score === best.score && scheduled > best.ymd)) {
-            best = { ymd: scheduled, score };
+        const pickupId = ShiprocketService.extractPickupIdFromBatchNode(node);
+        const plausibleDate =
+          scheduled && ShiprocketService.isPlausibleCourierPickupYmd(scheduled) ? scheduled : null;
+        const score =
+          ShiprocketService.scorePickupBatchNode(node) +
+          (plausibleDate ? 50 : 0) +
+          (pickupId ? 30 : 0);
+
+        if (pickupId || plausibleDate) {
+          if (
+            !best ||
+            score > best.score ||
+            (score === best.score && plausibleDate && (!best.pickupDate || plausibleDate > best.pickupDate))
+          ) {
+            best = { pickupDate: plausibleDate, pickupId, score };
           }
         }
       }
@@ -1725,10 +1788,18 @@ class ShiprocketService {
         if (v && typeof v === 'object') queue.push(v);
       }
     }
-    return best ? best.ymd : null;
+    return best;
   }
 
-  async fetchPickupDateForShipment({ shipmentId, shiprocketOrderId, channelOrderId } = {}) {
+  /**
+   * @deprecated use findPickupBatchMatchInPickupListPayload — date only
+   */
+  static findPickupDateInPickupListPayload(data, refs) {
+    const match = ShiprocketService.findPickupBatchMatchInPickupListPayload(data, refs);
+    return match?.pickupDate || null;
+  }
+
+  async fetchPickupBatchForShipment({ shipmentId, shiprocketOrderId, channelOrderId } = {}) {
     const sid = this.parseNumericShipmentId(shipmentId);
     const oid = this.parseNumericShiprocketOrderId(shiprocketOrderId);
     const cid = channelOrderId != null ? String(channelOrderId).trim() : '';
@@ -1758,7 +1829,7 @@ class ShiprocketService {
     }
 
     for (const { path, params: baseParams } of baseAttempts) {
-      for (let page = 1; page <= 5; page += 1) {
+      for (let page = 1; page <= 15; page += 1) {
         try {
           const data = await this.requestWithAuth({
             method: 'get',
@@ -1766,12 +1837,21 @@ class ShiprocketService {
             params: { ...baseParams, page },
             timeout: 25000
           });
-          const pickupDate = ShiprocketService.findPickupDateInPickupListPayload(data, refs);
-          if (
-            pickupDate &&
-            ShiprocketService.isPlausibleCourierPickupYmd(pickupDate)
-          ) {
-            return { success: true, pickupDate, source: path, raw: data };
+          const match = ShiprocketService.findPickupBatchMatchInPickupListPayload(data, refs);
+          if (match && (match.pickupId || match.pickupDate)) {
+            const plausibleDate =
+              match.pickupDate && ShiprocketService.isPlausibleCourierPickupYmd(match.pickupDate)
+                ? match.pickupDate
+                : null;
+            if (match.pickupId || plausibleDate) {
+              return {
+                success: true,
+                pickupDate: plausibleDate,
+                shiprocketPickupId: match.pickupId || null,
+                source: path,
+                raw: data
+              };
+            }
           }
           const rows = Array.isArray(data?.data)
             ? data.data
@@ -1794,9 +1874,23 @@ class ShiprocketService {
     }
     return {
       success: false,
-      code: 'PICKUP_DATE_NOT_IN_LIST',
-      message: 'Pickup date not found in Shiprocket pickup list'
+      code: 'PICKUP_BATCH_NOT_IN_LIST',
+      message: 'Pickup batch not found in Shiprocket pickup list'
     };
+  }
+
+  /** @deprecated use fetchPickupBatchForShipment */
+  async fetchPickupDateForShipment(opts) {
+    const res = await this.fetchPickupBatchForShipment(opts);
+    if (!res.success) return res;
+    if (!res.pickupDate) {
+      return {
+        success: false,
+        code: 'PICKUP_DATE_NOT_IN_LIST',
+        message: 'Pickup date not found in Shiprocket pickup list'
+      };
+    }
+    return res;
   }
 
   /**
@@ -1814,6 +1908,22 @@ class ShiprocketService {
     const cid = channelOrderId != null ? String(channelOrderId).trim() : '';
 
     const lookup = await this.fetchForwardOrderSnapshot({ shiprocketOrderId, channelOrderId });
+    let listRes = null;
+
+    const loadPickupListBatch = async () => {
+      if (listRes) return listRes;
+      listRes = await this.fetchPickupBatchForShipment({
+        shipmentId: sid,
+        shiprocketOrderId:
+          oid ||
+          (lookup.success
+            ? this.parseNumericShiprocketOrderId(lookup.snapshot?.shiprocketOrderId)
+            : null),
+        channelOrderId: cid
+      });
+      return listRes;
+    };
+
     if (lookup.success && lookup.snapshot) {
       if (!sid && lookup.snapshot.shipmentId) {
         sid = this.parseNumericShipmentId(lookup.snapshot.shipmentId);
@@ -1825,38 +1935,39 @@ class ShiprocketService {
             ? ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(lookup.raw)
             : null);
         if (fromShow && ShiprocketService.isPlausibleCourierPickupYmd(fromShow)) {
-          return { success: true, pickupDate: fromShow, source: 'orders_show', shipmentId: sid };
+          const batch = allowPickupListFallback ? await loadPickupListBatch() : null;
+          return {
+            success: true,
+            pickupDate: fromShow,
+            shiprocketPickupId: batch?.shiprocketPickupId || null,
+            source: 'orders_show',
+            shipmentId: sid
+          };
         }
       }
       if (lookup.snapshot.pickupScheduled === false || allowPickupListFallback === false) {
         return {
           success: false,
           pickupDate: null,
+          shiprocketPickupId: null,
           source: 'orders_show_no_pickup',
           shipmentId: sid
         };
       }
     }
 
-    const listRes = await this.fetchPickupDateForShipment({
-      shipmentId: sid,
-      shiprocketOrderId:
-        oid ||
-        (lookup.success
-          ? this.parseNumericShiprocketOrderId(lookup.snapshot?.shiprocketOrderId)
-          : null),
-      channelOrderId: cid
-    });
-    if (listRes.success && listRes.pickupDate) {
+    const batch = await loadPickupListBatch();
+    if (batch?.success && (batch.pickupDate || batch.shiprocketPickupId)) {
       return {
         success: true,
-        pickupDate: listRes.pickupDate,
+        pickupDate: batch.pickupDate || null,
+        shiprocketPickupId: batch.shiprocketPickupId || null,
         source: 'pickup_list',
         shipmentId: sid
       };
     }
 
-    return { success: false, pickupDate: null, source: 'none', shipmentId: sid };
+    return { success: false, pickupDate: null, shiprocketPickupId: null, source: 'none', shipmentId: sid };
   }
 
   isPickupAlreadyScheduledMessage(message) {
@@ -1873,6 +1984,10 @@ class ShiprocketService {
 
   normalizeYmdDate(value) {
     return ShiprocketService.normalizeYmdDate(value);
+  }
+
+  normalizeShiprocketPickupId(value) {
+    return ShiprocketService.normalizeShiprocketPickupId(value);
   }
 
   isPlausibleCourierPickupYmd(ymd, opts) {

@@ -43,6 +43,7 @@ async function applyLocalShipmentReset(order, options = {}) {
     assignedCourierId: null,
     pickupDate: null,
     pickupScheduledAt: null,
+    shiprocketPickupId: null,
     manifestUrl: null,
     labelUrl: null,
     manifestGeneratedAt: null,
@@ -144,6 +145,7 @@ function buildPayloadFromSnapshot(snapshot, order) {
         assignedCourierId: null,
         manifestUrl: null,
         labelUrl: null,
+        shiprocketPickupId: null,
         events: appendResetEvent(si.rawEvents, reset.reason)
       }
     };
@@ -166,6 +168,9 @@ function buildPayloadFromSnapshot(snapshot, order) {
   if (snapshot.labelUrl) payload.labelUrl = snapshot.labelUrl;
   if (snapshot.manifestUrl) payload.manifestUrl = snapshot.manifestUrl;
   if (snapshot.providerStatus) payload.providerStatus = snapshot.providerStatus;
+  if (snapshot.shiprocketPickupId) {
+    payload.shiprocketPickupId = snapshot.shiprocketPickupId;
+  }
   if (snapshot.pickupScheduled === true && snapshot.pickupDate) {
     payload.pickupDate = snapshot.pickupDate;
   } else if (snapshot.pickupScheduled === false) {
@@ -193,12 +198,13 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
   );
 
   if (!hasAwb) {
-    if (si.pickupDate || si.pickupScheduledAt) {
+    if (si.pickupDate || si.pickupScheduledAt || si.shiprocketPickupId) {
       await applyUpsertShipmentInfo({
         order: freshOrder,
         shipmentPayload: {
           pickupDate: null,
           pickupScheduledAt: null,
+          shiprocketPickupId: null,
           lastPickupError: null
         },
         trigger: trigger || 'reconcile_clear_stale_pickup_no_awb',
@@ -209,23 +215,42 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
   }
 
   if (snap && snap.pickupScheduled === false) {
-    if (si.pickupDate || si.pickupScheduledAt) {
+    const localForwardProgress = Boolean(
+      si.pickupDate || si.pickupScheduledAt || si.manifestUrl || si.labelUrl
+    );
+    if (localForwardProgress && hasAwb) {
+      return ensureShiprocketPickupId(freshOrder, trigger || 'reconcile_pickup_id_only');
+    }
+    if (si.pickupDate || si.pickupScheduledAt || si.shiprocketPickupId) {
       await applyUpsertShipmentInfo({
         order: freshOrder,
         shipmentPayload: {
           pickupDate: null,
           pickupScheduledAt: null,
+          shiprocketPickupId: null,
           lastPickupError: null
         },
         trigger: trigger || 'reconcile_clear_stale_pickup',
         allowOrderStatusUpdate: false
       });
     }
-    return { success: true, pickupDate: null, source: 'not_scheduled' };
+    return { success: true, pickupDate: null, shiprocketPickupId: null, source: 'not_scheduled' };
   }
 
-  if (!snap?.pickupScheduled && !snap?.pickupDate) {
-    return { success: true, pickupDate: si.pickupDate || null, source: 'none' };
+  const shouldResolveBatch = Boolean(
+    snap?.pickupScheduled === true ||
+      snap?.pickupDate ||
+      si.pickupDate ||
+      si.pickupScheduledAt
+  );
+
+  if (!shouldResolveBatch) {
+    return {
+      success: true,
+      pickupDate: si.pickupDate || null,
+      shiprocketPickupId: si.shiprocketPickupId || null,
+      source: 'none'
+    };
   }
 
   const shipmentId = si.shipmentId || snap?.shipmentId;
@@ -233,7 +258,8 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
     shipmentId,
     shiprocketOrderId: si.shiprocketOrderId || snap?.shiprocketOrderId,
     channelOrderId: freshOrder.orderId,
-    allowPickupListFallback: snap?.pickupScheduled === true
+    allowPickupListFallback:
+      snap?.pickupScheduled === true || Boolean(si.pickupDate || si.pickupScheduledAt)
   });
 
   const payload = {};
@@ -251,10 +277,27 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
     payload.pickupDate = null;
   }
 
+  let pickupId = resolved.shiprocketPickupId || null;
+  if (!pickupId) {
+    const batchOnly = await ShiprocketService.fetchPickupBatchForShipment({
+      shipmentId,
+      shiprocketOrderId: si.shiprocketOrderId || snap?.shiprocketOrderId,
+      channelOrderId: freshOrder.orderId
+    });
+    if (batchOnly.success && batchOnly.shiprocketPickupId) {
+      pickupId = batchOnly.shiprocketPickupId;
+    }
+  }
+
+  if (pickupId && pickupId !== si.shiprocketPickupId) {
+    payload.shiprocketPickupId = pickupId;
+  }
+
   if (Object.keys(payload).length === 0) {
     return {
       success: resolved.success,
       pickupDate: si.pickupDate || null,
+      shiprocketPickupId: si.shiprocketPickupId || null,
       source: resolved.source || 'none'
     };
   }
@@ -270,6 +313,7 @@ async function persistPickupDateFromSnapshot(order, snap, trigger) {
   return {
     success: true,
     pickupDate: updated?.shipmentInfo?.pickupDate || payload.pickupDate || null,
+    shiprocketPickupId: updated?.shipmentInfo?.shiprocketPickupId || payload.shiprocketPickupId || null,
     source: resolved.source || 'reconcile'
   };
 }
@@ -391,6 +435,10 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
   }
 
   order = await Order.findOne({ orderId: order.orderId });
+  if (order && !resetApplied) {
+    await ensureShiprocketPickupId(order, `${source}_pickup_id`);
+    order = await Order.findOne({ orderId: order.orderId });
+  }
   if (order) {
     await evaluateAndPersistShipmentOps(order, { source });
   }
@@ -402,6 +450,7 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
     resetApplied,
     snapshot,
     pickupDate: order?.shipmentInfo?.pickupDate || null,
+    shiprocketPickupId: order?.shipmentInfo?.shiprocketPickupId || null,
     shipmentOps: ops,
     order
   };
@@ -502,6 +551,132 @@ async function ensureForwardPickupStateForSchedule(order, trigger) {
   return { booked: false, snapshot: snap, cleared: false };
 }
 
+/**
+ * Whether order is eligible for Shiprocket pickup batch id (SRPID) backfill.
+ * @param {object|null|undefined} shipmentInfo
+ */
+function isEligibleForShiprocketPickupIdBackfill(shipmentInfo) {
+  const si = shipmentInfo || {};
+  if (si.shiprocketPickupId) return false;
+  if (!(si.awbCode || si.trackingNumber)) return false;
+  return Boolean(si.shipmentId || si.shiprocketOrderId);
+}
+
+/**
+ * Fetch SRPID from Shiprocket pickup list and persist on order (no full reconcile).
+ * @param {import('mongoose').Document|string|object} orderOrId
+ * @param {string} [trigger]
+ */
+async function ensureShiprocketPickupId(orderOrId, trigger = 'pickup_id_backfill') {
+  const orderId =
+    typeof orderOrId === 'string'
+      ? orderOrId.trim()
+      : orderOrId?.orderId != null
+        ? String(orderOrId.orderId).trim()
+        : '';
+  if (!orderId) {
+    return { success: false, code: 'ORDER_ID_REQUIRED', shiprocketPickupId: null };
+  }
+
+  const freshOrder = await Order.findOne({ orderId });
+  if (!freshOrder) {
+    return { success: false, code: 'ORDER_NOT_FOUND', shiprocketPickupId: null };
+  }
+
+  const si = freshOrder.shipmentInfo || {};
+  if (si.shiprocketPickupId) {
+    return {
+      success: true,
+      shiprocketPickupId: si.shiprocketPickupId,
+      source: 'cached'
+    };
+  }
+
+  if (!isEligibleForShiprocketPickupIdBackfill(si)) {
+    return { success: false, code: 'NOT_ELIGIBLE', shiprocketPickupId: null };
+  }
+
+  const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
+    shiprocketOrderId: si.shiprocketOrderId,
+    channelOrderId: freshOrder.orderId
+  });
+  if (lookup.success && lookup.snapshot?.shiprocketPickupId) {
+    const { applyUpsertShipmentInfo } = require('../controllers/order.controller');
+    await applyUpsertShipmentInfo({
+      order: freshOrder,
+      shipmentPayload: { shiprocketPickupId: lookup.snapshot.shiprocketPickupId },
+      trigger: `${trigger}_orders_show`,
+      allowOrderStatusUpdate: false
+    });
+    return {
+      success: true,
+      shiprocketPickupId: lookup.snapshot.shiprocketPickupId,
+      source: 'orders_show'
+    };
+  }
+
+  const batch = await ShiprocketService.fetchPickupBatchForShipment({
+    shipmentId: si.shipmentId,
+    shiprocketOrderId: si.shiprocketOrderId,
+    channelOrderId: freshOrder.orderId
+  });
+
+  if (!batch.success || !batch.shiprocketPickupId) {
+    return {
+      success: false,
+      code: batch.code || 'PICKUP_ID_NOT_FOUND',
+      shiprocketPickupId: null,
+      message: batch.message || null
+    };
+  }
+
+  const { applyUpsertShipmentInfo } = require('../controllers/order.controller');
+  await applyUpsertShipmentInfo({
+    order: freshOrder,
+    shipmentPayload: { shiprocketPickupId: batch.shiprocketPickupId },
+    trigger,
+    allowOrderStatusUpdate: false
+  });
+
+  return {
+    success: true,
+    shiprocketPickupId: batch.shiprocketPickupId,
+    source: batch.source || 'pickup_list'
+  };
+}
+
+/**
+ * Best-effort SRPID backfill for orders on the current admin list page.
+ * @param {Array<object>} orders — lean order docs (mutated in place when saved)
+ * @param {{ max?: number, trigger?: string }} [options]
+ */
+async function backfillShiprocketPickupIdsForListPage(orders, options = {}) {
+  const max = Number.isFinite(Number(options.max)) ? Number(options.max) : 10;
+  const trigger = options.trigger || 'admin_list_pickup_id_backfill';
+  const candidates = (Array.isArray(orders) ? orders : [])
+    .filter((o) => isEligibleForShiprocketPickupIdBackfill(o?.shipmentInfo))
+    .slice(0, max);
+
+  let saved = 0;
+  for (const doc of candidates) {
+    try {
+      const result = await ensureShiprocketPickupId(doc, trigger);
+      if (result.success && result.shiprocketPickupId) {
+        if (!doc.shipmentInfo) doc.shipmentInfo = {};
+        doc.shipmentInfo.shiprocketPickupId = result.shiprocketPickupId;
+        saved += 1;
+      }
+    } catch (err) {
+      const logger = require('../utils/logger');
+      logger.warn('[pickup-id-backfill] list page failed', {
+        orderId: doc?.orderId,
+        message: err?.message || String(err)
+      });
+    }
+  }
+  return { attempted: candidates.length, saved };
+}
+
 module.exports = {
   applyLocalShipmentReset,
   buildPayloadFromSnapshot,
@@ -509,5 +684,8 @@ module.exports = {
   reconcileOrderFromShiprocket,
   detectResetFromWebhookPayload,
   detectForwardOrderReset,
-  ensureForwardPickupStateForSchedule
+  ensureForwardPickupStateForSchedule,
+  ensureShiprocketPickupId,
+  isEligibleForShiprocketPickupIdBackfill,
+  backfillShiprocketPickupIdsForListPage
 };

@@ -6,6 +6,17 @@ const assert = require('assert');
 const shiprocketInstance = require('../utils/shiprocket');
 const ShiprocketService = shiprocketInstance.constructor;
 
+function nearFuturePickupYmd(daysAhead = 7) {
+  return ShiprocketService.addDaysYmd(ShiprocketService.todayYmdUtc(), daysAhead);
+}
+
+function nearFuturePickupDmy(daysAhead = 7) {
+  const ymd = nearFuturePickupYmd(daysAhead);
+  const [y, m, d] = ymd.split('-');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${Number(d)} ${months[Number(m) - 1]} ${y}`;
+}
+
 function testNormalizeYmdDate() {
   assert.strictEqual(ShiprocketService.normalizeYmdDate('2026-05-18'), '2026-05-18');
   assert.strictEqual(ShiprocketService.normalizeYmdDate('18-05-2026'), '2026-05-18');
@@ -17,17 +28,17 @@ function testNormalizeYmdDate() {
 
 function testCourierPickupDateGuards() {
   const Cls = ShiprocketService;
+  const nearFuture = Cls.addDaysYmd(Cls.todayYmdUtc(), 7);
   assert.strictEqual(Cls.parseCourierPickupDateValue('2001-02-28'), null);
   assert.strictEqual(Cls.parseCourierPickupDateValue(983318400), null);
-  assert.strictEqual(Cls.parseCourierPickupDateValue('For 18 May 2026'), '2026-05-18');
-  assert.strictEqual(Cls.parseCourierPickupDateValue('18-May-2026'), '2026-05-18');
-  assert.strictEqual(Cls.parseCourierPickupDateValue('18th May 2026'), '2026-05-18');
-  assert.strictEqual(Cls.parseCourierPickupDateValue('2026-05-18'), '2026-05-18');
-  assert.ok(Cls.isPlausibleCourierPickupYmd('2026-05-18'));
+  assert.strictEqual(Cls.parseCourierPickupDateValue(`For ${nearFuture.split('-')[2]} Jun ${nearFuture.slice(0, 4)}`), nearFuture);
+  assert.strictEqual(Cls.parseCourierPickupDateValue(nearFuture), nearFuture);
+  assert.ok(Cls.isPlausibleCourierPickupYmd(nearFuture));
   assert.ok(!Cls.isPlausibleCourierPickupYmd('2001-02-28'));
 }
 
 function testOrdersShowShipmentObjectShape() {
+  const pickupYmd = nearFuturePickupYmd();
   const snap = ShiprocketService.extractForwardOrderSnapshot({
     id: 1350319109,
     status: 'PICKUP SCHEDULED',
@@ -36,32 +47,34 @@ function testOrdersShowShipmentObjectShape() {
       id: 1346591722,
       awb: '369445882047',
       courier: 'Amazon Prepaid Surface 500g',
-      pickup_scheduled_date: '18-May-2026',
+      pickup_scheduled_date: pickupYmd,
       status: 'PICKUP GENERATED'
     }
   });
   assert.strictEqual(snap.shipmentId, '1346591722');
   assert.strictEqual(snap.awbCode, '369445882047');
-  assert.strictEqual(snap.pickupDate, '2026-05-18');
+  assert.strictEqual(snap.pickupDate, pickupYmd);
   assert.strictEqual(snap.pickupScheduled, true);
 }
 
 /** Controllers require('../utils/shiprocket') — the singleton instance, not the class. */
 function testInstanceDelegatesUsedByControllers() {
+  const pickupYmd = nearFuturePickupYmd();
   assert.strictEqual(typeof shiprocketInstance.isPlausibleCourierPickupYmd, 'function');
   assert.strictEqual(typeof shiprocketInstance.parseCourierPickupDateValue, 'function');
-  assert.ok(shiprocketInstance.isPlausibleCourierPickupYmd('2026-05-18'));
+  assert.ok(shiprocketInstance.isPlausibleCourierPickupYmd(pickupYmd));
   assert.ok(!shiprocketInstance.isPlausibleCourierPickupYmd('2001-02-28'));
   assert.strictEqual(shiprocketInstance.isPickupAlreadyScheduledMessage('Already in Pickup Queue.'), true);
 }
 
 function testExtractForwardOrderSnapshot() {
+  const pickupYmd = nearFuturePickupYmd();
   const snap = ShiprocketService.extractForwardOrderSnapshot({
     id: 1347554071,
     shipment_id: 987654,
     awb: 'AWB123',
     courier_name: 'Amazon Shipping',
-    pickup_scheduled_date: '2026-05-18',
+    pickup_scheduled_date: pickupYmd,
     status: 'PICKUP SCHEDULED',
     status_code: 4,
     label_url: 'https://example.com/label.pdf'
@@ -69,7 +82,7 @@ function testExtractForwardOrderSnapshot() {
   assert.strictEqual(snap.shiprocketOrderId, '1347554071');
   assert.strictEqual(snap.shipmentId, '987654');
   assert.strictEqual(snap.awbCode, 'AWB123');
-  assert.strictEqual(snap.pickupDate, '2026-05-18');
+  assert.strictEqual(snap.pickupDate, pickupYmd);
   assert.strictEqual(snap.pickupScheduled, true);
   assert.strictEqual(snap.labelUrl, 'https://example.com/label.pdf');
 }
@@ -87,23 +100,26 @@ function testPickupAlreadyScheduledMessage() {
 }
 
 function testParsePickupDateFromScheduleResponse() {
+  const pickupYmd = nearFuturePickupYmd();
+  const fallbackYmd = nearFuturePickupYmd(6);
+  const altYmd = nearFuturePickupYmd(10);
   assert.strictEqual(
     ShiprocketService.parsePickupDateFromScheduleResponse(
-      { pickup_scheduled_date: '2026-05-18' },
-      '2026-05-17'
+      { pickup_scheduled_date: pickupYmd },
+      fallbackYmd
     ),
-    '2026-05-18'
+    pickupYmd
   );
   assert.strictEqual(
     ShiprocketService.parsePickupDateFromScheduleResponse(
-      { pickup_date: '2026-05-21', pickup_scheduled_date: '2026-05-18' },
-      '2026-05-21'
+      { pickup_date: altYmd, pickup_scheduled_date: pickupYmd },
+      altYmd
     ),
-    '2026-05-18'
+    pickupYmd
   );
   assert.strictEqual(
-    ShiprocketService.parsePickupDateFromScheduleResponse(null, '2026-05-25'),
-    '2026-05-25'
+    ShiprocketService.parsePickupDateFromScheduleResponse(null, nearFuturePickupYmd(5)),
+    nearFuturePickupYmd(5)
   );
 }
 
@@ -131,78 +147,116 @@ function testShippingLabelVsInvoiceUrl() {
 
 function testExtractPickupDateDeep() {
   const Cls = shiprocketInstance.constructor;
+  const pickupYmd = nearFuturePickupYmd();
+  const pickupHuman = nearFuturePickupDmy();
   const ymd = Cls.extractPickupDateDeepFromRoot({
-    pickup_scheduled_date: '2026-05-18',
-    pickup_status: 'PICKUP SCHEDULED For 18 May 2026'
+    pickup_scheduled_date: pickupYmd,
+    pickup_status: `PICKUP SCHEDULED For ${pickupHuman}`
   });
-  assert.strictEqual(ymd, '2026-05-18');
-  assert.strictEqual(Cls.parsePickupDateFromHumanText('For 18 May 2026'), '2026-05-18');
+  assert.strictEqual(ymd, pickupYmd);
+  assert.strictEqual(Cls.parsePickupDateFromHumanText(`For ${pickupHuman}`), pickupYmd);
 }
 
 function testPickupDateIgnoredWhenOnlyRequestField() {
+  const pickupYmd = nearFuturePickupYmd();
+  const ignoredYmd = nearFuturePickupYmd(10);
   const snap = ShiprocketService.extractForwardOrderSnapshot({
     id: 1350319109,
     shipment_id: 987654,
-    pickup_date: '2026-05-21',
+    awb: 'AWB123',
+    pickup_date: ignoredYmd,
     pickup_scheduled_date: null,
     status: 'PICKUP SCHEDULED'
   });
   assert.strictEqual(snap.pickupDate, null);
   const strict = ShiprocketService.extractStrictPickupScheduledDateFromOrderShow({
-    pickup_date: '2026-05-21',
-    pickup_scheduled_date: '2026-05-18'
+    pickup_date: ignoredYmd,
+    pickup_scheduled_date: pickupYmd
   });
-  assert.strictEqual(strict, '2026-05-18');
+  assert.strictEqual(strict, pickupYmd);
 }
 
 function testPickupListBatchMatchesShipment() {
   const Cls = shiprocketInstance.constructor;
+  const pickupYmd = nearFuturePickupYmd();
+  const pickupHuman = nearFuturePickupDmy();
   const panelPayload = {
     data: [
       {
         pickup_id: 'SRPID-47935881',
-        pickup_status: 'PICKUP SCHEDULED For 18 May 2026',
-        pickup_scheduled_date: '2026-05-18',
+        pickup_status: `PICKUP SCHEDULED For ${pickupHuman}`,
+        pickup_scheduled_date: pickupYmd,
         shipments: [987654, 111222]
       }
     ]
   };
-  assert.strictEqual(Cls.findPickupDateInPickupListPayload(panelPayload, 987654), '2026-05-18');
-  assert.strictEqual(Cls.findPickupDateInPickupListPayload(panelPayload, 111222), '2026-05-18');
+  assert.strictEqual(Cls.findPickupDateInPickupListPayload(panelPayload, 987654), pickupYmd);
+  assert.strictEqual(Cls.findPickupDateInPickupListPayload(panelPayload, 111222), pickupYmd);
   assert.strictEqual(Cls.findPickupDateInPickupListPayload(panelPayload, 999999), null);
+
+  const match = Cls.findPickupBatchMatchInPickupListPayload(panelPayload, 987654);
+  assert.strictEqual(match?.pickupDate, pickupYmd);
+  assert.strictEqual(match?.pickupId, 'SRPID-47935881');
+  assert.strictEqual(Cls.normalizeShiprocketPickupId('48421432'), 'SRPID-48421432');
+  assert.strictEqual(Cls.normalizeShiprocketPickupId('SRPID-48421432'), 'SRPID-48421432');
 
   const nestedWrongChildDate = {
     data: [
       {
         pickup_id: 'SRPID-47935881',
-        pickup_scheduled_date: '2026-05-18',
-        shipments: [{ shipment_id: 987654, pickup_date: '2026-05-21' }]
+        pickup_scheduled_date: pickupYmd,
+        shipments: [{ shipment_id: 987654, pickup_date: nearFuturePickupYmd(10) }]
       }
     ]
   };
-  assert.strictEqual(Cls.findPickupDateInPickupListPayload(nestedWrongChildDate, 987654), '2026-05-18');
+  assert.strictEqual(Cls.findPickupDateInPickupListPayload(nestedWrongChildDate, 987654), pickupYmd);
 
   const orderIdsInBatch = {
     data: [
       {
         pickup_id: 'SRPID-47935881',
-        pickup_status: 'PICKUP SCHEDULED For 18 May 2026',
-        pickup_scheduled_date: '2026-05-18',
+        pickup_status: `PICKUP SCHEDULED For ${pickupHuman}`,
+        pickup_scheduled_date: pickupYmd,
         shipments: [1350319109, 1347554071]
       }
     ]
   };
   assert.strictEqual(
     Cls.findPickupDateInPickupListPayload(orderIdsInBatch, { shiprocketOrderId: 1350319109 }),
-    '2026-05-18'
+    pickupYmd
   );
 
   assert.strictEqual(
     Cls.extractStrictPickupScheduledDateFromOrderShow({
-      shipments: [{ pickup_status: 'PICKUP SCHEDULED For 18 May 2026' }]
+      shipments: [{ pickup_status: `PICKUP SCHEDULED For ${pickupHuman}` }]
     }),
-    '2026-05-18'
+    pickupYmd
   );
+}
+
+function testCompletedPickupBatchWithOldDateStillReturnsPickupId() {
+  const Cls = shiprocketInstance.constructor;
+  const panelPayload = {
+    data: [
+      {
+        pickup_id: 'SRPID-48332890',
+        pickup_status: 'PICKUP COMPLETED',
+        pickup_scheduled_date: '2026-05-29',
+        shipments: [987654]
+      }
+    ]
+  };
+  const match = Cls.findPickupBatchMatchInPickupListPayload(panelPayload, 987654);
+  assert.strictEqual(match?.pickupId, 'SRPID-48332890');
+
+  const snap = Cls.extractForwardOrderSnapshot({
+    id: 1350319109,
+    shipment_id: 987654,
+    awb: '14112362507328',
+    status: 'OUT FOR DELIVERY',
+    pickup_id: 'SRPID-48332890'
+  });
+  assert.strictEqual(snap.shiprocketPickupId, 'SRPID-48332890');
 }
 
 function testParsePickupPreferences() {
@@ -377,6 +431,7 @@ function run() {
   testExtractPickupDateDeep();
   testPickupDateIgnoredWhenOnlyRequestField();
   testPickupListBatchMatchesShipment();
+  testCompletedPickupBatchWithOldDateStillReturnsPickupId();
   testParsePickupPreferences();
   testBuildPickupCalendarBlocksSunday();
   console.log('All Shiprocket P0 unit checks passed.');

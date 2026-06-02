@@ -29,7 +29,8 @@ const {
   applyLocalShipmentReset,
   detectForwardOrderReset,
   persistPickupDateFromSnapshot,
-  ensureForwardPickupStateForSchedule
+  ensureForwardPickupStateForSchedule,
+  ensureShiprocketPickupId
 } = require('../services/shiprocketReconcile.service');
 const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
 const {
@@ -281,7 +282,10 @@ async function repairPickupStateAfterShiprocketSync(order, snap) {
     (queueErr || manifestDone || isOrderPickupBookedOnShiprocket(fresh)) && !si2.pickupScheduledAt;
   const needsErrorClear = queueErr;
 
-  if (!needsBookedAt && !needsErrorClear) return fresh;
+  if (!needsBookedAt && !needsErrorClear) {
+    await ensureShiprocketPickupId(fresh, 'admin_pickup_state_repair_id');
+    return Order.findOne({ orderId: order.orderId });
+  }
 
   const payload = {};
   if (needsErrorClear) payload.lastPickupError = null;
@@ -296,6 +300,7 @@ async function repairPickupStateAfterShiprocketSync(order, snap) {
     trigger: 'admin_pickup_state_repair',
     allowOrderStatusUpdate: false
   });
+  await ensureShiprocketPickupId(fresh, 'admin_pickup_state_repair_id');
   return Order.findOne({ orderId: order.orderId });
 }
 
@@ -1237,6 +1242,124 @@ exports.adminBulkFulfillmentSchedulePickup = async (req, res) => {
   }
 };
 
+/**
+ * Single-order Shiprocket sync for bulk refresh (reconcile + SRPID backfill).
+ * @param {string} orderId
+ */
+async function runBulkSyncShiprocketSingle(orderId) {
+  try {
+    const id = String(orderId || '').trim();
+    if (!id) {
+      return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
+    }
+
+    const order = await loadOrderDocByOrderId(id);
+    if (!order) {
+      return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
+    }
+
+    const gate = evaluateOrderPaymentForShiprocketFulfillment(order);
+    if (!gate.ok) {
+      return {
+        orderId: id,
+        success: false,
+        skipped: false,
+        code: gate.code || 'PAYMENT_REQUIRED',
+        message: gate.message || 'Payment requirements not met.'
+      };
+    }
+
+    const hasSr =
+      order.shipmentInfo?.shiprocketOrderId ||
+      order.shipmentInfo?.shipmentId ||
+      order.shipmentInfo?.awbCode;
+    if (!hasSr) {
+      return {
+        orderId: id,
+        success: false,
+        skipped: true,
+        code: 'SHIPROCKET_ORDER_MISSING',
+        message: 'No Shiprocket shipment on this order yet.'
+      };
+    }
+
+    const synced = await syncShipmentFromShiprocket(order, 'admin_bulk_sync');
+    if (!synced.success) {
+      return {
+        orderId: id,
+        success: false,
+        skipped: false,
+        code: synced.code || 'SYNC_FAILED',
+        message: synced.message || 'Sync failed'
+      };
+    }
+
+    if (!synced.resetApplied) {
+      await repairPickupStateAfterShiprocketSync(order, synced.snapshot);
+    }
+
+    await ensureShiprocketPickupId(id, 'admin_bulk_sync_pickup_id');
+    const fresh = await Order.findOne({ orderId: id });
+    const pickupId = fresh?.shipmentInfo?.shiprocketPickupId || null;
+
+    return {
+      orderId: id,
+      success: true,
+      skipped: false,
+      resetApplied: Boolean(synced.resetApplied),
+      shiprocketPickupId: pickupId,
+      message: pickupId
+        ? `Synced from Shiprocket (${pickupId}).`
+        : synced.resetApplied
+          ? 'Shiprocket reset detected — use Ship now to re-book.'
+          : 'Synced from Shiprocket.'
+    };
+  } catch (err) {
+    logger.error('runBulkSyncShiprocketSingle', { orderId, message: err?.message, stack: err?.stack });
+    return {
+      orderId: String(orderId || '').trim() || String(orderId),
+      success: false,
+      skipped: false,
+      code: 'UNHANDLED',
+      message: err?.message || String(err)
+    };
+  }
+}
+
+/** POST /orders/admin/items/bulk-fulfillment/sync-shiprocket  body: { orderIds: string[], concurrency?: number } */
+exports.adminBulkFulfillmentSyncShiprocket = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderIds = normalizeBulkOrderIds(req.body);
+    if (orderIds.length === 0) {
+      return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
+    }
+
+    const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runBulkSyncShiprocketSingle(oid));
+
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const skipped = results.filter((r) => r.skipped);
+
+    return res.json({
+      success: true,
+      summary: {
+        total: results.length,
+        succeeded: succeeded.length,
+        failed: failed.length,
+        skipped: skipped.length,
+        completed: succeeded.filter((r) => !r.skipped).length,
+        pickupIdsSaved: succeeded.filter((r) => r.shiprocketPickupId).length
+      },
+      results
+    });
+  } catch (error) {
+    logger.error('adminBulkFulfillmentSyncShiprocket', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'BULK_SYNC_SHIPROCKET_FAILED', error.message || 'Server error');
+  }
+};
+
 /** POST /orders/admin/items/:orderId/fulfillment/ensure-shipment */
 exports.adminFulfillmentEnsureShipment = async (req, res) => {
   try {
@@ -1315,19 +1438,25 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
     const repaired = synced.resetApplied
       ? await Order.findOne({ orderId: order.orderId })
       : await repairPickupStateAfterShiprocketSync(order, synced.snapshot);
-    const freshOrder = repaired || (await Order.findOne({ orderId: order.orderId }));
+    if (!synced.resetApplied) {
+      await ensureShiprocketPickupId(order.orderId, 'admin_manual_sync_pickup_id');
+    }
+    const freshOrder = (await Order.findOne({ orderId: order.orderId })) || repaired;
     const si = freshOrder?.shipmentInfo || {};
     const shipmentOps = buildShipmentOpsView(freshOrder, { source: 'admin_manual_sync' });
     const pickupMsg = synced.resetApplied
       ? 'Shiprocket reset detected — stale AWB/pickup cleared. Use Ship now to re-book.'
-      : si.pickupDate
-        ? `Courier pickup day updated to ${si.pickupDate} (from Shiprocket).`
-        : 'Synced from Shiprocket. Confirm pickup day on Shiprocket if needed, then refresh again.';
+      : si.shiprocketPickupId
+        ? `Synced from Shiprocket. Pickup ID: ${si.shiprocketPickupId}.`
+        : si.pickupDate
+          ? `Courier pickup day updated to ${si.pickupDate} (from Shiprocket).`
+          : 'Synced from Shiprocket. Confirm pickup day on Shiprocket if needed, then refresh again.';
     return res.json({
       success: true,
       synced: synced.success,
       message: synced.success ? pickupMsg : synced.message || 'Sync completed with warnings.',
       pickupDate: si.pickupDate || null,
+      shiprocketPickupId: si.shiprocketPickupId || null,
       pickupDateSource: synced.pickupDateSource || null,
       shipmentOps,
       order: freshOrder

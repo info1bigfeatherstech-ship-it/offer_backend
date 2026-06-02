@@ -12,6 +12,7 @@ const { uploadBufferToR2 } = require('../utils/r2Storage');
 const { optimizeProductImageBuffer } = require('../utils/cloudinaryHelper');
 const { deleteFromR2ByUrl } = require('../utils/r2Storage');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
+const refreshTokenSession = require('../services/refreshTokenSession.service');
 
 // Wholesaler activation OTP follows the same global expiry window as every
 // other OTP flow. Driven by OTP_EXPIRY_MINUTES env (default: 5 minutes).
@@ -507,7 +508,7 @@ function buildExistingWholesalerConflictPayload(status, requestId = null) {
 
 function generateRefreshToken(userId) {
   return jwt.sign(
-    { id: userId, type: 'refresh' },
+    { id: userId, type: 'refresh', jti: crypto.randomUUID() },
     process.env.REFRESH_TOKEN_SECRET,
     { expiresIn: REFRESH_EXPIRES }
   );
@@ -1305,15 +1306,12 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
     const refreshToken = generateRefreshToken(user._id);
     const hashedRefreshToken = hashString(refreshToken);
 
-    user.refreshTokens = user.refreshTokens || [];
-    user.refreshTokens = user.refreshTokens.filter((t) => t.expiresAt > new Date());
-    user.refreshTokens.push({
-      token: hashedRefreshToken,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      createdAt: new Date(),
+    await user.save();
+
+    await refreshTokenSession.appendSession(user._id, {
+      hashedToken: hashedRefreshToken,
       deviceInfo: req.headers['user-agent'] || 'Unknown'
     });
-    await user.save();
 
     doc.status = 'activated';
     doc.linkedUserId = user._id;

@@ -121,6 +121,7 @@ exports.getOrdersList = async (req, res) => {
     const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
     const { OPS_STATES } = require('../services/shipmentOps/constants');
     const { evaluateAndPersistShipmentOps } = require('../services/shipmentOps');
+    const { backfillShiprocketPickupIdsForListPage } = require('../services/shiprocketReconcile.service');
 
     for (const doc of orders) {
       const st = String(doc.orderStatus || '').toLowerCase();
@@ -137,6 +138,8 @@ exports.getOrdersList = async (req, res) => {
         }
       }
     }
+
+    await backfillShiprocketPickupIdsForListPage(orders, { max: 20 });
 
     const rows = orders.map((doc) => mapOrderRow(doc));
 

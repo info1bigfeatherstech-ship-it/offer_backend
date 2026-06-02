@@ -326,6 +326,30 @@ function testActiveAwbPickupScheduledDoesNotReset() {
   assert.strictEqual(built.reset, false);
 }
 
+function testLabelPrimaryWhenManifestReady() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: '14112362507328',
+      shipmentId: '1346591722',
+      shiprocketOrderId: '1350319109',
+      courier: 'Xpressbees Surface',
+      pickupDate: '2026-06-02',
+      pickupScheduledAt: new Date('2026-06-01'),
+      manifestUrl: 'https://example.com/manifest.pdf',
+      labelUrl: 'https://example.com/label.pdf',
+      providerStatus: 'Pickup Generated'
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.LABEL_READY);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.primaryAction, 'downloadLabel');
+  assert.strictEqual(view.actionCapabilities.downloadManifest, true);
+  assert.strictEqual(view.actionCapabilities.downloadLabel, true);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -339,6 +363,7 @@ function run() {
   testStalePickupScheduledWithoutAwbTriggersReset();
   testReadyToShipProcessingAllowsShipNow();
   testActiveAwbPickupScheduledDoesNotReset();
+  testLabelPrimaryWhenManifestReady();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');

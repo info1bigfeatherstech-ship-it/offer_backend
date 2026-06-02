@@ -446,6 +446,11 @@ async function upsertShipmentInfo({
         nextShipmentInfo.pickupDate =
             pd == null || pd === '' ? null : String(pd).trim() || null;
     }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'shiprocketPickupId')) {
+        const pid = shipmentPayload.shiprocketPickupId;
+        nextShipmentInfo.shiprocketPickupId =
+            pid == null || pid === '' ? null : String(pid).trim() || null;
+    }
     if (shipmentPayload.pickupScheduledAt) {
         nextShipmentInfo.pickupScheduledAt = new Date(shipmentPayload.pickupScheduledAt);
     } else if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'pickupScheduledAt')) {
@@ -2334,6 +2339,26 @@ exports.getOrder = async (req, res) => {
 
         if (!canViewOrderForRequest(req, order, isOrderStaff)) {
             return buildUnauthorizedOrderResponse(res);
+        }
+
+        if (isOrderStaff) {
+            const {
+                ensureShiprocketPickupId,
+                isEligibleForShiprocketPickupIdBackfill
+            } = require('../services/shiprocketReconcile.service');
+            if (isEligibleForShiprocketPickupIdBackfill(order.shipmentInfo)) {
+                try {
+                    const idResult = await ensureShiprocketPickupId(order, 'admin_order_detail_pickup_id');
+                    if (idResult.success && idResult.shiprocketPickupId) {
+                        order.shipmentInfo.shiprocketPickupId = idResult.shiprocketPickupId;
+                    }
+                } catch (pickupIdErr) {
+                    logger.warn('[getOrder] SRPID backfill skipped', {
+                        orderId,
+                        message: pickupIdErr?.message || String(pickupIdErr)
+                    });
+                }
+            }
         }
 
         const transformedOrder = order.toObject();
