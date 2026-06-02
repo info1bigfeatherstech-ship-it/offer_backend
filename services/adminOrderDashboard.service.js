@@ -219,6 +219,12 @@ function roundMoney(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
 
+function formatShiprocketPickupIdDisplay(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const shiprocket = require('../utils/shiprocket');
+  return shiprocket.normalizeShiprocketPickupId(value);
+}
+
 function normalizeFinancialView(o) {
   const orderStatus = String(o?.orderStatus || '').toLowerCase();
   const paymentStatus = String(o?.paymentStatus || '').toLowerCase();
@@ -304,6 +310,8 @@ function mapOrderRow(order) {
     hasShiprocketOrderId,
     pickupScheduled,
     pickupDate: si.pickupDate || null,
+    shiprocketPickupId: si.shiprocketPickupId || null,
+    shiprocketPickupIdDisplay: formatShiprocketPickupIdDisplay(si.shiprocketPickupId),
     courier: si.courier || null,
     providerStatus: si.providerStatus || null,
     awbCode: si.awbCode || si.trackingNumber || null,

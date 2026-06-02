@@ -123,6 +123,13 @@ router.post(
   adminFulfillment.adminBulkFulfillmentSchedulePickup
 );
 
+router.post(
+  '/admin/items/bulk-fulfillment/sync-shiprocket',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminFulfillment.adminBulkFulfillmentSyncShiprocket
+);
+
 router.get(
   '/admin/fulfillment/pickup-calendar',
   verifyToken,

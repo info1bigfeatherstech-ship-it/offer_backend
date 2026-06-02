@@ -29,6 +29,10 @@ function isPostConfirmOrderStatus(orderStatus) {
  * @param {Record<string, boolean>} caps
  */
 function resolvePrimaryActionKey(caps) {
+  // Shiprocket panel flow: after manifest exists, label is the next primary step.
+  if (caps.downloadLabel && caps.downloadManifest) {
+    return ACTION_KEYS.downloadLabel;
+  }
   for (const key of PRIMARY_ACTION_ORDER) {
     if (caps[key]) return key;
   }

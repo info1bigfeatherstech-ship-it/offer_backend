@@ -109,6 +109,8 @@ const orderSchema = new mongoose.Schema(
       /** Scheduled pickup date YYYY-MM-DD (Shiprocket generate/pickup) */
       pickupDate: { type: String, default: null },
       pickupScheduledAt: Date,
+      /** Shiprocket pickup batch id (panel: SRPID-48421432) */
+      shiprocketPickupId: { type: String, default: null },
       lastSyncAt: Date,
       lastSyncSource: String,
       lastError: String,
