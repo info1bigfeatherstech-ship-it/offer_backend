@@ -5097,22 +5097,34 @@ const bulkHardDelete = async (req, res) => {
 
 const getAllProductsAdmin = async (req, res) => {
   try {
-    let { page = 1, limit = 20 } = req.query;
+    let { page = 1, limit = 20, search = "" } = req.query;
 
     page = Number(page);
     limit = Math.min(100, Math.max(1, Number(limit)));
 
     const skip = (page - 1) * limit;
 
+    const trimmedSearch = String(search || "").trim().slice(0, 100);
+    const searchFilter = trimmedSearch
+      ? {
+          $or: [
+            { name: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+            { title: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+            { brand: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+            { "variants.productCode": { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+          ],
+        }
+      : {};
+
     const [products, totalProducts] = await Promise.all([
-      Product.find({})
+      Product.find(searchFilter)
         .populate("category", "name slug status")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .lean({ virtuals: true }),
 
-      Product.countDocuments({}),
+      Product.countDocuments(searchFilter),
     ]);
 
     // get ids

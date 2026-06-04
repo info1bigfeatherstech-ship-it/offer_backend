@@ -2458,7 +2458,10 @@ exports.getUserOrders = async (req, res) => {
     }
 };
 
-// ========== CANCEL ORDER ==========
+// ========== CANCEL ORDER (DISABLED) ==========
+// Intentionally commented: customer order cancellation removed by product policy — do not call accidentally.
+// To restore: uncomment exports.cancelOrder below AND the route in routes/orders.route.js (`PUT /items/:orderId/cancel`).
+/*
 exports.cancelOrder = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -2584,6 +2587,7 @@ exports.cancelOrder = async (req, res) => {
         return respondOrderError(res, 500, 'ORDER_CANCELLATION_FAILED', 'Error cancelling order');
     }
 };
+*/
 
 // ========== UPDATE ORDER STATUS (Admin) ==========
 exports.updateOrderStatus = async (req, res) => {
@@ -2980,6 +2984,21 @@ exports.trackOrder = async (req, res) => {
         if (isOrderStaffRequest(req)) {
             const { buildShipmentOpsView } = require('../services/shipmentOps');
             tracking.shipmentOps = buildShipmentOpsView(orderDoc, { source: 'track_order' });
+        } else {
+            const { buildCustomerTrackingExtras } = require('../utils/customerTrackingDisplay');
+            const hasAwb = Boolean(
+                tracking.trackingNumber ||
+                    orderDoc.shipmentInfo?.awbCode ||
+                    orderDoc.shipmentInfo?.trackingNumber
+            );
+            const customerExtras = buildCustomerTrackingExtras({
+                orderDoc,
+                liveEvents: liveTracking?.events,
+                hasAwb
+            });
+            tracking.simpleTimeline = fallbackTimeline;
+            tracking.courierTimeline = customerExtras.courierTimeline;
+            tracking.statusSummary = customerExtras.statusSummary;
         }
 
         return res.json({

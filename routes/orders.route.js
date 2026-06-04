@@ -14,7 +14,7 @@ const {
   abandonOnlineCheckout,
   getOrder,
   getUserOrders,
-  cancelOrder,
+  // cancelOrder — intentionally not imported: customer cancel API disabled (see orders.route.js + order.controller.js).
   updateOrderStatus,
   generateInvoice,
   trackOrder,
@@ -44,7 +44,8 @@ router.get('/items/:orderId', verifyToken, requireWholesaleUserForWholesaleStore
 router.get('/items/:orderId/track', verifyToken, requireWholesaleUserForWholesaleStorefront, trackOrder);
 router.post('/items/:orderId/return-request', verifyToken, requireWholesaleUserForWholesaleStorefront, uploadReturnProofs, createReturnRequest);
 router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholesaleStorefront, generateInvoice);
-router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
+// Intentionally commented: customer order cancellation disabled by product policy (uncomment with exports.cancelOrder in order.controller.js to restore).
+// router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
 
 router.post(
   '/admin/items/:orderId/refund',
