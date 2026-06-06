@@ -81,33 +81,38 @@ function cartFingerprintFromItems(items) {
   return crypto.createHash('sha256').update(key).digest('hex').slice(0, 32);
 }
 
+function shippingDimCm(value, fallback = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 /**
- * Aggregate package hints for courier APIs (conservative, not volumetric-optimal).
+ * Aggregate package hints for courier APIs (max L/W, stacked height from catalog dims).
  */
 function aggregateShipping(lines) {
   let totalWeightKg = 0;
-  let maxL = 10;
-  let maxW = 10;
+  let maxL = 0;
+  let maxW = 0;
   let heightStack = 0;
 
   for (const line of lines) {
     const sh = (line.product && line.product.shipping) || {};
     const w = Math.max(0.05, Number(sh.weight) || 0.5);
     const d = sh.dimensions || {};
-    const l = Math.max(1, Number(d.length) || 10);
-    const wi = Math.max(1, Number(d.width) || 10);
-    const h = Math.max(1, Number(d.height) || 10);
+    const l = shippingDimCm(d.length);
+    const wi = shippingDimCm(d.width);
+    const h = shippingDimCm(d.height);
     totalWeightKg += w * line.quantity;
     maxL = Math.max(maxL, l);
     maxW = Math.max(maxW, wi);
     heightStack += h * line.quantity;
   }
 
-  const heightCm = Math.min(200, Math.max(10, heightStack));
+  const heightCm = Math.min(200, Math.max(1, heightStack));
   return {
     weightKg: Math.max(0.05, roundMoney2(totalWeightKg)),
-    lengthCm: maxL,
-    widthCm: maxW,
+    lengthCm: maxL || 1,
+    widthCm: maxW || 1,
     heightCm
   };
 }

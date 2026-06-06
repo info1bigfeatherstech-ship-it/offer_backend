@@ -79,7 +79,7 @@ exports.checkDeliveryAvailability = async (req, res) => {
     }
 
     let totalWeight = 1;
-    let dims = { lengthCm: 10, widthCm: 10, heightCm: 10 };
+    let dims = { lengthCm: 1, widthCm: 1, heightCm: 1 };
 
     const cartDoc = cartId
       ? await Cart.findById(cartId)

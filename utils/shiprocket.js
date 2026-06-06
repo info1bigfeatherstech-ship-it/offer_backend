@@ -167,9 +167,9 @@ class ShiprocketService {
   async checkDeliveryAvailability(deliveryPincode, opts = {}) {
     const pincode = String(deliveryPincode || '').replace(/\D/g, '').slice(0, 6);
     const weight = Math.max(0.05, Number(opts.weightKg) || 0.5);
-    const length = Math.max(1, Number(opts.lengthCm) || 10);
-    const breadth = Math.max(1, Number(opts.widthCm) || 10);
-    const height = Math.max(1, Number(opts.heightCm) || 10);
+    const length = Math.max(1, Number(opts.lengthCm) || 1);
+    const breadth = Math.max(1, Number(opts.widthCm) || 1);
+    const height = Math.max(1, Number(opts.heightCm) || 1);
     const codAmount = Math.max(0, Number(opts.codAmount) || 0);
 
     if (pincode.length !== 6) {
@@ -304,9 +304,9 @@ class ShiprocketService {
 
     const orderItems = [];
     for (const item of order.items || []) {
-      let length = 10;
-      let breadth = 10;
-      let height = 10;
+      let length = 1;
+      let breadth = 1;
+      let height = 1;
       let weight = 0.5;
       let name = 'Product';
       let sku = 'SKU';
@@ -353,13 +353,13 @@ class ShiprocketService {
       : orderItems.reduce((s, it) => s + (Number(it.weight) || 0.5) * (Number(it.units) || 1), 0);
     const maxL = snapMetrics
       ? snapMetrics.maxL
-      : Math.max(10, ...orderItems.map((i) => Number(i.length) || 0));
+      : Math.max(1, ...orderItems.map((i) => Number(i.length) || 0), 0);
     const maxB = snapMetrics
       ? snapMetrics.maxB
-      : Math.max(10, ...orderItems.map((i) => Number(i.breadth) || 0));
+      : Math.max(1, ...orderItems.map((i) => Number(i.breadth) || 0), 0);
     const maxH = snapMetrics
       ? snapMetrics.maxH
-      : Math.max(10, ...orderItems.map((i) => Number(i.height) || 0));
+      : Math.max(1, ...orderItems.map((i) => Number(i.height) || 0), 0);
 
     const payMethod = String(order.paymentInfo?.method || '').toLowerCase();
     const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
@@ -1134,9 +1134,9 @@ class ShiprocketService {
   async listCouriersForRoute(deliveryPincode, opts = {}) {
     const pincode = String(deliveryPincode || '').replace(/\D/g, '').slice(0, 6);
     const weight = Math.max(0.05, Number(opts.weightKg) || 0.5);
-    const length = Math.max(1, Number(opts.lengthCm) || 10);
-    const breadth = Math.max(1, Number(opts.widthCm) || 10);
-    const height = Math.max(1, Number(opts.heightCm) || 10);
+    const length = Math.max(1, Number(opts.lengthCm) || 1);
+    const breadth = Math.max(1, Number(opts.widthCm) || 1);
+    const height = Math.max(1, Number(opts.heightCm) || 1);
     const codAmount = Math.max(0, Number(opts.codAmount) || 0);
 
     if (pincode.length !== 6) {
