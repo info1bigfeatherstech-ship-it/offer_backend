@@ -320,6 +320,72 @@ function filterVariantsForStorefront(variants, storefront) {
   return variants.filter((v) => isVariantListedOnStorefront(v, storefront));
 }
 
+/**
+ * Derive product-level channelStatus from variant visibility (bottom-up).
+ * @param {Array<object>} variants
+ */
+function deriveProductChannelStatusFromVariants(variants) {
+  const list = Array.isArray(variants) ? variants : [];
+
+  const hasActiveEcomm = list.some((v) => {
+    const state = v?.channelVisibility?.ecomm;
+    return state === 'active' || (state == null && v?.isActive !== false);
+  });
+  const hasDraftEcomm = list.some((v) => (v?.channelVisibility?.ecomm || 'draft') === 'draft');
+  const ecomm = hasActiveEcomm ? 'active' : hasDraftEcomm ? 'draft' : 'archived';
+
+  const wholesale = list.some((v) => hasWholesalePricingConfig(v)) ? 'active' : 'draft';
+
+  return { ecomm, wholesale };
+}
+
+/**
+ * Keep legacy variant.isActive aligned with ecomm channelVisibility.
+ * @param {object} variant
+ */
+function reconcileVariantLegacyFlagsFromChannelVisibility(variant) {
+  if (!variant || typeof variant !== 'object') return;
+  variant.isActive = effectiveVariantChannelStatus(variant, 'ecomm') === 'active';
+}
+
+/**
+ * Push product-level channel changes down to all variants (top-down bulk/admin).
+ * @param {object} productDoc mongoose product doc
+ * @param {{ ecomm?: string, wholesale?: string }} partial
+ */
+function propagateProductChannelStatusToVariants(productDoc, partial) {
+  if (!productDoc || !Array.isArray(productDoc.variants) || !partial || typeof partial !== 'object') {
+    return;
+  }
+  for (const variant of productDoc.variants) {
+    variant.channelVisibility = mergeVariantChannelVisibility(variant, partial);
+  }
+  if (typeof productDoc.markModified === 'function') {
+    productDoc.markModified('variants');
+  }
+}
+
+/**
+ * Single reconcile pass: variants → legacy flags → product channelStatus + status.
+ * @param {object} productDoc mongoose product doc
+ */
+function reconcileProductCatalogState(productDoc) {
+  if (!productDoc || !Array.isArray(productDoc.variants)) return;
+
+  for (const variant of productDoc.variants) {
+    reconcileVariantLegacyFlagsFromChannelVisibility(variant);
+  }
+
+  const derived = deriveProductChannelStatusFromVariants(productDoc.variants);
+  productDoc.channelStatus = derived;
+  productDoc.status = derived.ecomm;
+
+  if (typeof productDoc.markModified === 'function') {
+    productDoc.markModified('variants');
+    productDoc.markModified('channelStatus');
+  }
+}
+
 module.exports = {
   CHANNEL_LIFECYCLE,
   STOREFRONT_KEYS,
@@ -338,5 +404,9 @@ module.exports = {
   mongoCatalogAnd,
   mergeProductChannelStatus,
   mergeVariantChannelVisibility,
-  filterVariantsForStorefront
+  filterVariantsForStorefront,
+  deriveProductChannelStatusFromVariants,
+  reconcileVariantLegacyFlagsFromChannelVisibility,
+  propagateProductChannelStatusToVariants,
+  reconcileProductCatalogState
 };

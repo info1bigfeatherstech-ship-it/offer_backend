@@ -7,8 +7,52 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const { roundMoney2 } = require('../services/checkoutComputation.service');
 
+const DIM_WEIGHT_DIVISOR = 5000;
+
 function unitWeightKgFromProductShipping(shipping) {
   return Math.max(0.05, roundMoney2(Number(shipping?.weight) || 0.5));
+}
+
+function unitDimsCmFromProductShipping(shipping) {
+  const d = shipping?.dimensions || {};
+  const l = Number(d.length);
+  const w = Number(d.width);
+  const h = Number(d.height);
+  if (![l, w, h].every((n) => Number.isFinite(n) && n > 0)) return null;
+  return {
+    lengthCm: Math.max(1, l),
+    widthCm: Math.max(1, w),
+    heightCm: Math.max(1, h)
+  };
+}
+
+function dimWeightKgFromDimsCm(dims) {
+  if (!dims || typeof dims !== 'object') return null;
+  const l = Number(dims.lengthCm);
+  const w = Number(dims.widthCm);
+  const h = Number(dims.heightCm);
+  if (![l, w, h].every((n) => Number.isFinite(n) && n > 0)) return null;
+  return roundMoney2((l * w * h) / DIM_WEIGHT_DIVISOR);
+}
+
+function buildLineDimFields(shipping, qty) {
+  const dims = unitDimsCmFromProductShipping(shipping);
+  if (!dims) return {};
+  const unitDimWeightKg = dimWeightKgFromDimsCm(dims);
+  const q = Math.max(0, Number(qty) || 0);
+  return {
+    lengthCm: dims.lengthCm,
+    widthCm: dims.widthCm,
+    heightCm: dims.heightCm,
+    unitDimWeightKg,
+    lineDimWeightKg: unitDimWeightKg != null ? roundMoney2(unitDimWeightKg * q) : null
+  };
+}
+
+function hasLineDims(row) {
+  return [row?.lengthCm, row?.widthCm, row?.heightCm].every(
+    (n) => Number.isFinite(Number(n)) && Number(n) > 0
+  );
 }
 
 /**
@@ -27,20 +71,23 @@ function buildShippingWeightSnapshotFromCheckoutLines({ lines, totalWeightKg, di
       sku: sku || null,
       quantity: qty,
       unitWeightKg,
-      lineWeightKg: roundMoney2(unitWeightKg * qty)
+      lineWeightKg: roundMoney2(unitWeightKg * qty),
+      ...buildLineDimFields(line.product?.shipping, qty)
     };
   });
 
   const sumLines = roundMoney2(lineSnapshots.reduce((s, l) => s + Number(l.lineWeightKg || 0), 0));
   const total = Math.max(0.05, roundMoney2(Number(totalWeightKg) || sumLines));
+  const packageDims = {
+    lengthCm: dims?.lengthCm != null ? Number(dims.lengthCm) : null,
+    widthCm: dims?.widthCm != null ? Number(dims.widthCm) : null,
+    heightCm: dims?.heightCm != null ? Number(dims.heightCm) : null
+  };
 
   return {
     totalWeightKg: total,
-    dims: {
-      lengthCm: dims?.lengthCm != null ? Number(dims.lengthCm) : null,
-      widthCm: dims?.widthCm != null ? Number(dims.widthCm) : null,
-      heightCm: dims?.heightCm != null ? Number(dims.heightCm) : null
-    },
+    totalDimWeightKg: dimWeightKgFromDimsCm(packageDims),
+    dims: packageDims,
     lines: lineSnapshots,
     source: 'checkout'
   };
@@ -59,6 +106,7 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
     let unitWeightKg = 0.5;
     let productName = 'Product';
     let sku = null;
+    let productShipping = null;
 
     if (item.productId) {
       const pid = mongoose.Types.ObjectId.isValid(item.productId) ? item.productId : item.productId?._id;
@@ -68,6 +116,7 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
       }
       if (product) {
         productName = product.name || productName;
+        productShipping = product.shipping;
         unitWeightKg = unitWeightKgFromProductShipping(product.shipping);
         const v = (product.variants || []).find((x) => String(x._id) === String(item.variantId));
         if (v?.sku) sku = String(v.sku).trim();
@@ -82,7 +131,8 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
       sku,
       quantity: qty,
       unitWeightKg,
-      lineWeightKg: roundMoney2(unitWeightKg * qty)
+      lineWeightKg: roundMoney2(unitWeightKg * qty),
+      ...buildLineDimFields(productShipping, qty)
     });
   }
 
@@ -93,9 +143,61 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
 
   return {
     totalWeightKg,
+    totalDimWeightKg: null,
     dims: { lengthCm: null, widthCm: null, heightCm: null },
     lines: lineSnapshots,
     source: 'catalog_fallback'
+  };
+}
+
+/**
+ * Fill missing per-line dims on stored snapshots (legacy orders) from current catalog.
+ * @param {object|null} snap
+ */
+async function enrichShippingWeightSnapshotDims(snap) {
+  if (!snap?.lines?.length) return snap;
+
+  const lines = [...snap.lines];
+  const missingProductIds = [
+    ...new Set(
+      lines
+        .filter((row) => !hasLineDims(row) && row?.productId)
+        .map((row) => String(row.productId))
+    )
+  ];
+
+  const productById = new Map();
+  if (missingProductIds.length) {
+    const ids = missingProductIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const products = await Product.find({ _id: { $in: ids } }).select('shipping').lean();
+    for (const p of products) {
+      productById.set(String(p._id), p);
+    }
+  }
+
+  let changed = false;
+  const enrichedLines = lines.map((row) => {
+    if (hasLineDims(row)) return row;
+    const product = productById.get(String(row.productId));
+    if (!product?.shipping) return row;
+    const dimFields = buildLineDimFields(product.shipping, row.quantity);
+    if (!Object.keys(dimFields).length) return row;
+    changed = true;
+    return { ...row, ...dimFields };
+  });
+
+  const packageDims = snap.dims || {};
+  const totalDimWeightKg =
+    snap.totalDimWeightKg != null
+      ? snap.totalDimWeightKg
+      : dimWeightKgFromDimsCm(packageDims);
+
+  if (!changed && snap.totalDimWeightKg != null) return snap;
+
+  return {
+    ...snap,
+    totalDimWeightKg,
+    lines: enrichedLines
   };
 }
 
@@ -132,6 +234,8 @@ async function resolveShiprocketPackageMetrics(order) {
 module.exports = {
   buildShippingWeightSnapshotFromCheckoutLines,
   buildShippingWeightSnapshotFromOrderItems,
+  enrichShippingWeightSnapshotDims,
   resolveShiprocketPackageMetrics,
-  unitWeightKgFromProductShipping
+  unitWeightKgFromProductShipping,
+  dimWeightKgFromDimsCm
 };

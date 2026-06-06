@@ -179,6 +179,7 @@ const orderSchema = new mongoose.Schema(
     /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */
     shippingWeightSnapshot: {
       totalWeightKg: { type: Number, default: null },
+      totalDimWeightKg: { type: Number, default: null },
       dims: {
         lengthCm: { type: Number, default: null },
         widthCm: { type: Number, default: null },
@@ -193,7 +194,12 @@ const orderSchema = new mongoose.Schema(
             sku: { type: String, default: null },
             quantity: { type: Number, default: 0 },
             unitWeightKg: { type: Number, default: null },
-            lineWeightKg: { type: Number, default: null }
+            lineWeightKg: { type: Number, default: null },
+            lengthCm: { type: Number, default: null },
+            widthCm: { type: Number, default: null },
+            heightCm: { type: Number, default: null },
+            unitDimWeightKg: { type: Number, default: null },
+            lineDimWeightKg: { type: Number, default: null }
           }
         ],
         default: []

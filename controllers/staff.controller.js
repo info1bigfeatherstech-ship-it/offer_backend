@@ -336,6 +336,8 @@ const createStaff = async (req, res) => {
     }
 
     const { name, email, phone, password, role } = req.body;
+    const trimmedName = String(name || '').trim();
+    const trimmedPhone = String(phone || '').trim();
     const storefront = storefrontFromScope(req);
 
     if (!ALLOWED_STAFF_ROLES.includes(role)) {
@@ -345,11 +347,7 @@ const createStaff = async (req, res) => {
       });
     }
 
-    const [existingEmail, existingPhone] = await Promise.all([
-      User.findOne({ email }),
-      User.findOne({ phone })
-    ]);
-
+    const existingEmail = await User.findOne({ email });
     if (existingEmail) {
       return res.status(409).json({
         success: false,
@@ -357,17 +355,20 @@ const createStaff = async (req, res) => {
       });
     }
 
-    if (existingPhone) {
-      return res.status(409).json({
-        success: false,
-        message: 'User with this phone number already exists'
-      });
+    if (trimmedPhone) {
+      const existingPhone = await User.findOne({ phone: trimmedPhone });
+      if (existingPhone) {
+        return res.status(409).json({
+          success: false,
+          message: 'User with this phone number already exists'
+        });
+      }
     }
 
     const staff = new User({
-      name,
+      ...(trimmedName ? { name: trimmedName } : {}),
       email,
-      phone,
+      ...(trimmedPhone ? { phone: trimmedPhone } : {}),
       password,
       role,
       userType: 'user',
