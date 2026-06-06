@@ -23,7 +23,10 @@ const {
   mergeProductChannelStatus,
   mergeVariantChannelVisibility,
   hasWholesalePricingConfig,
-  getVariantAvailabilityByStorefront
+  getVariantAvailabilityByStorefront,
+  deriveProductChannelStatusFromVariants,
+  propagateProductChannelStatusToVariants,
+  reconcileProductCatalogState
 } = require("../utils/storefrontCatalog");
 
 
@@ -1994,7 +1997,7 @@ async function processProductWithRollback(productName, productRows, stats) {
         variants: existingProduct.variants,
       });
       existingProduct.seo = seoData;
-      syncProductStorefrontStatusFromVariants(existingProduct);
+      reconcileProductCatalogState(existingProduct);
       
       await existingProduct.save();
       return { success: true, action: 'updated', product: existingProduct };
@@ -2197,9 +2200,8 @@ async function buildNewProductWithVariants(productName, productRows, variants) {
       customMessage: firstRow.customMessage || "",
     },
   };
-  productObj.channelStatus = deriveProductChannelStatusFromVariants(variants);
-  productObj.status = productObj.channelStatus.ecomm;
-  
+  reconcileProductCatalogState(productObj);
+
   // Generate SEO
   const seoData = generateSEOData({
     name: productObj.name,
@@ -2807,7 +2809,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
               product.attributes = productAttributes;
             }
 
-            syncProductStorefrontStatusFromVariants(product);
+            reconcileProductCatalogState(product);
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'updated' });
@@ -3740,12 +3742,23 @@ const updateProduct = async (req, res) => {
       doc.brand = updates.brand;
     }
     if (updates.status !== undefined) {
-      doc.status = updates.status;
+      const normalizedStatus = normalizeLifecycleValue(updates.status) || 'draft';
+      doc.status = normalizedStatus;
+      doc.channelStatus = mergeProductChannelStatus(doc, {
+        ecomm: normalizedStatus,
+        wholesale: normalizedStatus
+      });
+      propagateProductChannelStatusToVariants(doc, {
+        ecomm: normalizedStatus,
+        wholesale: normalizedStatus
+      });
+      doc.markModified('channelStatus');
     }
     if (updates.channelStatus !== undefined) {
       const parsed = parseIfString(updates.channelStatus, {});
       doc.channelStatus = mergeProductChannelStatus(doc, parsed);
-      doc.markModified("channelStatus");
+      propagateProductChannelStatusToVariants(doc, parsed);
+      doc.markModified('channelStatus');
     }
     if (updates.isFeatured !== undefined) {
       doc.isFeatured =
@@ -3883,6 +3896,10 @@ const updateProduct = async (req, res) => {
         updates.variantIsActive !== undefined ? updates.variantIsActive : updates.isActive;
       if (activeFlag !== undefined) {
         variant.isActive = parseBoolean(activeFlag);
+        variant.channelVisibility = mergeVariantChannelVisibility(variant, {
+          ecomm: variant.isActive ? 'active' : 'draft'
+        });
+        doc.markModified('variants');
       }
 
       if (updates.channelVisibility !== undefined) {
@@ -4059,6 +4076,7 @@ const updateProduct = async (req, res) => {
     }
 
     recomputeProductAggregates(doc);
+    reconcileProductCatalogState(doc);
 
     await doc.save({ validateBeforeSave: true });
 
@@ -4404,29 +4422,6 @@ function parseWholesaleConfigForImportRow(row) {
   };
 }
 
-function deriveProductChannelStatusFromVariants(variants) {
-  const list = Array.isArray(variants) ? variants : [];
-
-  const hasActiveEcomm = list.some((v) => {
-    const state = v?.channelVisibility?.ecomm;
-    return state === 'active' || (state == null && v?.isActive !== false);
-  });
-  const hasDraftEcomm = list.some((v) => (v?.channelVisibility?.ecomm || 'draft') === 'draft');
-  const ecomm = hasActiveEcomm ? 'active' : (hasDraftEcomm ? 'draft' : 'archived');
-
-  const wholesale = list.some((v) => hasWholesalePricingConfig(v)) ? 'active' : 'draft';
-
-  return { ecomm, wholesale };
-}
-
-function syncProductStorefrontStatusFromVariants(productDoc) {
-  if (!productDoc || !Array.isArray(productDoc.variants)) return;
-  const derived = deriveProductChannelStatusFromVariants(productDoc.variants);
-  productDoc.channelStatus = derived;
-  // Keep legacy status aligned for backward-compatible queries.
-  productDoc.status = derived.ecomm;
-}
-
 /**
  * Bulk set lifecycle status for many products (admin list multi-select).
  * - active: visible on storefront (same as restore flow)
@@ -4473,19 +4468,19 @@ const bulkUpdateProductStatus = async (req, res) => {
       });
     }
 
-    const existing = await Product.find({ slug: { $in: slugs } })
-      .select('slug name status channelStatus variants')
-      .lean();
+    const existing = await Product.find({ slug: { $in: slugs } });
     const foundSet = new Set(existing.map((p) => p.slug));
     const notFoundSlugs = slugs.filter((s) => !foundSet.has(s));
 
-    const updates = [];
     const skipped = [];
+    const updatedSlugs = [];
     const now = new Date();
 
-    for (const product of existing) {
+    for (const doc of existing) {
       const currentChannelStatus = {
-        ...(product.channelStatus || {})
+        ...(doc.channelStatus && doc.channelStatus.toObject
+          ? doc.channelStatus.toObject()
+          : doc.channelStatus || {})
       };
       const nextChannelStatus = {
         ...currentChannelStatus,
@@ -4500,11 +4495,11 @@ const bulkUpdateProductStatus = async (req, res) => {
 
       if (
         nextChannelStatus.wholesale === 'active' &&
-        !hasActiveWholesaleVariantForCatalog(product)
+        !hasActiveWholesaleVariantForCatalog(doc)
       ) {
         skipped.push({
-          slug: product.slug,
-          name: product.name,
+          slug: doc.slug,
+          name: doc.name,
           reasonCode: 'WHOLESALE_ELIGIBILITY_MISSING',
           reason:
             'Wholesale activation skipped: no variant is eligible (requires wholesale=true, wholesaleBase>0, and wholesale visibility active).'
@@ -4512,45 +4507,43 @@ const bulkUpdateProductStatus = async (req, res) => {
         continue;
       }
 
-      const updateDoc = {
-        channelStatus: nextChannelStatus
-      };
+      const propagatePartial = {};
       if (hasLegacyStatus) {
-        updateDoc.status = normalizedLegacyStatus;
+        propagatePartial.ecomm = normalizedLegacyStatus;
+        propagatePartial.wholesale = normalizedLegacyStatus;
+      } else {
+        if (normalizedChannelStatus.ecomm != null) propagatePartial.ecomm = normalizedChannelStatus.ecomm;
+        if (normalizedChannelStatus.wholesale != null) {
+          propagatePartial.wholesale = normalizedChannelStatus.wholesale;
+        }
       }
+
+      doc.channelStatus = nextChannelStatus;
+      propagateProductChannelStatusToVariants(doc, propagatePartial);
+      reconcileProductCatalogState(doc);
 
       if (
         nextChannelStatus.ecomm === 'archived' &&
         nextChannelStatus.wholesale === 'archived'
       ) {
-        updateDoc.archivedAt = now;
+        doc.archivedAt = now;
       } else if (hasLegacyStatus && normalizedLegacyStatus !== 'archived') {
-        updateDoc.archivedAt = null;
+        doc.archivedAt = null;
       }
 
-      updates.push({
-        updateOne: {
-          filter: { _id: product._id },
-          update: {
-            $set: updateDoc
-          }
-        }
-      });
+      await doc.save({ validateBeforeSave: true });
+      updatedSlugs.push(doc.slug);
     }
 
-    let modifiedCount = 0;
-    if (updates.length > 0) {
-      const writeResult = await Product.bulkWrite(updates, { ordered: false });
-      modifiedCount = Number(writeResult.modifiedCount || 0);
-    }
+    const modifiedCount = updatedSlugs.length;
 
     await invalidateAllProductCaches();
 
     return res.status(200).json({
       success: true,
       message:
-        updates.length > 0
-          ? `Bulk channel status update completed. Updated: ${updates.length}, skipped: ${skipped.length}.`
+        modifiedCount > 0
+          ? `Bulk channel status update completed. Updated: ${modifiedCount}, skipped: ${skipped.length}.`
           : `No products were updated. Skipped: ${skipped.length}.`,
       status: hasLegacyStatus ? normalizedLegacyStatus : null,
       channelStatus: hasChannelStatus || hasLegacyStatus
@@ -4562,11 +4555,11 @@ const bulkUpdateProductStatus = async (req, res) => {
       requested: slugs.length,
       matched: existing.length,
       modified: modifiedCount,
-      updatedCount: updates.length,
+      updatedCount: modifiedCount,
       skippedCount: skipped.length,
       skippedProducts: skipped,
       updatedProducts: existing
-        .filter((p) => !skipped.some((s) => s.slug === p.slug))
+        .filter((p) => updatedSlugs.includes(p.slug))
         .map((p) => ({ slug: p.slug, name: p.name })),
       unchanged: Math.max(existing.length - modifiedCount - skipped.length, 0),
       notFoundSlugs,
@@ -4639,6 +4632,7 @@ const updateVariantChannelVisibility = async (req, res) => {
 
     variant.channelVisibility = mergeVariantChannelVisibility(variant, requested);
     doc.markModified('variants');
+    reconcileProductCatalogState(doc);
 
     // Prevent wholesale storefront active state without an eligible active variant.
     if (

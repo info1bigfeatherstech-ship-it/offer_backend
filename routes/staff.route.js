@@ -43,9 +43,8 @@ router.post(
   '/',
   [
     body('name')
+      .optional({ values: 'falsy' })
       .trim()
-      .notEmpty()
-      .withMessage('Name is required')
       .isLength({ min: 2 })
       .withMessage('Name must be at least 2 characters'),
     body('email')
@@ -56,9 +55,8 @@ router.post(
       .withMessage('Valid email is required')
       .normalizeEmail(),
     body('phone')
+      .optional({ values: 'falsy' })
       .trim()
-      .notEmpty()
-      .withMessage('Phone number is required')
       .matches(/^[0-9]{10}$/)
       .withMessage('Phone number must be 10 digits'),
     body('password')

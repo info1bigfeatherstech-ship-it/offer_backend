@@ -24,7 +24,8 @@ const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
     buildShippingWeightSnapshotFromCheckoutLines,
-    buildShippingWeightSnapshotFromOrderItems
+    buildShippingWeightSnapshotFromOrderItems,
+    enrichShippingWeightSnapshotDims
 } = require('../utils/shippingWeightSnapshot');
 const {
     isAdvanceBalanceCodCheckout,
@@ -2399,12 +2400,16 @@ exports.getOrder = async (req, res) => {
         }
 
         if (isOrderStaff) {
-            const snap = transformedOrder.shippingWeightSnapshot;
+            let snap = transformedOrder.shippingWeightSnapshot;
             if (!snap?.lines?.length && Array.isArray(order.items) && order.items.length) {
                 const fallback = await buildShippingWeightSnapshotFromOrderItems(order);
                 if (fallback) {
+                    snap = fallback;
                     transformedOrder.shippingWeightSnapshot = fallback;
                 }
+            }
+            if (snap?.lines?.length) {
+                transformedOrder.shippingWeightSnapshot = await enrichShippingWeightSnapshotDims(snap);
             }
         }
 
