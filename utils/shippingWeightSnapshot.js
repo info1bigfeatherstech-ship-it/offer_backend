@@ -216,9 +216,9 @@ async function resolveShiprocketPackageMetrics(order) {
         lineWeightByVariantId.set(String(row.variantId), Number(row.unitWeightKg) || 0.5);
       }
     }
-    const maxL = Math.max(10, Number(snap.dims?.lengthCm) || 10);
-    const maxB = Math.max(10, Number(snap.dims?.widthCm) || 10);
-    const maxH = Math.max(10, Number(snap.dims?.heightCm) || 10);
+    const maxL = Math.max(1, Number(snap.dims?.lengthCm) || 1);
+    const maxB = Math.max(1, Number(snap.dims?.widthCm) || 1);
+    const maxH = Math.max(1, Number(snap.dims?.heightCm) || 1);
     return {
       totalWeight: Math.max(0.05, Number(snap.totalWeightKg) || 0.5),
       maxL,
