@@ -159,8 +159,16 @@ exports.quoteCheckout = async (req, res) => {
     const userId = req.userId;
     const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
-    const { addressId, couponCode, paymentMethodHint, paymentPlan, paymentAdvancePercent, balanceCollection } =
-      req.body || {};
+    const {
+      addressId,
+      couponCode,
+      paymentMethodHint,
+      paymentPlan,
+      paymentAdvancePercent,
+      balanceCollection,
+      quotePurpose
+    } = req.body || {};
+    const isComparisonQuote = String(quotePurpose || '').toLowerCase() === 'cod_comparison';
 
     const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
 
@@ -286,6 +294,29 @@ exports.quoteCheckout = async (req, res) => {
     const fp = cartFingerprintFromItems(cartDoc.items);
     const quoteExpiresAt = new Date(Date.now() + QUOTE_TTL_MS);
     const couponCodeUpper = couponCode ? String(couponCode).toUpperCase().trim() : '';
+
+    if (isComparisonQuote) {
+      return res.json({
+        success: true,
+        previewOnly: true,
+        quoteId: null,
+        isDeliverable: true,
+        ...buildClientCodAvailability({
+          policy: checkoutPolicy,
+          carrierCodAvailable: finalTotals.deliveryMeta?.codAvailable !== false
+        }),
+        checkoutPolicy,
+        pincode: pin,
+        itemCount: cartDoc.items.length,
+        itemsSubtotal: finalTotals.subtotal,
+        promotionDiscount: finalTotals.discount,
+        deliveryCharges: finalTotals.deliveryCharges,
+        taxes: finalTotals.tax,
+        amountPayable: finalTotals.totalAmount,
+        includesShippingAndHandling: true,
+        couponApplied: finalTotals.appliedCouponCode
+      });
+    }
 
     await CheckoutQuote.updateMany(
       {

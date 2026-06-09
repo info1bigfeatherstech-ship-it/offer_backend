@@ -1,13 +1,15 @@
 // controllers/delivery.controller.js
 const mongoose = require('mongoose');
 const ShiprocketService = require('../utils/shiprocket');
-const DeliveryZone = require('../models/delieveryZone');
 const Cart = require('../models/cart');
 const Product = require('../models/Product');
 const { aggregateShipping } = require('../services/checkoutComputation.service');
+const {
+  resolveVariantShipping,
+  unitWeightKgFromResolvedShipping,
+  DEFAULT_UNIT_WEIGHT_KG
+} = require('../utils/variantCatalogFields');
 const logger = require('../utils/logger');
-
-const DEFAULT_ITEM_WEIGHT_KG = 0.5;
 
 function uniqueProductIds(cartItems) {
   const ids = [];
@@ -23,46 +25,48 @@ function uniqueProductIds(cartItems) {
   return ids;
 }
 
-/** Batch-load shipping weights — avoids N+1 queries (same totals as per-row finds, including 0.5kg fallback). */
-async function calculateCartWeightKg(cartItems) {
-  const ids = uniqueProductIds(cartItems);
-  let products = [];
-  if (ids.length) {
-    products = await Product.find({ _id: { $in: ids } })
-      .select('shipping')
-      .lean();
-  }
-  const byId = new Map(products.map((p) => [String(p._id), p]));
-
-  let totalWeight = 0;
-  for (const item of cartItems || []) {
-    if (!item?.productId) continue;
-    const p = mongoose.isValidObjectId(item.productId)
-      ? byId.get(String(item.productId))
-      : null;
-    const w = Number(p?.shipping?.weight);
-    const unit = Number.isFinite(w) && w > 0 ? w : DEFAULT_ITEM_WEIGHT_KG;
-    totalWeight += (Number(item.quantity) || 0) * unit;
-  }
-  return totalWeight;
+function findVariantOnProduct(product, variantId) {
+  if (!product?.variants?.length || variantId == null) return product?.variants?.[0] || null;
+  return product.variants.find((v) => String(v._id) === String(variantId)) || null;
 }
 
-/** Build shipping lines for aggregateShipping using one query for all cart products. */
+/** Batch-load products and resolve per-line shipping (variant ?? product). */
 async function buildShippingLinesFromCartItems(cartItems) {
   const ids = uniqueProductIds(cartItems);
   if (!ids.length) return [];
 
   const products = await Product.find({ _id: { $in: ids } })
-    .select('shipping')
+    .select('shipping variants')
     .lean();
   const byId = new Map(products.map((p) => [String(p._id), p]));
 
   const lines = [];
-  for (const it of cartItems) {
+  for (const it of cartItems || []) {
     const p = byId.get(String(it.productId));
-    if (p) lines.push({ product: p, quantity: Number(it.quantity) || 0 });
+    if (!p) continue;
+    const variant = findVariantOnProduct(p, it.variantId);
+    lines.push({
+      product: p,
+      variant,
+      quantity: Number(it.quantity) || 0,
+      resolvedShipping: resolveVariantShipping(variant, p)
+    });
   }
   return lines;
+}
+
+async function calculateCartWeightKg(cartItems) {
+  const lines = await buildShippingLinesFromCartItems(cartItems);
+  if (!lines.length) return DEFAULT_UNIT_WEIGHT_KG;
+
+  let totalWeight = 0;
+  for (const line of lines) {
+    const w = unitWeightKgFromResolvedShipping(
+      line.resolvedShipping || resolveVariantShipping(line.variant, line.product)
+    );
+    totalWeight += (Number(line.quantity) || 0) * w;
+  }
+  return Math.max(0.05, totalWeight);
 }
 
 // ========== PRODUCTION VERSION ==========
@@ -88,9 +92,17 @@ exports.checkDeliveryAvailability = async (req, res) => {
         : null;
 
     if (cartDoc?.items?.length) {
-      totalWeight = await calculateCartWeightKg(cartDoc.items);
       const lines = await buildShippingLinesFromCartItems(cartDoc.items);
-      if (lines.length) dims = aggregateShipping(lines);
+      if (lines.length) {
+        totalWeight = lines.reduce((sum, line) => {
+          const w = unitWeightKgFromResolvedShipping(
+            line.resolvedShipping || resolveVariantShipping(line.variant, line.product)
+          );
+          return sum + (Number(line.quantity) || 0) * w;
+        }, 0);
+        totalWeight = Math.max(0.05, totalWeight);
+        dims = aggregateShipping(lines);
+      }
     }
 
     const result = await ShiprocketService.checkDeliveryAvailability(pincode, {
@@ -144,80 +156,6 @@ exports.getDeliveryCharges = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Error fetching delivery charges',
-      error: error.message
-    });
-  }
-};
-
-// ========== ADMIN FUNCTIONS ==========
-exports.addDeliveryZone = async (req, res) => {
-  try {
-    const { name, pincodes, baseCharge, perKgCharge, freeDeliveryAbove, estimatedDays } = req.body;
-
-    const deliveryZone = new DeliveryZone({
-      name,
-      pincodes,
-      baseCharge,
-      perKgCharge,
-      freeDeliveryAbove,
-      estimatedDays
-    });
-
-    await deliveryZone.save();
-
-    return res.status(201).json({
-      success: true,
-      message: 'Delivery zone added successfully',
-      deliveryZone
-    });
-  } catch (error) {
-    logger.error('Add delivery zone error:', { message: error.message, stack: error.stack });
-    return res.status(500).json({
-      success: false,
-      message: 'Error adding delivery zone',
-      error: error.message
-    });
-  }
-};
-
-exports.getDeliveryZones = async (req, res) => {
-  try {
-    const zones = await DeliveryZone.find({ isActive: true });
-    return res.json({
-      success: true,
-      zones
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Error fetching delivery zones',
-      error: error.message
-    });
-  }
-};
-
-exports.updateDeliveryZone = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updates = req.body;
-
-    const zone = await DeliveryZone.findByIdAndUpdate(id, updates, { new: true });
-    if (!zone) {
-      return res.status(404).json({
-        success: false,
-        message: 'Delivery zone not found'
-      });
-    }
-
-    return res.json({
-      success: true,
-      message: 'Delivery zone updated',
-      deliveryZone: zone
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Error updating delivery zone',
       error: error.message
     });
   }

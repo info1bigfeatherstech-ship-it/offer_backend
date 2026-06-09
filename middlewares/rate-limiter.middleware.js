@@ -82,6 +82,13 @@ const rateLimits = {
     windowMs: 15 * 60 * 1000,
     max: 500,
     message: 'Admin rate limit exceeded'
+  },
+
+  // Push subscription register/unregister
+  pushWrite: {
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    message: 'Too many push subscription updates. Please try again later'
   }
 };
 
@@ -125,7 +132,8 @@ const limiters = {
   checkoutConfirm: createRateLimiter('checkoutConfirm', ['/health', '/api/health']),
   sensitive: createRateLimiter('sensitive', ['/health', '/api/health']),
   orders: createRateLimiter('orders', ['/health', '/api/health']),
-  admin: createRateLimiter('admin', ['/health', '/api/health'])
+  admin: createRateLimiter('admin', ['/health', '/api/health']),
+  pushWrite: createRateLimiter('pushWrite', ['/health', '/api/health'])
 };
 
 module.exports = { limiters, createRateLimiter };
