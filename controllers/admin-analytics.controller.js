@@ -4,6 +4,10 @@ const Cart = require('../models/cart');
 const Wishlist = require('../models/Wishlist');
 const Product = require('../models/Product');
 const mongoose = require('mongoose');
+const {
+  sendBulkCartReminderEmails,
+  MAX_BULK_RECIPIENTS
+} = require('../services/cartReminderEmail.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
 const scopeLabelFromReq = (req) => req.adminScope?.storefront || 'ecomm';
@@ -17,6 +21,63 @@ function mergeAnd(base, extra) {
 async function fetchScopedUserIds(req) {
   const scopedUsers = await User.find(scopedUserQueryFromReq(req)).select('_id').lean();
   return scopedUsers.map((u) => u._id);
+}
+
+const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
+const ADMIN_CART_POPULATE = [
+  { path: 'userId', select: 'name email phone role' },
+  {
+    path: 'items.productId',
+    select: ADMIN_CART_PRODUCT_SELECT
+  }
+];
+
+function getItemUnitPrice(priceSnapshot) {
+  if (!priceSnapshot) return 0;
+  return priceSnapshot.sale ?? priceSnapshot.base ?? 0;
+}
+
+function formatAdminCartItem(item) {
+  const product = item.productId;
+  const variant = product?.variants?.find(
+    (v) => String(v._id) === String(item.variantId)
+  );
+
+  const unitPrice = getItemUnitPrice(item.priceSnapshot);
+  const quantity = item.quantity || 1;
+
+  return {
+    productId: product?._id,
+    productName: product?.name || product?.title || 'Unknown Product',
+    productSlug: product?.slug,
+    variantId: item.variantId,
+    sku: variant?.sku || null,
+    productCode: variant?.productCode ?? null,
+    quantity,
+    unitPrice,
+    lineTotal: unitPrice * quantity,
+    priceSnapshot: item.priceSnapshot,
+    variantAttributes: item.variantAttributesSnapshot?.length
+      ? item.variantAttributesSnapshot
+      : variant?.attributes || [],
+    imageUrl: variant?.images?.[0]?.url || null,
+    addedAt: item.createdAt
+  };
+}
+
+function formatAdminCart(cart, extra = {}) {
+  const items = (cart.items || []).map(formatAdminCartItem);
+
+  return {
+    _id: cart._id,
+    user: cart.userId,
+    items,
+    totalAmount: cart.totalAmount ?? 0,
+    itemCount: items.length,
+    createdAt: cart.createdAt,
+    updatedAt: cart.updatedAt,
+    ...extra
+  };
 }
 
 // =============================================
@@ -120,9 +181,8 @@ const           getUserById = async (req, res) => {
       });
     }
 
-    // Get cart details
     const userCart = await Cart.findOne({ userId: user._id })
-      .populate('items.productId', 'name slug images')
+      .populate(ADMIN_CART_POPULATE)
       .lean();
 
     // Get wishlist details
@@ -135,7 +195,7 @@ const           getUserById = async (req, res) => {
       scope: scopeLabelFromReq(req),
       data: {
         user,
-        cart: userCart || { items: [], totalAmount: 0 },
+        cart: userCart ? formatAdminCart(userCart) : { items: [], totalAmount: 0, itemCount: 0 },
         wishlist: wishlist || { products: [] }
       }
     });
@@ -179,8 +239,7 @@ const getAllcarts = async (req, res) => {
 
     const [carts, total] = await Promise.all([
       Cart.find(scopeQuery)
-        .populate('userId', 'name email phone role')
-        .populate('items.productId', 'name slug images')
+        .populate(ADMIN_CART_POPULATE)
         .sort(sort)
         .skip(skip)
         .limit(limit)
@@ -188,24 +247,7 @@ const getAllcarts = async (req, res) => {
       Cart.countDocuments(scopeQuery)
     ]);
 
-    // Format carts data
-    const formattedcarts = carts.map(cart => ({
-      _id: cart._id,
-      user: cart.userId,
-      items: cart.items.map(item => ({
-        productId: item.productId?._id,
-        productName: item.productId?.name,
-        variantId: item.variantId,
-        quantity: item.quantity,
-        priceSnapshot: item.priceSnapshot,
-        variantAttributes: item.variantAttributesSnapshot,
-        addedAt: item.createdAt
-      })),
-      totalAmount: cart.totalAmount,
-      createdAt: cart.createdAt,
-      updatedAt: cart.updatedAt,
-      itemCount: cart.items.length
-    }));
+    const formattedcarts = carts.map((cart) => formatAdminCart(cart));
 
     return res.status(200).json({
       success: true,
@@ -268,8 +310,7 @@ const getAbandonedcarts = async (req, res) => {
       updatedAt: { $lt: cutoffDate },
       'items.0': { $exists: true } // Has at least one item
     })
-      .populate('userId', 'name email phone')
-      .populate('items.productId', 'name slug price')
+      .populate(ADMIN_CART_POPULATE)
       .sort({ updatedAt: 1 })
       .skip(skip)
       .limit(limit)
@@ -281,21 +322,14 @@ const getAbandonedcarts = async (req, res) => {
       'items.0': { $exists: true }
     });
 
-    const formattedcarts = carts.map(cart => ({
-      _id: cart._id,
-      user: cart.userId,
-      items: cart.items.map(item => ({
-        productId: item.productId?._id,
-        productName: item.productId?.name,
-        variantId: item.variantId,
-        quantity: item.quantity,
-        price: item.priceSnapshot?.sale || item.priceSnapshot?.base
-      })),
-      totalAmount: cart.totalAmount,
-      abandonedSince: cart.updatedAt,
-      hoursSinceUpdate: Math.floor((Date.now() - new Date(cart.updatedAt)) / (1000 * 60 * 60)),
-      itemCount: cart.items.length
-    }));
+    const formattedcarts = carts.map((cart) =>
+      formatAdminCart(cart, {
+        abandonedSince: cart.updatedAt,
+        hoursSinceUpdate: Math.floor(
+          (Date.now() - new Date(cart.updatedAt)) / (1000 * 60 * 60)
+        )
+      })
+    );
 
     return res.status(200).json({
       success: true,
@@ -355,8 +389,7 @@ const getHighValuecarts = async (req, res) => {
       totalAmount: { $gte: minAmount },
       'items.0': { $exists: true }
     })
-      .populate('userId', 'name email phone')
-      .populate('items.productId', 'name slug')
+      .populate(ADMIN_CART_POPULATE)
       .sort({ totalAmount: -1 })
       .skip(skip)
       .limit(limit)
@@ -371,14 +404,7 @@ const getHighValuecarts = async (req, res) => {
     return res.status(200).json({
       success: true,
       scope: scopeLabelFromReq(req),
-      data: carts.map(cart => ({
-        _id: cart._id,
-        user: cart.userId,
-        itemsCount: cart.items.length,
-        totalAmount: cart.totalAmount,
-        createdAt: cart.createdAt,
-        updatedAt: cart.updatedAt
-      })),
+      data: carts.map((cart) => formatAdminCart(cart)),
       pagination: {
         total,
         page,
@@ -393,6 +419,57 @@ const getHighValuecarts = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Error fetching high value carts',
+      error: error.message
+    });
+  }
+};
+
+// =============================================
+// 5b. GET SINGLE CART BY ID (READ ONLY)
+// =============================================
+const getCartById = async (req, res) => {
+  try {
+    const { cartId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(cartId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid cart ID'
+      });
+    }
+
+    const scopedUserIds = await fetchScopedUserIds(req);
+    if (!scopedUserIds.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cart not found'
+      });
+    }
+
+    const cart = await Cart.findOne({
+      _id: cartId,
+      userId: { $in: scopedUserIds }
+    })
+      .populate(ADMIN_CART_POPULATE)
+      .lean();
+
+    if (!cart) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cart not found'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      data: formatAdminCart(cart)
+    });
+  } catch (error) {
+    console.error('Get cart by ID error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error fetching cart details',
       error: error.message
     });
   }
@@ -719,12 +796,62 @@ const getDashboardSummary = async (req, res) => {
   }
 };
 
+// =============================================
+// BULK CART REMINDER EMAIL
+// =============================================
+const bulkCartReminderEmail = async (req, res) => {
+  try {
+    const userIds = req.body?.userIds;
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'USER_IDS_REQUIRED',
+        message: 'userIds array is required'
+      });
+    }
+    if (userIds.length > MAX_BULK_RECIPIENTS) {
+      return res.status(400).json({
+        success: false,
+        code: 'BULK_LIMIT_EXCEEDED',
+        message: `Maximum ${MAX_BULK_RECIPIENTS} users per bulk send`
+      });
+    }
+
+    const results = await sendBulkCartReminderEmails({
+      userIds,
+      scopeQuery: scopedUserQueryFromReq(req)
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Cart reminder emails processed: ${results.sent} sent, ${results.skipped} skipped, ${results.failed} failed`,
+      ...results
+    });
+  } catch (error) {
+    console.error('Bulk cart reminder email error:', error);
+    const code = error.code || 'CART_REMINDER_EMAIL_FAILED';
+    const status =
+      code === 'EMAIL_NOT_CONFIGURED'
+        ? 503
+        : ['USER_IDS_REQUIRED', 'BULK_LIMIT_EXCEEDED', 'INVALID_USER_IDS'].includes(code)
+          ? 400
+          : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not send cart reminder emails'
+    });
+  }
+};
+
 module.exports = {
   getAllUsers,
   getUserById,
+  bulkCartReminderEmail,
   getAllCarts: getAllcarts,
   getAbandonedCarts: getAbandonedcarts,
   getHighValueCarts: getHighValuecarts,
+  getCartById,
   getAllWishlists,
   getStaleWishlists,
   getPopularWishlistProducts,
