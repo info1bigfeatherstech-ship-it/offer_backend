@@ -406,19 +406,31 @@ class ShiprocketService {
   }
 
   /**
-   * True when online advance was paid and remaining balance is collected as COD at delivery.
+   * Resolve COD collect amount for partial prepaid + balance-on-delivery orders.
+   * @returns {{ totalInr: number, paidInr: number, balanceDue: number, codCollect: number }}
    */
-  static isPartialCodBalanceShipment(parts, order) {
-    const payMethod = String(parts?.payMethod || order?.paymentInfo?.method || '').toLowerCase();
-    if (payMethod !== 'online') return false;
-
+  static resolvePartialCodCollect(parts, order) {
     const totalInr = roundMoney2(Number(order?.totalAmount) || 0);
     const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
     let balanceDue = roundMoney2(Number(order?.balanceDueInr) || 0);
     if (!(balanceDue > 0) && paidInr > 0 && totalInr > 0) {
       balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
     }
-    const codCollect = roundMoney2(Number(parts?.codCollect) || balanceDue);
+    let codCollect = roundMoney2(Number(parts?.codCollect) || 0);
+    if (!(codCollect > 0) && balanceDue > 0) {
+      codCollect = balanceDue;
+    }
+    return { totalInr, paidInr, balanceDue, codCollect };
+  }
+
+  /**
+   * True when online advance was paid and remaining balance is collected as COD at delivery.
+   */
+  static isPartialCodBalanceShipment(parts, order) {
+    const payMethod = String(parts?.payMethod || order?.paymentInfo?.method || '').toLowerCase();
+    if (payMethod !== 'online') return false;
+
+    const { totalInr, paidInr, codCollect } = ShiprocketService.resolvePartialCodCollect(parts, order);
     if (!(codCollect > 0) || codCollect >= totalInr - 0.005) return false;
 
     const balanceViaCod =
@@ -476,13 +488,12 @@ class ShiprocketService {
     }));
 
     if (ShiprocketService.isPartialCodBalanceShipment(parts, order)) {
-      const codCollect = roundMoney2(parts.codCollect);
+      const { codCollect, paidInr } = ShiprocketService.resolvePartialCodCollect(parts, order);
       const scaledItems = ShiprocketService.scaleOrderItemsForCodCollect(
         mappedItems,
         codCollect,
         order.totalAmount
       );
-      const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
       payload.payment_method = 'COD';
       payload.order_items = scaledItems;
       payload.sub_total = codCollect;
@@ -551,6 +562,48 @@ class ShiprocketService {
     };
 
     const payload = ShiprocketService.finalizeAdhocCreatePayload(basePayload, order, parts, orderItems);
+    const isPartial = ShiprocketService.isPartialCodBalanceShipment(parts, order);
+    const lineSum = roundMoney2(
+      (payload.order_items || []).reduce(
+        (s, it) => s + (Number(it.selling_price) || 0) * Math.max(1, Number(it.units) || 1),
+        0
+      )
+    );
+
+    // #region agent log
+    const _dbgPartialCod = {
+      sessionId: 'fac29a',
+      runId: process.env.DEBUG_RUN_ID || 'pre-fix',
+      hypothesisId: 'B-D-E',
+      location: 'shiprocket.js:createShipment',
+      message: 'Shiprocket adhoc payload before API',
+      data: {
+        orderId: order.orderId,
+        isPartial,
+        partsCodCollect: parts.codCollect,
+        resolvedCodCollect: ShiprocketService.resolvePartialCodCollect(parts, order).codCollect,
+        splitMode: order.paymentInfo?.splitMode,
+        balanceCollectionMethod: order.paymentInfo?.balanceCollectionMethod,
+        paymentStatus: order.paymentStatus,
+        totalAmount: order.totalAmount,
+        amountPaidInr: order.amountPaidInr,
+        balanceDueInr: order.balanceDueInr,
+        payloadSubTotal: payload.sub_total,
+        payloadTotal: payload.total,
+        payloadCodAmount: payload.cod_amount,
+        payloadPaymentMethod: payload.payment_method,
+        lineSum,
+        fixVersion: 'partial-cod-v2-resolve'
+      },
+      timestamp: Date.now()
+    };
+    fetch('http://127.0.0.1:7253/ingest/131a0f6c-80aa-4a56-bc41-7f95da1d615b', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'fac29a' },
+      body: JSON.stringify(_dbgPartialCod)
+    }).catch(() => {});
+    logger.info('[DEBUG:fac29a] Shiprocket adhoc payload', _dbgPartialCod.data);
+    // #endregion
 
     try {
       const data = await this.requestWithAuth({

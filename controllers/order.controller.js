@@ -586,6 +586,31 @@ async function ensureShipmentForOrder({ order, trigger }) {
         return { success: true, alreadyExists: true, pendingAwbAssignment: true };
     }
 
+    // #region agent log
+    fetch('http://127.0.0.1:7253/ingest/131a0f6c-80aa-4a56-bc41-7f95da1d615b', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'fac29a' },
+        body: JSON.stringify({
+            sessionId: 'fac29a',
+            runId: process.env.DEBUG_RUN_ID || 'pre-fix',
+            hypothesisId: 'C',
+            location: 'order.controller.js:ensureShipmentForOrder',
+            message: 'Order snapshot before createShipment',
+            data: {
+                orderId: order.orderId,
+                trigger,
+                splitMode: order.paymentInfo?.splitMode,
+                balanceCollectionMethod: order.paymentInfo?.balanceCollectionMethod,
+                paymentStatus: order.paymentStatus,
+                amountPaidInr: order.amountPaidInr,
+                balanceDueInr: order.balanceDueInr,
+                totalAmount: order.totalAmount
+            },
+            timestamp: Date.now()
+        })
+    }).catch(() => {});
+    // #endregion
+
     const result = await ShiprocketService.createShipment(order);
     if (!result?.success) {
         await markShipmentSyncFailure({ order, error: result?.error || 'createShipment failed', trigger });
