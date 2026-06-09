@@ -18,12 +18,29 @@ const SEND_DELAY_MS = 400;
 
 let cachedTransporter = null;
 
+/** Bulk cart-reminder mail uses MARKETING_EMAIL_* — not EMAIL_USER (OTP/auth). */
+function getMarketingEmailUser() {
+  return String(process.env.MARKETING_EMAIL_USER || '').trim();
+}
+
+function getMarketingEmailPassword() {
+  return String(process.env.MARKETING_EMAIL_PASSWORD || '').trim();
+}
+
+function getMarketingFromAddress() {
+  const fromName = String(process.env.MARKETING_EMAIL_FROM_NAME || 'OfferWaaleBaba').trim();
+  const fromEmail = getMarketingEmailUser();
+  return `"${fromName}" <${fromEmail}>`;
+}
+
 function getTransporter() {
   if (cachedTransporter) return cachedTransporter;
-  const user = process.env.EMAIL_USER;
-  const pass = process.env.EMAIL_PASSWORD;
+  const user = getMarketingEmailUser();
+  const pass = getMarketingEmailPassword();
   if (!user || !pass) {
-    const err = new Error('Email is not configured. Set EMAIL_USER and EMAIL_PASSWORD on the server.');
+    const err = new Error(
+      'Marketing email is not configured. Set MARKETING_EMAIL_USER and MARKETING_EMAIL_PASSWORD on the server.'
+    );
     err.code = 'EMAIL_NOT_CONFIGURED';
     throw err;
   }
@@ -250,7 +267,7 @@ async function sendBulkCartReminderEmails({ userIds, scopeQuery = {} }) {
     .lean();
 
   const transporter = getTransporter();
-  const from = `"OfferWaaleBaba" <${process.env.EMAIL_USER}>`;
+  const from = getMarketingFromAddress();
 
   const results = {
     sent: 0,
