@@ -4,9 +4,11 @@ const router = express.Router();
 const {
   getAllUsers,
   getUserById,
+  bulkCartReminderEmail,
   getAllCarts,
   getAbandonedCarts,
   getHighValueCarts,
+  getCartById,
   getAllWishlists,
   getStaleWishlists,
   getPopularWishlistProducts,
@@ -28,12 +30,14 @@ router.use(requireStrictAdminStorefrontScope);
 
 // User analytics
 router.get('/users', getAllUsers);
+router.post('/users/bulk-cart-reminder-email', bulkCartReminderEmail);
 router.get('/users/:userId', getUserById);
 
 // Cart analytics
 router.get('/carts', getAllCarts);
 router.get('/carts/abandoned', getAbandonedCarts);
 router.get('/carts/high-value', getHighValueCarts);
+router.get('/carts/:cartId', getCartById);
 
 // Wishlist analytics
 router.get('/wishlists', getAllWishlists);
