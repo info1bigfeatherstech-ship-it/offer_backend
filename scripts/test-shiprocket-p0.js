@@ -488,6 +488,46 @@ function testFullPrepaidAdhocPayloadUnchanged() {
   assert.strictEqual(payload.order_items[0].selling_price, 450);
 }
 
+function testPartialCodFinalizeResolvesWhenPartsCodCollectZero() {
+  const Cls = ShiprocketService;
+  const order = {
+    orderId: 'OWB-TEST-PARTIAL-ZERO-PARTS',
+    totalAmount: 194.36,
+    amountPaidInr: 48.59,
+    balanceDueInr: 145.77,
+    paymentStatus: 'partially_paid',
+    paymentInfo: {
+      method: 'online',
+      splitMode: 'advance',
+      balanceCollectionMethod: 'cod',
+      advancePercent: 25
+    }
+  };
+  const parts = {
+    useCodAtDoor: false,
+    payMethod: 'online',
+    balanceViaCod: true,
+    splitAdv: true,
+    codCollect: 0
+  };
+  const orderItems = [
+    { name: 'Item', sku: 'S1', units: 1, selling_price: 194.36, discount: 0, tax: '', hsn: '' }
+  ];
+  assert.strictEqual(Cls.isPartialCodBalanceShipment(parts, order), true);
+  const payload = Cls.finalizeAdhocCreatePayload(
+    { payment_method: 'COD', sub_total: 194.36, shipping_charges: 0 },
+    order,
+    parts,
+    orderItems
+  );
+  assert.strictEqual(payload.total, 145.77);
+  assert.strictEqual(payload.cod_amount, 145.77);
+  const lineSum = Math.round(
+    payload.order_items.reduce((s, it) => s + it.selling_price * it.units, 0) * 100
+  ) / 100;
+  assert.ok(Math.abs(lineSum - 145.77) < 0.02, `lineSum ${lineSum} expected ~145.77`);
+}
+
 function testFullCodAdhocPayloadUnchanged() {
   const Cls = ShiprocketService;
   const order = {
@@ -517,6 +557,7 @@ function testFullCodAdhocPayloadUnchanged() {
 
 function run() {
   testPartialCodAdhocPayload();
+  testPartialCodFinalizeResolvesWhenPartsCodCollectZero();
   testFullPrepaidAdhocPayloadUnchanged();
   testFullCodAdhocPayloadUnchanged();
   testNormalizeYmdDate();
