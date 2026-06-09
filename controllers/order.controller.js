@@ -586,6 +586,12 @@ async function ensureShipmentForOrder({ order, trigger }) {
         return { success: true, alreadyExists: true, pendingAwbAssignment: true };
     }
 
+    const reloaded = await Order.findOne({ orderId: order.orderId })
+        .populate('items.productId', 'name slug variants shipping');
+    if (reloaded) {
+        order = reloaded;
+    }
+
     // #region agent log
     fetch('http://127.0.0.1:7253/ingest/131a0f6c-80aa-4a56-bc41-7f95da1d615b', {
         method: 'POST',
@@ -612,13 +618,27 @@ async function ensureShipmentForOrder({ order, trigger }) {
     // #endregion
 
     const result = await ShiprocketService.createShipment(order);
+    if (result?.adhocPayloadDebug) {
+        order.shipmentInfo = order.shipmentInfo || {};
+        const events = Array.isArray(order.shipmentInfo.rawEvents) ? order.shipmentInfo.rawEvents : [];
+        events.push({
+            type: 'adhoc_payload_debug',
+            at: new Date(),
+            trigger,
+            ...result.adhocPayloadDebug
+        });
+        order.shipmentInfo.rawEvents = events.slice(-20);
+        order.markModified('shipmentInfo');
+        await order.save();
+    }
     if (!result?.success) {
         await markShipmentSyncFailure({ order, error: result?.error || 'createShipment failed', trigger });
         return {
             success: false,
             code: 'SHIPMENT_CREATE_FAILED',
             message: 'Shipment creation failed',
-            details: result?.error || null
+            details: result?.error || null,
+            adhocPayloadDebug: result?.adhocPayloadDebug || null
         };
     }
 

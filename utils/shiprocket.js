@@ -433,16 +433,13 @@ class ShiprocketService {
     const { totalInr, paidInr, codCollect } = ShiprocketService.resolvePartialCodCollect(parts, order);
     if (!(codCollect > 0) || codCollect >= totalInr - 0.005) return false;
 
+    if (!(paidInr > 0)) return false;
+
     const balanceViaCod =
       parts?.balanceViaCod === true ||
       String(order?.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
-    const splitAdv =
-      parts?.splitAdv === true ||
-      String(order?.paymentInfo?.splitMode || '').toLowerCase() === 'advance';
-    const partiallyPaid =
-      String(order?.paymentStatus || '').toLowerCase() === 'partially_paid' && paidInr > 0;
 
-    return balanceViaCod && (splitAdv || partiallyPaid);
+    return balanceViaCod;
   }
 
   /**
@@ -625,11 +622,16 @@ class ShiprocketService {
         labelUrl: data.label_url,
         providerStatus: data.status || null,
         raw: data,
+        adhocPayloadDebug: _dbgPartialCod.data,
         mock: false
       };
     } catch (err) {
       logger.error('[Shiprocket] createShipment failed:', err.response?.data || err.message);
-      return { success: false, error: err.response?.data || err.message };
+      return {
+        success: false,
+        error: err.response?.data || err.message,
+        adhocPayloadDebug: _dbgPartialCod.data
+      };
     }
   }
 
