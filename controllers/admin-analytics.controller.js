@@ -8,6 +8,11 @@ const {
   sendBulkCartReminderEmails,
   MAX_BULK_RECIPIENTS
 } = require('../services/cartReminderEmail.service');
+const {
+  sendBulkCartReminderPushes,
+  MAX_BULK_RECIPIENTS: MAX_BULK_PUSH_RECIPIENTS
+} = require('../services/cartReminderPush.service');
+const leadsPushSettingsService = require('../services/leadsPushSettings.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
 const scopeLabelFromReq = (req) => req.adminScope?.storefront || 'ecomm';
@@ -797,6 +802,109 @@ const getDashboardSummary = async (req, res) => {
 };
 
 // =============================================
+// LEADS PUSH SETTINGS (auto daily toggle)
+// =============================================
+const getLeadsPushSettings = async (req, res) => {
+  try {
+    const storefront = scopeLabelFromReq(req);
+    const data = await leadsPushSettingsService.getAdminSettings(storefront);
+    return res.status(200).json({
+      success: true,
+      scope: storefront,
+      data,
+    });
+  } catch (error) {
+    console.error('Get leads push settings error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Could not load push notification settings',
+    });
+  }
+};
+
+const updateLeadsPushSettings = async (req, res) => {
+  try {
+    if (req.body?.autoPushEnabled === undefined) {
+      return res.status(400).json({
+        success: false,
+        code: 'AUTO_PUSH_ENABLED_REQUIRED',
+        message: 'autoPushEnabled is required',
+      });
+    }
+
+    const storefront = scopeLabelFromReq(req);
+    const data = await leadsPushSettingsService.updateAutoPushEnabled(
+      storefront,
+      req.body.autoPushEnabled,
+      req.user?._id || req.userId || null
+    );
+
+    return res.status(200).json({
+      success: true,
+      scope: storefront,
+      message: data.autoPushEnabled
+        ? 'Auto cart reminder push enabled'
+        : 'Auto cart reminder push disabled',
+      data,
+    });
+  } catch (error) {
+    console.error('Update leads push settings error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Could not update push notification settings',
+    });
+  }
+};
+
+// =============================================
+// BULK CART REMINDER PUSH
+// =============================================
+const bulkCartReminderPush = async (req, res) => {
+  try {
+    const userIds = req.body?.userIds;
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'USER_IDS_REQUIRED',
+        message: 'userIds array is required'
+      });
+    }
+    if (userIds.length > MAX_BULK_PUSH_RECIPIENTS) {
+      return res.status(400).json({
+        success: false,
+        code: 'BULK_LIMIT_EXCEEDED',
+        message: `Maximum ${MAX_BULK_PUSH_RECIPIENTS} users per bulk send`
+      });
+    }
+
+    const results = await sendBulkCartReminderPushes({
+      userIds,
+      scopeQuery: scopedUserQueryFromReq(req)
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Cart reminder push processed: ${results.sent} sent, ${results.skipped} skipped, ${results.failed} failed`,
+      ...results
+    });
+  } catch (error) {
+    console.error('Bulk cart reminder push error:', error);
+    const code = error.code || 'CART_REMINDER_PUSH_FAILED';
+    const status =
+      code === 'PUSH_NOT_CONFIGURED'
+        ? 503
+        : ['USER_IDS_REQUIRED', 'BULK_LIMIT_EXCEEDED', 'INVALID_USER_IDS'].includes(code)
+          ? 400
+          : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not send cart reminder push notifications'
+    });
+  }
+};
+
+// =============================================
 // BULK CART REMINDER EMAIL
 // =============================================
 const bulkCartReminderEmail = async (req, res) => {
@@ -847,6 +955,9 @@ const bulkCartReminderEmail = async (req, res) => {
 module.exports = {
   getAllUsers,
   getUserById,
+  getLeadsPushSettings,
+  updateLeadsPushSettings,
+  bulkCartReminderPush,
   bulkCartReminderEmail,
   getAllCarts: getAllcarts,
   getAbandonedCarts: getAbandonedcarts,

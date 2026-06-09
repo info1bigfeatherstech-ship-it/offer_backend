@@ -18,6 +18,13 @@ const AdmZip = require("adm-zip");
 const { Parser } = require("json2csv");   //  ADD THIS
 const { generateSEOData } = require("../utils/seoUtils");
 const {
+  applyVariantCatalogFieldsToTarget,
+  buildVariantCatalogFieldsFromImportRow,
+  parseVariantShippingForStorage,
+  parseVariantTextForStorage,
+  validateVariantsResolvableShipping
+} = require("../utils/variantCatalogFields");
+const {
   deriveProductChannelStatusFromLegacy,
   deriveVariantChannelVisibilityFromLegacy,
   mergeProductChannelStatus,
@@ -1071,7 +1078,7 @@ const createProduct = async (req, res) => {
 
       const isActiveFlag = v.isActive !== false;
       const wholesaleEligible = wholesale && Number(priceObj.wholesaleBase) > 0;
-      variants.push({
+      const variantDoc = {
         sku: skuVal,
         productCode,
         wholesale,
@@ -1088,7 +1095,17 @@ const createProduct = async (req, res) => {
           v.channelVisibility,
           { isWholesaleEligible: wholesaleEligible }
         )
-      });
+      };
+      if (i === 0) {
+        applyVariantCatalogFieldsToTarget(variantDoc, {}, { isPrimary: true });
+      } else {
+        applyVariantCatalogFieldsToTarget(variantDoc, {
+          title: v.title,
+          description: v.description,
+          shipping: v.shipping
+        });
+      }
+      variants.push(variantDoc);
     }
 
     // =============================
@@ -1120,6 +1137,15 @@ const createProduct = async (req, res) => {
       });
     }
     const normalizedShipping = shippingValidation.shipping;
+
+    const variantsShippingCheck = validateVariantsResolvableShipping(normalizedShipping, variants);
+    if (!variantsShippingCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "VARIANT_SHIPPING_REQUIRED",
+        message: variantsShippingCheck.message
+      });
+    }
 
     // =============================
     //  VALIDATE HSN CODE (Optional)
@@ -1941,8 +1967,10 @@ async function processProductWithRollback(productName, productRows, stats) {
     }
     
     // SECOND: Build all variants (validation passed)
-    for (const row of productRows) {
-      const variant = await buildVariantWithValidation(row, productName);
+    for (let i = 0; i < productRows.length; i++) {
+      const row = productRows[i];
+      const isPrimary = !existingProduct && i === 0;
+      const variant = await buildVariantWithValidation(row, productName, { isPrimary });
       variants.push(variant);
     }
     
@@ -2016,7 +2044,7 @@ async function processProductWithRollback(productName, productRows, stats) {
 // =============================================
 // HELPER: Build variant with wholesale validation
 // =============================================
-async function buildVariantWithValidation(row, productName) {
+async function buildVariantWithValidation(row, productName, options = {}) {
   const cleanBasePrice = parseFloat(row.basePrice?.replace(/[^0-9.]/g, "") || 0);
   const cleanSalePrice = row.salePrice ? parseFloat(row.salePrice.replace(/[^0-9.]/g, "")) : null;
   
@@ -2115,7 +2143,7 @@ async function buildVariantWithValidation(row, productName) {
   const parsedCode = parseProductCodeParts(row.productCode, `CSV row for ${productName}`);
   const productCode = parsedCode.normalized;
   
-  return {
+  const variantDoc = {
     sku: row.sku || `SKU-${productCode}`,
     productCode,
     wholesale,
@@ -2136,6 +2164,15 @@ async function buildVariantWithValidation(row, productName) {
     isActive: normalizeLifecycleFromRowStatus(row?.status, 'active') === 'active',
     channelVisibility: buildChannelVisibilityFromCsvRow(row, wholesaleCfg.wholesaleEligible),
   };
+  if (options.isPrimary) {
+    applyVariantCatalogFieldsToTarget(variantDoc, {}, { isPrimary: true });
+  } else {
+    applyVariantCatalogFieldsToTarget(
+      variantDoc,
+      buildVariantCatalogFieldsFromImportRow(row, { applyVariantCatalog: options.applyVariantCatalog !== false })
+    );
+  }
+  return variantDoc;
 }
 
 // =============================================
@@ -3695,6 +3732,7 @@ const updateProduct = async (req, res) => {
     const variant =
       variantIndex >= 0 ? doc.variants[variantIndex] : null;
     const isVariantScopedUpdate = Boolean(targetProductCode);
+    const isPrimaryVariantUpdate = variantIndex === 0;
 
     // -------- HSN / GST / fragile (product) --------
     if (updates.hsnCode !== undefined) {
@@ -3802,7 +3840,16 @@ const updateProduct = async (req, res) => {
       };
     }
 
-    if (updates.shipping !== undefined) {
+    if (updates.shipping !== undefined && isVariantScopedUpdate && variant && !isPrimaryVariantUpdate) {
+      const parsedShipping = parseIfString(updates.shipping, {});
+      const variantShipping = parseVariantShippingForStorage(parsedShipping);
+      if (variantShipping) {
+        variant.shipping = variantShipping;
+      } else {
+        variant.shipping = undefined;
+      }
+      doc.markModified("variants");
+    } else if (updates.shipping !== undefined && !isVariantScopedUpdate) {
       const parsed = parseIfString(updates.shipping, {});
       doc.shipping = {
         ...(doc.shipping?.toObject ? doc.shipping.toObject() : {}),
@@ -3822,15 +3869,34 @@ const updateProduct = async (req, res) => {
     const shouldValidateShippingForRequest =
       !isVariantScopedUpdate || updates.shipping !== undefined;
     if (shouldValidateShippingForRequest) {
-      const updatedShippingValidation = validateRequiredShippingFields(doc.shipping);
-      if (!updatedShippingValidation.valid) {
-        return res.status(400).json({
-          success: false,
-          code: "SHIPPING_FIELDS_REQUIRED",
-          message: updatedShippingValidation.message
-        });
+      if (isVariantScopedUpdate && updates.shipping !== undefined) {
+        const variantShippingCheck = validateVariantsResolvableShipping(doc.shipping, doc.variants);
+        if (!variantShippingCheck.valid) {
+          return res.status(400).json({
+            success: false,
+            code: "VARIANT_SHIPPING_REQUIRED",
+            message: variantShippingCheck.message
+          });
+        }
+      } else {
+        const updatedShippingValidation = validateRequiredShippingFields(doc.shipping);
+        if (!updatedShippingValidation.valid) {
+          return res.status(400).json({
+            success: false,
+            code: "SHIPPING_FIELDS_REQUIRED",
+            message: updatedShippingValidation.message
+          });
+        }
+        doc.shipping = updatedShippingValidation.shipping;
+        const allVariantsCheck = validateVariantsResolvableShipping(doc.shipping, doc.variants);
+        if (!allVariantsCheck.valid) {
+          return res.status(400).json({
+            success: false,
+            code: "VARIANT_SHIPPING_REQUIRED",
+            message: allVariantsCheck.message
+          });
+        }
       }
-      doc.shipping = updatedShippingValidation.shipping;
     }
 
     // Product-level attributes (skip when this request targets a variant and sends variant attrs in `attributes`)
@@ -3982,6 +4048,25 @@ const updateProduct = async (req, res) => {
         if (parsedInventory.trackInventory !== undefined) {
           variant.inventory.trackInventory = parsedInventory.trackInventory;
         }
+      }
+
+      if (!isPrimaryVariantUpdate && updates.variantTitle !== undefined) {
+        const nextTitle = parseVariantTextForStorage(updates.variantTitle);
+        if (nextTitle) variant.title = nextTitle;
+        else variant.title = undefined;
+        doc.markModified("variants");
+      }
+
+      if (!isPrimaryVariantUpdate && updates.variantDescription !== undefined) {
+        const nextDescription = parseVariantTextForStorage(updates.variantDescription);
+        if (nextDescription) variant.description = nextDescription;
+        else variant.description = undefined;
+        doc.markModified("variants");
+      }
+
+      if (isPrimaryVariantUpdate) {
+        applyVariantCatalogFieldsToTarget(variant, {}, { isPrimary: true });
+        doc.markModified("variants");
       }
 
       if (variant.wholesale) {
@@ -5382,6 +5467,28 @@ const newVariant = {
 
   isActive: variant.isActive !== false
 };
+
+    if (variant.shipping) {
+      variant.shipping = parseIfString(variant.shipping, variant.shipping);
+    }
+    applyVariantCatalogFieldsToTarget(newVariant, {
+      title: variant.variantTitle ?? variant.title,
+      description: variant.variantDescription ?? variant.description,
+      shipping: variant.shipping
+    });
+
+    const resolvable = validateVariantsResolvableShipping(product.shipping, [
+      ...product.variants,
+      newVariant
+    ]);
+    if (!resolvable.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "VARIANT_SHIPPING_REQUIRED",
+        message: resolvable.message
+      });
+    }
+
     product.variants.push(newVariant);
 
     // =========================

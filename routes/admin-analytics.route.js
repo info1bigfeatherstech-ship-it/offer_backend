@@ -5,6 +5,9 @@ const {
   getAllUsers,
   getUserById,
   bulkCartReminderEmail,
+  bulkCartReminderPush,
+  getLeadsPushSettings,
+  updateLeadsPushSettings,
   getAllCarts,
   getAbandonedCarts,
   getHighValueCarts,
@@ -30,7 +33,10 @@ router.use(requireStrictAdminStorefrontScope);
 
 // User analytics
 router.get('/users', getAllUsers);
+router.get('/push-settings', getLeadsPushSettings);
+router.put('/push-settings', updateLeadsPushSettings);
 router.post('/users/bulk-cart-reminder-email', bulkCartReminderEmail);
+router.post('/users/bulk-cart-reminder-push', bulkCartReminderPush);
 router.get('/users/:userId', getUserById);
 
 // Cart analytics

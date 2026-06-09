@@ -317,18 +317,29 @@ class ShiprocketService {
           const product = await Product.findById(pid).lean();
           if (product) {
             name = product.name || name;
-            length = product.shipping?.dimensions?.length || length;
-            breadth = product.shipping?.dimensions?.width || breadth;
-            height = product.shipping?.dimensions?.height || height;
-            weight = product.shipping?.weight || weight;
             const v = (product.variants || []).find((x) => String(x._id) === String(item.variantId));
             if (v?.sku) sku = v.sku;
+
+            const { resolveVariantShipping } = require('./variantCatalogFields');
+            const resolved = resolveVariantShipping(v, product);
+            const dims = resolved?.dimensions || {};
+            length = Number(dims.length) || length;
+            breadth = Number(dims.width) || breadth;
+            height = Number(dims.height) || height;
+            weight = Number(resolved?.weight) || weight;
           }
         }
       }
 
-      if (snapMetrics?.lineWeightByVariantId?.has(String(item.variantId))) {
-        weight = snapMetrics.lineWeightByVariantId.get(String(item.variantId));
+      const variantKey = String(item.variantId);
+      if (snapMetrics?.lineWeightByVariantId?.has(variantKey)) {
+        weight = snapMetrics.lineWeightByVariantId.get(variantKey);
+      }
+      if (snapMetrics?.lineDimsByVariantId?.has(variantKey)) {
+        const d = snapMetrics.lineDimsByVariantId.get(variantKey);
+        length = Number(d?.length) || length;
+        breadth = Number(d?.width) || breadth;
+        height = Number(d?.height) || height;
       }
 
       const unit = Number(item.priceSnapshot?.sale ?? item.priceSnapshot?.base ?? 0);
@@ -369,6 +380,11 @@ class ShiprocketService {
     let codCollect = 0;
     if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
       codCollect = roundMoney2(order.balanceDueInr);
+      if (!(codCollect > 0)) {
+        const totalInr = roundMoney2(Number(order.totalAmount) || 0);
+        const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
+        codCollect = roundMoney2(Math.max(0, totalInr - paidInr));
+      }
     }
     const codAmountForQuote =
       useCodAtDoor && payMethod === 'cod' ? roundMoney2(Number(order.totalAmount) || 0) : useCodAtDoor ? codCollect : 0;
@@ -387,6 +403,99 @@ class ShiprocketService {
       codCollect,
       codAmountForQuote
     };
+  }
+
+  /**
+   * True when online advance was paid and remaining balance is collected as COD at delivery.
+   */
+  static isPartialCodBalanceShipment(parts, order) {
+    const payMethod = String(parts?.payMethod || order?.paymentInfo?.method || '').toLowerCase();
+    if (payMethod !== 'online') return false;
+
+    const totalInr = roundMoney2(Number(order?.totalAmount) || 0);
+    const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
+    let balanceDue = roundMoney2(Number(order?.balanceDueInr) || 0);
+    if (!(balanceDue > 0) && paidInr > 0 && totalInr > 0) {
+      balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
+    }
+    const codCollect = roundMoney2(Number(parts?.codCollect) || balanceDue);
+    if (!(codCollect > 0) || codCollect >= totalInr - 0.005) return false;
+
+    const balanceViaCod =
+      parts?.balanceViaCod === true ||
+      String(order?.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
+    const splitAdv =
+      parts?.splitAdv === true ||
+      String(order?.paymentInfo?.splitMode || '').toLowerCase() === 'advance';
+    const partiallyPaid =
+      String(order?.paymentStatus || '').toLowerCase() === 'partially_paid' && paidInr > 0;
+
+    return balanceViaCod && (splitAdv || partiallyPaid);
+  }
+
+  /**
+   * Scale line selling_price so Σ(qty × price) ≈ codCollect (remaining balance only).
+   */
+  static scaleOrderItemsForCodCollect(orderItems, codCollect, orderTotalInr) {
+    const items = (orderItems || []).map((it) => ({ ...it }));
+    const totalInr = roundMoney2(Number(orderTotalInr) || 0);
+    const target = roundMoney2(Number(codCollect) || 0);
+    if (!(target > 0) || !(totalInr > 0) || target >= totalInr - 0.005 || items.length === 0) {
+      return items;
+    }
+    const ratio = target / totalInr;
+    const scaled = items.map((it) => ({
+      ...it,
+      selling_price: roundMoney2((Number(it.selling_price) || 0) * ratio)
+    }));
+    const lineSum = roundMoney2(
+      scaled.reduce((s, it) => s + (Number(it.selling_price) || 0) * Math.max(1, Number(it.units) || 1), 0)
+    );
+    const drift = roundMoney2(target - lineSum);
+    if (Math.abs(drift) >= 0.01) {
+      const last = scaled[scaled.length - 1];
+      const qty = Math.max(1, Number(last.units) || 1);
+      last.selling_price = roundMoney2(Math.max(0.01, (Number(last.selling_price) || 0) + drift / qty));
+    }
+    return scaled;
+  }
+
+  /**
+   * Finalize adhoc create payload — full COD/prepaid unchanged; partial prepaid+COD uses balance only.
+   */
+  static finalizeAdhocCreatePayload(basePayload, order, parts, orderItems) {
+    const payload = { ...basePayload };
+    const mappedItems = (orderItems || []).map((it) => ({
+      name: it.name,
+      sku: it.sku,
+      units: it.units,
+      selling_price: it.selling_price,
+      discount: it.discount,
+      tax: it.tax,
+      hsn: it.hsn
+    }));
+
+    if (ShiprocketService.isPartialCodBalanceShipment(parts, order)) {
+      const codCollect = roundMoney2(parts.codCollect);
+      const scaledItems = ShiprocketService.scaleOrderItemsForCodCollect(
+        mappedItems,
+        codCollect,
+        order.totalAmount
+      );
+      const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
+      payload.payment_method = 'COD';
+      payload.order_items = scaledItems;
+      payload.sub_total = codCollect;
+      payload.shipping_charges = 0;
+      payload.total = codCollect;
+      payload.cod_amount = codCollect;
+      payload.total_discount = 0;
+      payload.comment = `Partial prepaid ₹${paidInr}; collect COD ₹${codCollect}`;
+      return payload;
+    }
+
+    payload.order_items = mappedItems;
+    return payload;
   }
 
   /**
@@ -417,7 +526,7 @@ class ShiprocketService {
       parts;
     const billingPhone = String(addr.phone || '').replace(/\D/g, '').slice(-10) || '9999999999';
 
-    const payload = {
+    const basePayload = {
       order_id: order.orderId,
       order_date: (order.createdAt || new Date()).toISOString().slice(0, 19).replace('T', ' '),
       pickup_location: pickupLocation,
@@ -432,15 +541,6 @@ class ShiprocketService {
       billing_email: process.env.STORE_EMAIL || 'orders@example.com',
       billing_phone: billingPhone,
       shipping_is_billing: true,
-      order_items: orderItems.map((it) => ({
-        name: it.name,
-        sku: it.sku,
-        units: it.units,
-        selling_price: it.selling_price,
-        discount: it.discount,
-        tax: it.tax,
-        hsn: it.hsn
-      })),
       payment_method: useCodAtDoor ? 'COD' : 'Prepaid',
       sub_total: Number(order.subtotal) || 0,
       shipping_charges: roundMoney2(Number(order.deliveryCharges) || 0),
@@ -450,11 +550,7 @@ class ShiprocketService {
       weight: totalWeight
     };
 
-    if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
-      if (codCollect > 0) {
-        payload.order_total = codCollect;
-      }
-    }
+    const payload = ShiprocketService.finalizeAdhocCreatePayload(basePayload, order, parts, orderItems);
 
     try {
       const data = await this.requestWithAuth({

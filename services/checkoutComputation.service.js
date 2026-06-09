@@ -15,6 +15,12 @@ const {
   resolveCartItemVariantId,
   loadProductForCartItem
 } = require('./cartSanitize.service');
+const {
+  resolveVariantShipping,
+  unitWeightKgFromResolvedShipping,
+  unitDimsCmFromResolvedShipping,
+  shippingDimCm
+} = require('../utils/variantCatalogFields');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -81,13 +87,9 @@ function cartFingerprintFromItems(items) {
   return crypto.createHash('sha256').update(key).digest('hex').slice(0, 32);
 }
 
-function shippingDimCm(value, fallback = 1) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
 /**
  * Aggregate package hints for courier APIs (max L/W, stacked height from catalog dims).
+ * Each line uses variant-level shipping with product-level fallback (Option B).
  */
 function aggregateShipping(lines) {
   let totalWeightKg = 0;
@@ -96,16 +98,17 @@ function aggregateShipping(lines) {
   let heightStack = 0;
 
   for (const line of lines) {
-    const sh = (line.product && line.product.shipping) || {};
-    const w = Math.max(0.05, Number(sh.weight) || 0.5);
-    const d = sh.dimensions || {};
-    const l = shippingDimCm(d.length);
-    const wi = shippingDimCm(d.width);
-    const h = shippingDimCm(d.height);
-    totalWeightKg += w * line.quantity;
+    const sh = resolveVariantShipping(line.variant, line.product);
+    const w = unitWeightKgFromResolvedShipping(sh);
+    const dims = unitDimsCmFromResolvedShipping(sh);
+    const l = shippingDimCm(dims?.lengthCm);
+    const wi = shippingDimCm(dims?.widthCm);
+    const h = shippingDimCm(dims?.heightCm);
+    const qty = Math.max(0, Number(line.quantity) || 0);
+    totalWeightKg += w * qty;
     maxL = Math.max(maxL, l);
     maxW = Math.max(maxW, wi);
-    heightStack += h * line.quantity;
+    heightStack += h * qty;
   }
 
   const heightCm = Math.min(200, Math.max(1, heightStack));
@@ -192,9 +195,10 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
 
     const itemTotal = roundMoney2(price.sale * cartItem.quantity);
     subtotal += itemTotal;
-    totalWeight += cartItem.quantity * (product.shipping?.weight || 0.5);
+    const resolvedShipping = resolveVariantShipping(variant, product);
+    totalWeight += cartItem.quantity * unitWeightKgFromResolvedShipping(resolvedShipping);
 
-    lines.push({ product, variant, quantity: cartItem.quantity, itemTotal });
+    lines.push({ product, variant, quantity: cartItem.quantity, itemTotal, resolvedShipping });
     orderItems.push({
       productId: product._id,
       variantId: variant._id,

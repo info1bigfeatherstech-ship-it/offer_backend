@@ -94,6 +94,20 @@ const variantSchema = new mongoose.Schema(
       trackInventory: { type: Boolean, default: true }
     },
 
+    /** Optional per-variant display copy (falls back to product.title / product.description). */
+    title: { type: String, trim: true, default: undefined },
+    description: { type: String, default: undefined },
+
+    /** Optional per-variant shipping (falls back to product.shipping at checkout / Shiprocket). */
+    shipping: {
+      weight: { type: Number, min: 0, default: undefined },
+      dimensions: {
+        length: { type: Number, min: 0, default: undefined },
+        width: { type: Number, min: 0, default: undefined },
+        height: { type: Number, min: 0, default: undefined }
+      }
+    },
+
     /** Per-storefront lifecycle; falls back to isActive when unset (read-side). */
     channelVisibility: {
       type: new mongoose.Schema(

@@ -28,6 +28,7 @@ const { initCloudinary } = require('./config/cloudinary.config');
 const gracefulShutdown = require('./services/shutdown.service');
 const cleanupService = require('./services/cleanup.service');
 const paymentHoldExpiryService = require('./services/paymentHoldExpiry.service');
+const cartReminderPushScheduler = require('./services/cartReminderPushScheduler.service');
 const logger = require('./utils/logger');
 const { CORS_STOREFRONT_ALLOWED_HEADERS } = require('./constants/storefrontHeaders');
 const Coupon = require('./models/Coupon');
@@ -60,6 +61,7 @@ const wholesalerRoutes = require('./routes/wholesaler.route');
 const productReviewPublicRoutes = require('./routes/product-review.public.route');
 const productReviewUserRoutes = require('./routes/product-review.user.route');
 const adminProductReviewRoutes = require('./routes/admin-product-review.route');
+const pushRoutes = require('./routes/push.route');
 
 // ============================================================================
 // Configuration
@@ -214,6 +216,12 @@ function validateStartupConfig() {
 
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
     warnings.push('EMAIL_USER or EMAIL_PASSWORD missing; OTP/email workflows may fail.');
+  }
+
+  if (process.env.VAPID_PUBLIC_KEY || process.env.VAPID_PRIVATE_KEY) {
+    if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+      warnings.push('VAPID_PUBLIC_KEY or VAPID_PRIVATE_KEY missing; web push will be disabled.');
+    }
   }
 
   if (ownerReviewOrigins.length === 0) {
@@ -732,6 +740,7 @@ app.use('/api/checkout', checkoutRoutes);
 app.use('/api/delivery', deliveryRoutes);
 app.use('/api/admin/coupons', adminCouponRoutes);
 app.use('/api/coupons', userCouponRoutes);
+app.use('/api/push', limiters.pushWrite, pushRoutes);
 app.use('/api/product-reviews/public', limiters.products, productReviewPublicRoutes);
 app.use('/api/product-reviews', limiters.write, productReviewUserRoutes);
 app.use('/api/admin/product-reviews', limiters.admin, adminProductReviewRoutes);
@@ -818,7 +827,8 @@ async function startApplication() {
     if (IS_PRIMARY_INSTANCE) {
       cleanupService.start();
       paymentHoldExpiryService.start();
-      logger.info('[Schedulers] cleanup + paymentHold started on primary instance');
+      cartReminderPushScheduler.start();
+      logger.info('[Schedulers] cleanup + paymentHold + cartReminderPush started on primary instance');
     } else {
       logger.info('[Schedulers] Skipping cleanup/paymentHold on secondary worker', {
         instance: process.env.NODE_APP_INSTANCE
@@ -856,6 +866,10 @@ async function startApplication() {
 
       gracefulShutdown.registerConnection('PaymentHoldExpiryService', async () => {
         paymentHoldExpiryService.stop();
+      });
+
+      gracefulShutdown.registerConnection('CartReminderPushScheduler', async () => {
+        cartReminderPushScheduler.stop();
       });
     }
 

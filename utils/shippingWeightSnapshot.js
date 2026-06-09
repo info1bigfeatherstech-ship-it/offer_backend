@@ -6,25 +6,13 @@
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const { roundMoney2 } = require('../services/checkoutComputation.service');
+const {
+  resolveVariantShipping,
+  unitWeightKgFromResolvedShipping,
+  unitDimsCmFromResolvedShipping
+} = require('./variantCatalogFields');
 
 const DIM_WEIGHT_DIVISOR = 5000;
-
-function unitWeightKgFromProductShipping(shipping) {
-  return Math.max(0.05, roundMoney2(Number(shipping?.weight) || 0.5));
-}
-
-function unitDimsCmFromProductShipping(shipping) {
-  const d = shipping?.dimensions || {};
-  const l = Number(d.length);
-  const w = Number(d.width);
-  const h = Number(d.height);
-  if (![l, w, h].every((n) => Number.isFinite(n) && n > 0)) return null;
-  return {
-    lengthCm: Math.max(1, l),
-    widthCm: Math.max(1, w),
-    heightCm: Math.max(1, h)
-  };
-}
 
 function dimWeightKgFromDimsCm(dims) {
   if (!dims || typeof dims !== 'object') return null;
@@ -35,8 +23,8 @@ function dimWeightKgFromDimsCm(dims) {
   return roundMoney2((l * w * h) / DIM_WEIGHT_DIVISOR);
 }
 
-function buildLineDimFields(shipping, qty) {
-  const dims = unitDimsCmFromProductShipping(shipping);
+function buildLineDimFieldsFromShipping(shipping, qty) {
+  const dims = unitDimsCmFromResolvedShipping(shipping);
   if (!dims) return {};
   const unitDimWeightKg = dimWeightKgFromDimsCm(dims);
   const q = Math.max(0, Number(qty) || 0);
@@ -56,12 +44,14 @@ function hasLineDims(row) {
 }
 
 /**
- * @param {{ lines: Array<{ product: object, variant: object, quantity: number }>, totalWeightKg?: number, dims?: object }} input
+ * @param {{ lines: Array<{ product: object, variant: object, quantity: number, resolvedShipping?: object }>, totalWeightKg?: number, dims?: object }} input
  */
 function buildShippingWeightSnapshotFromCheckoutLines({ lines, totalWeightKg, dims }) {
   const lineSnapshots = (lines || []).map((line) => {
     const qty = Math.max(0, Number(line.quantity) || 0);
-    const unitWeightKg = unitWeightKgFromProductShipping(line.product?.shipping);
+    const shipping =
+      line.resolvedShipping || resolveVariantShipping(line.variant, line.product);
+    const unitWeightKg = unitWeightKgFromResolvedShipping(shipping);
     const variant = line.variant;
     const sku = variant?.sku ? String(variant.sku).trim() : null;
     return {
@@ -72,7 +62,7 @@ function buildShippingWeightSnapshotFromCheckoutLines({ lines, totalWeightKg, di
       quantity: qty,
       unitWeightKg,
       lineWeightKg: roundMoney2(unitWeightKg * qty),
-      ...buildLineDimFields(line.product?.shipping, qty)
+      ...buildLineDimFieldsFromShipping(shipping, qty)
     };
   });
 
@@ -103,26 +93,27 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
 
   const lineSnapshots = [];
   for (const item of items) {
-    let unitWeightKg = 0.5;
     let productName = 'Product';
     let sku = null;
-    let productShipping = null;
+    let variant = null;
+    let product = null;
 
     if (item.productId) {
       const pid = mongoose.Types.ObjectId.isValid(item.productId) ? item.productId : item.productId?._id;
-      let product = item.productId;
-      if (pid && (!product.shipping || typeof product.shipping !== 'object')) {
-        product = await Product.findById(pid).select('name shipping variants').lean();
+      let loaded = item.productId;
+      if (pid && (!loaded.shipping || typeof loaded.shipping !== 'object' || !loaded.variants)) {
+        loaded = await Product.findById(pid).select('name shipping variants').lean();
       }
-      if (product) {
-        productName = product.name || productName;
-        productShipping = product.shipping;
-        unitWeightKg = unitWeightKgFromProductShipping(product.shipping);
-        const v = (product.variants || []).find((x) => String(x._id) === String(item.variantId));
-        if (v?.sku) sku = String(v.sku).trim();
+      if (loaded) {
+        product = loaded;
+        productName = loaded.name || productName;
+        variant = (loaded.variants || []).find((x) => String(x._id) === String(item.variantId)) || null;
+        if (variant?.sku) sku = String(variant.sku).trim();
       }
     }
 
+    const shipping = resolveVariantShipping(variant, product);
+    const unitWeightKg = unitWeightKgFromResolvedShipping(shipping);
     const qty = Math.max(0, Number(item.quantity) || 0);
     lineSnapshots.push({
       productId: item.productId?._id || item.productId || null,
@@ -132,7 +123,7 @@ async function buildShippingWeightSnapshotFromOrderItems(order) {
       quantity: qty,
       unitWeightKg,
       lineWeightKg: roundMoney2(unitWeightKg * qty),
-      ...buildLineDimFields(productShipping, qty)
+      ...buildLineDimFieldsFromShipping(shipping, qty)
     });
   }
 
@@ -169,7 +160,7 @@ async function enrichShippingWeightSnapshotDims(snap) {
   const productById = new Map();
   if (missingProductIds.length) {
     const ids = missingProductIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
-    const products = await Product.find({ _id: { $in: ids } }).select('shipping').lean();
+    const products = await Product.find({ _id: { $in: ids } }).select('shipping variants').lean();
     for (const p of products) {
       productById.set(String(p._id), p);
     }
@@ -179,8 +170,10 @@ async function enrichShippingWeightSnapshotDims(snap) {
   const enrichedLines = lines.map((row) => {
     if (hasLineDims(row)) return row;
     const product = productById.get(String(row.productId));
-    if (!product?.shipping) return row;
-    const dimFields = buildLineDimFields(product.shipping, row.quantity);
+    if (!product) return row;
+    const variant = (product.variants || []).find((v) => String(v._id) === String(row.variantId)) || null;
+    const shipping = resolveVariantShipping(variant, product);
+    const dimFields = buildLineDimFieldsFromShipping(shipping, row.quantity);
     if (!Object.keys(dimFields).length) return row;
     changed = true;
     return { ...row, ...dimFields };
@@ -204,16 +197,25 @@ async function enrichShippingWeightSnapshotDims(snap) {
 /**
  * Package metrics for Shiprocket create/assign — prefer frozen checkout snapshot.
  * @param {object} order
- * @returns {Promise<{ totalWeight: number, maxL: number, maxB: number, maxH: number, lineWeightByVariantId: Map<string, number> }>}
+ * @returns {Promise<{ totalWeight: number, maxL: number, maxB: number, maxH: number, lineWeightByVariantId: Map<string, number>, lineDimsByVariantId: Map<string, object> }|null>}
  */
 async function resolveShiprocketPackageMetrics(order) {
   const snap = order?.shippingWeightSnapshot;
   const lineWeightByVariantId = new Map();
+  const lineDimsByVariantId = new Map();
 
   if (snap?.lines?.length) {
     for (const row of snap.lines) {
       if (row?.variantId != null) {
-        lineWeightByVariantId.set(String(row.variantId), Number(row.unitWeightKg) || 0.5);
+        const vid = String(row.variantId);
+        lineWeightByVariantId.set(vid, Number(row.unitWeightKg) || 0.5);
+        if (hasLineDims(row)) {
+          lineDimsByVariantId.set(vid, {
+            length: row.lengthCm,
+            width: row.widthCm,
+            height: row.heightCm
+          });
+        }
       }
     }
     const maxL = Math.max(1, Number(snap.dims?.lengthCm) || 1);
@@ -224,7 +226,8 @@ async function resolveShiprocketPackageMetrics(order) {
       maxL,
       maxB,
       maxH,
-      lineWeightByVariantId
+      lineWeightByVariantId,
+      lineDimsByVariantId
     };
   }
 
@@ -236,6 +239,5 @@ module.exports = {
   buildShippingWeightSnapshotFromOrderItems,
   enrichShippingWeightSnapshotDims,
   resolveShiprocketPackageMetrics,
-  unitWeightKgFromProductShipping,
   dimWeightKgFromDimsCm
 };
