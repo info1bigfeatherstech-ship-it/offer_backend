@@ -1,0 +1,2 @@
+"row","productCode","error"
+"Premium Cotton T-Shirt (row 3)","9002-1","Product validation failed: gstRate: Cast to Number failed for value ""NaN"" (type number) at path ""gstRate"""
