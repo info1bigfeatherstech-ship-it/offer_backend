@@ -566,6 +566,17 @@ class ShiprocketService {
         0
       )
     );
+    const adhocPayloadDebug = {
+      isPartial,
+      useCodAtDoor,
+      payMethod,
+      balanceViaCod,
+      codCollect,
+      lineSum,
+      payment_method: payload.payment_method,
+      cod_amount: payload.cod_amount ?? null,
+      order_items_count: (payload.order_items || []).length
+    };
 
     try {
       const data = await this.requestWithAuth({
@@ -587,7 +598,7 @@ class ShiprocketService {
         labelUrl: data.label_url,
         providerStatus: data.status || null,
         raw: data,
-        adhocPayloadDebug: _dbgPartialCod.data,
+        adhocPayloadDebug,
         mock: false
       };
     } catch (err) {
@@ -595,7 +606,7 @@ class ShiprocketService {
       return {
         success: false,
         error: err.response?.data || err.message,
-        adhocPayloadDebug: _dbgPartialCod.data
+        adhocPayloadDebug
       };
     }
   }
