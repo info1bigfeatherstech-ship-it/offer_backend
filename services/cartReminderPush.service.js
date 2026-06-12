@@ -4,6 +4,12 @@ const Cart = require('../models/cart');
 const User = require('../models/User');
 const PushSubscription = require('../models/PushSubscription');
 const cartReminderPushTemplate = require('../templates/cartReminderPush.template');
+const {
+  getVapidPublicKey,
+  getVapidPrivateKey,
+  getVapidSubject,
+  isPushConfigured,
+} = require('../utils/pushVapid');
 const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
 
@@ -21,24 +27,6 @@ const AUTO_BATCH_SIZE = 100;
 
 let vapidConfigured = false;
 
-function getVapidPublicKey() {
-  return String(process.env.VAPID_PUBLIC_KEY || '').trim();
-}
-
-function getVapidPrivateKey() {
-  return String(process.env.VAPID_PRIVATE_KEY || '').trim();
-}
-
-function getVapidSubject() {
-  const subject = String(process.env.VAPID_SUBJECT || '').trim();
-  if (subject) return subject;
-  const marketingEmail = String(process.env.MARKETING_EMAIL_USER || '').trim();
-  if (marketingEmail) return `mailto:${marketingEmail}`;
-  const otpEmail = String(process.env.EMAIL_USER || '').trim();
-  if (otpEmail) return `mailto:${otpEmail}`;
-  return 'mailto:support@offerwalebaba.com';
-}
-
 function ensureVapidConfigured() {
   if (vapidConfigured) return;
   const publicKey = getVapidPublicKey();
@@ -52,10 +40,6 @@ function ensureVapidConfigured() {
   }
   webpush.setVapidDetails(getVapidSubject(), publicKey, privateKey);
   vapidConfigured = true;
-}
-
-function isPushConfigured() {
-  return Boolean(getVapidPublicKey() && getVapidPrivateKey());
 }
 
 function getStorefrontCartUrl() {

@@ -1,5 +1,5 @@
 const LeadsPushSettings = require('../models/LeadsPushSettings');
-const { isPushConfigured } = require('./cartReminderPush.service');
+const { isPushConfigured } = require('../utils/pushVapid');
 const logger = require('../utils/logger');
 
 const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
@@ -12,7 +12,7 @@ function normalizeStorefront(value) {
 function getAutoPushHourIst() {
   const raw = Number(process.env.CART_REMINDER_PUSH_AUTO_HOUR_IST);
   if (Number.isFinite(raw) && raw >= 0 && raw <= 23) return Math.floor(raw);
-  return 11;
+  return 18;
 }
 
 async function getOrCreateSettings(storefront) {
