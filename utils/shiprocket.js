@@ -567,41 +567,6 @@ class ShiprocketService {
       )
     );
 
-    // #region agent log
-    const _dbgPartialCod = {
-      sessionId: 'fac29a',
-      runId: process.env.DEBUG_RUN_ID || 'pre-fix',
-      hypothesisId: 'B-D-E',
-      location: 'shiprocket.js:createShipment',
-      message: 'Shiprocket adhoc payload before API',
-      data: {
-        orderId: order.orderId,
-        isPartial,
-        partsCodCollect: parts.codCollect,
-        resolvedCodCollect: ShiprocketService.resolvePartialCodCollect(parts, order).codCollect,
-        splitMode: order.paymentInfo?.splitMode,
-        balanceCollectionMethod: order.paymentInfo?.balanceCollectionMethod,
-        paymentStatus: order.paymentStatus,
-        totalAmount: order.totalAmount,
-        amountPaidInr: order.amountPaidInr,
-        balanceDueInr: order.balanceDueInr,
-        payloadSubTotal: payload.sub_total,
-        payloadTotal: payload.total,
-        payloadCodAmount: payload.cod_amount,
-        payloadPaymentMethod: payload.payment_method,
-        lineSum,
-        fixVersion: 'partial-cod-v2-resolve'
-      },
-      timestamp: Date.now()
-    };
-    fetch('http://127.0.0.1:7253/ingest/131a0f6c-80aa-4a56-bc41-7f95da1d615b', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'fac29a' },
-      body: JSON.stringify(_dbgPartialCod)
-    }).catch(() => {});
-    logger.info('[DEBUG:fac29a] Shiprocket adhoc payload', _dbgPartialCod.data);
-    // #endregion
-
     try {
       const data = await this.requestWithAuth({
         method: 'post',

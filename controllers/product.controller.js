@@ -2503,10 +2503,34 @@ async function uploadVariantImages(imageFolder, productName, productCode, concur
   return results;
 }
 
+/**
+ * ZIP bulk: resolve parent product by exact name or by existing variant series base (e.g. 9002-1).
+ */
+async function findProductForZipBulkRow(row, parsedCode) {
+  const name = String(row.name || '').trim();
+  if (name) {
+    const byName = await Product.findOne({
+      name: { $regex: new RegExp(`^${escapeRegex(name)}$`, 'i') }
+    });
+    if (byName) return byName;
+  }
+  if (parsedCode?.base && parsedCode.sequence != null) {
+    const variantCodePattern = new RegExp(`^${escapeRegex(parsedCode.base)}-\\d+$`, 'i');
+    const bySeries = await Product.findOne({
+      'variants.productCode': { $regex: variantCodePattern }
+    });
+    if (bySeries) return bySeries;
+  }
+  return null;
+}
+
 // =============================================
-// HELPER: Build variant with complete validation
+// HELPER: Build variant with complete validation (ZIP bulk + shared)
+// Primary variant (new product first row): catalog fields live on product doc.
+// Additional variants: per-row title, description, weight, dimensions on variant doc.
 // =============================================
-async function buildCompleteVariant(row, productName, images) {
+async function buildCompleteVariant(row, productName, images, options = {}) {
+  const isPrimary = options.isPrimary === true;
   // Validate productCode format (BASE-N)
   const parsedCode = parseProductCodeParts(row.productCode, `CSV row for ${productName}`);
   const productCode = parsedCode.normalized;
@@ -2517,7 +2541,8 @@ async function buildCompleteVariant(row, productName, images) {
     throw new Error(`Invalid basePrice: ${row.basePrice}. Must be a positive number`);
   }
   
-  const salePrice = row.salePrice && row.salePrice.trim() ? Number(row.salePrice) : null;
+  const salePriceRaw = row.salePrice != null ? String(row.salePrice).trim() : '';
+  const salePrice = salePriceRaw ? Number(salePriceRaw) : null;
   if (salePrice !== null && (isNaN(salePrice) || salePrice <= 0)) {
     throw new Error(`Invalid salePrice: ${row.salePrice}. Must be a positive number`);
   }
@@ -2542,14 +2567,10 @@ async function buildCompleteVariant(row, productName, images) {
   };
   
   const variantAttributes = parseAttributes(row.variantAttributes);
-  
-  // Generate SKU
-  const timestamp = Date.now();
-  const random = Math.floor(Math.random() * 10000);
   const sku = row.sku?.trim() || `SKU-${productCode}`;
-  
   const wholesaleEligible = wholesaleCfg.wholesaleEligible;
-  return {
+
+  const variantDoc = {
     sku,
     productCode,
     wholesale,
@@ -2557,7 +2578,7 @@ async function buildCompleteVariant(row, productName, images) {
     price: {
       base: basePrice,
       sale: salePrice,
-      ...(wholesale && { wholesaleBase }),
+      ...(wholesale && wholesaleBase > 0 && { wholesaleBase }),
       ...(wholesale && wholesaleSale !== null && { wholesaleSale }),
     },
     minimumOrderQuantity,
@@ -2570,6 +2591,17 @@ async function buildCompleteVariant(row, productName, images) {
     isActive: normalizeLifecycleFromRowStatus(row?.status, 'active') === 'active',
     channelVisibility: buildChannelVisibilityFromCsvRow(row, wholesaleEligible)
   };
+
+  if (isPrimary) {
+    applyVariantCatalogFieldsToTarget(variantDoc, {}, { isPrimary: true });
+  } else {
+    applyVariantCatalogFieldsToTarget(
+      variantDoc,
+      buildVariantCatalogFieldsFromImportRow(row, { applyVariantCatalog: options.applyVariantCatalog !== false })
+    );
+  }
+
+  return variantDoc;
 }
 
 // =============================================
@@ -2680,6 +2712,23 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       }
     }
 
+    // Process variant -1 before -2/-3 per product so primary row creates product shipping first.
+    rows.sort((a, b) => {
+      const nameA = String(a.name || '').trim().toLowerCase();
+      const nameB = String(b.name || '').trim().toLowerCase();
+      if (nameA !== nameB) return nameA.localeCompare(nameB);
+      try {
+        const pa = parseProductCodeParts(normalizeProductCode(a.productCode), 'productCode');
+        const pb = parseProductCodeParts(normalizeProductCode(b.productCode), 'productCode');
+        const seqA = pa.sequence != null ? pa.sequence : 0;
+        const seqB = pb.sequence != null ? pb.sequence : 0;
+        if (seqA !== seqB) return seqA - seqB;
+      } catch {
+        // keep stable row order fallback
+      }
+      return (a.rowNumber || 0) - (b.rowNumber || 0);
+    });
+
     const stats = {
       total: rows.length,
       successful: 0,
@@ -2695,7 +2744,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     const BATCH_DELAY_MS = 1000;
 
     // =============================================
-    // Process products (SYNCHRONOUSLY)
+    // Process rows sequentially within batch (avoids same-product race on -1/-2)
     // =============================================
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE);
@@ -2703,7 +2752,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       
       console.log(`🔄 Processing batch ${batchNumber}/${Math.ceil(rows.length / BATCH_SIZE)} (${batch.length} products)`);
       
-      const batchPromises = batch.map(async (row) => {
+      for (const row of batch) {
         try {
           if (row._preValidationError) {
             throw new Error(row._preValidationError);
@@ -2769,14 +2818,21 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             }
           }
 
-          // Build complete variant with wholesale
-          const newVariant = await buildCompleteVariant(row, row.name, variantImages);
-
-          // Check if product exists
-          let product = await Product.findOne({ 
-            name: { $regex: new RegExp(`^${row.name}$`, 'i') }
-          });
+          // Resolve product before variant build — primary only when creating a new product (first row)
+          let product = await findProductForZipBulkRow(row, parsedCode);
           await ensureMissingVariantProductCodes(product, parsedCode.base);
+
+          if (!product && parsedCode.sequence != null && parsedCode.sequence > 1) {
+            throw new Error(
+              `Cannot import variant ${productCode}: product "${String(row.name || '').trim()}" was not found. ` +
+                `Import ${parsedCode.base}-1 first with the exact same product name.`
+            );
+          }
+
+          const isPrimaryVariantRow = !product;
+          const newVariant = await buildCompleteVariant(row, row.name, variantImages, {
+            isPrimary: isPrimaryVariantRow
+          });
 
           // Parse product-level fields
           const finalHsnCode = row.hsnCode?.trim().toUpperCase() || null;
@@ -2836,6 +2892,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
               );
             }
             
+            const shippingCheck = validateVariantsResolvableShipping(product.shipping, [
+              ...product.variants,
+              newVariant
+            ], product);
+            if (!shippingCheck.valid) {
+              throw new Error(shippingCheck.message || 'Variant shipping weight and dimensions are required.');
+            }
+
             product.variants.push(newVariant);
             
             // Update product-level fields if not set
@@ -2915,7 +2979,12 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
                 customMessage: row.customMessage || "",
               }
             });
-            
+
+            const newProductShippingCheck = validateVariantsResolvableShipping(product.shipping, product.variants, product);
+            if (!newProductShippingCheck.valid) {
+              throw new Error(newProductShippingCheck.message || 'Product shipping weight and dimensions are required.');
+            }
+            reconcileProductCatalogState(product);
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'inserted' });
@@ -2938,9 +3007,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           });
           console.error(`❌ Failed to process ${row.name}:`, err.message);
         }
-      });
-      
-      await Promise.all(batchPromises);
+      }
       
       if (i + BATCH_SIZE < rows.length) {
         console.log(`⏳ Waiting ${BATCH_DELAY_MS}ms before next batch...`);
@@ -3241,9 +3308,20 @@ const previewBulkUpload = async (req, res) => {
             try {
               const parsedForNew = parseProductCodeParts(productCode, "productCode");
               if (parsedForNew.sequence != null && parsedForNew.sequence > 1) {
-                variantWarnings.push(
-                  `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-1 for first variant.`
-                );
+                const hasFirstVariantInGroup = productRows.some((siblingRow) => {
+                  try {
+                    const siblingCode = normalizeProductCode(siblingRow.productCode);
+                    const siblingParsed = parseProductCodeParts(siblingCode, "productCode");
+                    return siblingParsed.base === parsedForNew.base && siblingParsed.sequence === 1;
+                  } catch {
+                    return false;
+                  }
+                });
+                if (!hasFirstVariantInGroup) {
+                  variantWarnings.push(
+                    `This looks like a new product, but productCode starts from ${parsedForNew.normalized}. Prefer ${parsedForNew.base} or ${parsedForNew.base}-1 for first variant.`
+                  );
+                }
               }
             } catch {
               // format issues handled elsewhere
