@@ -17,6 +17,9 @@ const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmen
 const MAX_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
 const DEFAULT_RANGE_DAYS = 30;
 
+/** Cancelled-tab statuses — excluded from All tab list and total order count. */
+const ALL_TAB_EXCLUDED_ORDER_STATUSES = BUCKET_TO_ORDER_STATUSES.others;
+
 /**
  * @param {string | undefined} s
  */
@@ -120,7 +123,9 @@ function buildSearchFilter(search) {
  */
 function buildBucketMatch(bucket) {
   const b = String(bucket || 'all').toLowerCase();
-  if (b === 'all') return {};
+  if (b === 'all') {
+    return { orderStatus: { $nin: ALL_TAB_EXCLUDED_ORDER_STATUSES } };
+  }
   const statuses = BUCKET_TO_ORDER_STATUSES[/** @type {keyof typeof BUCKET_TO_ORDER_STATUSES} */ (b)];
   if (!statuses) {
     const err = new Error(`Invalid bucket: ${bucket}`);
@@ -164,7 +169,15 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
           {
             $group: {
               _id: null,
-              totalOrders: { $sum: 1 },
+              totalOrders: {
+                $sum: {
+                  $cond: [
+                    { $not: { $in: ['$orderStatus', ALL_TAB_EXCLUDED_ORDER_STATUSES] } },
+                    1,
+                    0
+                  ]
+                }
+              },
               totalCompletedOrders: {
                 $sum: { $cond: [{ $eq: ['$orderStatus', 'delivered'] }, 1, 0] }
               },
@@ -176,7 +189,12 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
               totalRevenueInr: {
                 $sum: {
                   $cond: [
-                    { $not: { $in: ['$orderStatus', GMV_EXCLUDED_ORDER_STATUSES] } },
+                    {
+                      $and: [
+                        { $not: { $in: ['$orderStatus', GMV_EXCLUDED_ORDER_STATUSES] } },
+                        { $ne: ['$paymentStatus', 'failed'] }
+                      ]
+                    },
                     '$totalAmount',
                     0
                   ]
