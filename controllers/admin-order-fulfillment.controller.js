@@ -486,8 +486,11 @@ async function fetchShiprocketLabelPdfBuffer(order) {
 
   const cachedUrl = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
   const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
-  const artifactAwb = String(order.shipmentInfo?.fulfillmentLabelAwb || order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
-  const isStale = artifactAwb !== currentAwb;
+  // Only check fulfillmentLabelAwb — do NOT fallback to fulfillmentArtifactAwb.
+  // fulfillmentArtifactAwb gets updated by manifest generation and would
+  // incorrectly mark a stale label as fresh.
+  const labelAwb = String(order.shipmentInfo?.fulfillmentLabelAwb || '').trim();
+  const isStale = labelAwb !== currentAwb;
 
   let labelUrl = '';
   if (cachedUrl && !ShiprocketService.isLikelyTaxInvoiceUrl(cachedUrl) && !isStale) {
@@ -498,7 +501,8 @@ async function fetchShiprocketLabelPdfBuffer(order) {
     const label = await ShiprocketService.generateShippingLabel({
       shiprocketOrderId,
       channelOrderId: order.orderId,
-      shipmentId: order.shipmentInfo?.shipmentId
+      shipmentId: order.shipmentInfo?.shipmentId,
+      expectedAwb: currentAwb
     });
     if (!label.success || !label.labelUrl) {
       const e = new Error(label.message || 'Could not get shipping label URL');
@@ -564,8 +568,9 @@ async function fetchShiprocketManifestPdfBuffer(order) {
 
   const cachedUrl = order.shipmentInfo?.manifestUrl ? String(order.shipmentInfo.manifestUrl).trim() : '';
   const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
-  const artifactAwb = String(order.shipmentInfo?.fulfillmentManifestAwb || order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
-  const isStale = artifactAwb !== currentAwb;
+  // Only check fulfillmentManifestAwb — do NOT fallback to fulfillmentArtifactAwb.
+  const manifestAwb = String(order.shipmentInfo?.fulfillmentManifestAwb || '').trim();
+  const isStale = manifestAwb !== currentAwb;
 
   let manifestUrl = '';
   if (cachedUrl && !isStale) {
@@ -1591,10 +1596,12 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
         'No Shiprocket order id on this order. Use Ship now first.'
       );
     }
+    const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
     const label = await ShiprocketService.generateShippingLabel({
       shiprocketOrderId,
       channelOrderId: order.orderId,
-      shipmentId: order.shipmentInfo?.shipmentId
+      shipmentId: order.shipmentInfo?.shipmentId,
+      expectedAwb: currentAwb
     });
     if (!label.success) {
       return jsonError(res, 502, label.code || 'LABEL_FAILED', label.message || 'Label generation failed', {

@@ -73,16 +73,12 @@ function areFulfillmentArtifactsValid(shipmentInfo, signalClassification) {
   const currentAwb = String(si.awbCode || si.trackingNumber || '').trim();
   if (currentAwb) {
     if (si.manifestUrl) {
-      const manifestAwb = String(si.fulfillmentManifestAwb || si.fulfillmentArtifactAwb || '').trim();
-      if (manifestAwb !== currentAwb) {
-        return false;
-      }
+      const manifestAwb = String(si.fulfillmentManifestAwb || '').trim();
+      if (manifestAwb !== currentAwb) return false;
     }
     if (si.labelUrl) {
-      const labelAwb = String(si.fulfillmentLabelAwb || si.fulfillmentArtifactAwb || '').trim();
-      if (labelAwb !== currentAwb) {
-        return false;
-      }
+      const labelAwb = String(si.fulfillmentLabelAwb || '').trim();
+      if (labelAwb !== currentAwb) return false;
     }
   }
   return true;
