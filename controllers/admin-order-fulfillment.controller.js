@@ -40,6 +40,125 @@ const {
   buildCourierSubstituteNote
 } = require('../services/courierPolicy.service');
 
+function manifestAlreadyGeneratedMessage(message) {
+  return /manifest already generated|already been generated/i.test(String(message || ''));
+}
+
+/**
+ * Pull label/manifest URLs Shiprocket already has (e.g. generated on Shiprocket panel).
+ * @param {import('mongoose').Document} order
+ */
+async function pullPanelFulfillmentUrlsFromSnapshot(order) {
+  const si = order.shipmentInfo || {};
+  const currentAwb = String(si.awbCode || si.trackingNumber || '').trim();
+  if (!currentAwb) return null;
+  const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
+    shiprocketOrderId: si.shiprocketOrderId,
+    channelOrderId: order.orderId
+  });
+  if (!lookup.success || !lookup.snapshot) return null;
+  const snapAwb = String(lookup.snapshot.awbCode || '').trim();
+  if (!snapAwb || snapAwb !== currentAwb) return null;
+  return {
+    awbCode: snapAwb,
+    labelUrl: lookup.snapshot.labelUrl || null,
+    manifestUrl: lookup.snapshot.manifestUrl || null
+  };
+}
+
+/**
+ * Resolve manifest URL — prefers Shiprocket panel state, falls back to print when already generated.
+ * @param {import('mongoose').Document} order
+ */
+async function resolveManifestUrlForOrder(order) {
+  const shipmentId = order.shipmentInfo?.shipmentId;
+  const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+  if (!shipmentId) {
+    return { success: false, code: 'SHIPMENT_ID_MISSING', message: 'No shipment_id on order.' };
+  }
+  if (!shiprocketOrderId) {
+    return {
+      success: false,
+      code: 'SHIPROCKET_ORDER_ID_MISSING',
+      message: 'No Shiprocket order id on this order.'
+    };
+  }
+
+  const panel = await pullPanelFulfillmentUrlsFromSnapshot(order);
+  if (panel?.manifestUrl) {
+    return {
+      success: true,
+      manifestUrl: String(panel.manifestUrl).trim(),
+      shiprocketOrderId,
+      source: 'panel_snapshot'
+    };
+  }
+
+  const generated = await ShiprocketService.generateManifest({ shipmentId });
+  const alreadyGenerated =
+    !generated.success && manifestAlreadyGeneratedMessage(generated.message);
+  if (!generated.success && !alreadyGenerated) {
+    return generated;
+  }
+
+  const printed = await ShiprocketService.printManifest({
+    shiprocketOrderId,
+    channelOrderId: order.orderId
+  });
+  if (!printed.success) return printed;
+
+  const manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
+  if (!manifestUrl) {
+    return {
+      success: false,
+      code: 'MANIFEST_URL_MISSING',
+      message: 'Shiprocket did not return a manifest URL.'
+    };
+  }
+  return {
+    success: true,
+    manifestUrl,
+    shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId,
+    source: alreadyGenerated ? 'print_existing' : 'generate_and_print'
+  };
+}
+
+/**
+ * Resolve label URL — prefers Shiprocket panel snapshot for current AWB.
+ * @param {import('mongoose').Document} order
+ */
+async function resolveLabelUrlForOrder(order) {
+  const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+  if (!shiprocketOrderId) {
+    return {
+      success: false,
+      code: 'SHIPROCKET_ORDER_ID_MISSING',
+      message: 'No Shiprocket order id on this order.'
+    };
+  }
+  const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
+
+  const panel = await pullPanelFulfillmentUrlsFromSnapshot(order);
+  if (
+    panel?.labelUrl &&
+    !ShiprocketService.isLikelyTaxInvoiceUrl(panel.labelUrl)
+  ) {
+    return {
+      success: true,
+      labelUrl: String(panel.labelUrl).trim(),
+      shiprocketOrderId,
+      source: 'panel_snapshot'
+    };
+  }
+
+  return ShiprocketService.generateShippingLabel({
+    shiprocketOrderId,
+    channelOrderId: order.orderId,
+    shipmentId: order.shipmentInfo?.shipmentId,
+    expectedAwb: currentAwb
+  });
+}
+
 function jsonError(res, status, code, message, extras = {}) {
   return res.status(status).json({ success: false, code, message, ...extras });
 }
@@ -498,12 +617,7 @@ async function fetchShiprocketLabelPdfBuffer(order) {
   }
 
   if (!labelUrl) {
-    const label = await ShiprocketService.generateShippingLabel({
-      shiprocketOrderId,
-      channelOrderId: order.orderId,
-      shipmentId: order.shipmentInfo?.shipmentId,
-      expectedAwb: currentAwb
-    });
+    const label = await resolveLabelUrlForOrder(order);
     if (!label.success || !label.labelUrl) {
       const e = new Error(label.message || 'Could not get shipping label URL');
       e.code = label.code || 'LABEL_FAILED';
@@ -578,36 +692,21 @@ async function fetchShiprocketManifestPdfBuffer(order) {
   }
 
   if (!manifestUrl) {
-    const generated = await ShiprocketService.generateManifest({ shipmentId });
-    if (!generated.success) {
-      const e = new Error(generated.message || 'Manifest generation failed');
-      e.code = generated.code || 'MANIFEST_GENERATE_FAILED';
-      e.details = generated.details || null;
+    const resolved = await resolveManifestUrlForOrder(order);
+    if (!resolved.success || !resolved.manifestUrl) {
+      const e = new Error(resolved.message || 'Manifest resolution failed');
+      e.code = resolved.code || 'MANIFEST_RESOLVE_FAILED';
+      e.details = resolved.details || null;
       throw e;
     }
-    const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
-    const printed = await ShiprocketService.printManifest({
-      shiprocketOrderId,
-      channelOrderId: order.orderId
-    });
-    if (!printed.success) {
-      const e = new Error(printed.message || 'Manifest print failed');
-      e.code = printed.code || 'MANIFEST_PRINT_FAILED';
-      e.details = printed.details || null;
-      throw e;
-    }
-    manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
-    if (!manifestUrl) {
-      const e = new Error('Shiprocket did not return a manifest URL.');
-      e.code = 'MANIFEST_URL_MISSING';
-      throw e;
-    }
+    manifestUrl = String(resolved.manifestUrl).trim();
+    const shiprocketOrderId = resolved.shiprocketOrderId || (await resolveShiprocketOrderIdForOrder(order));
     await applyUpsertShipmentInfo({
       order,
       shipmentPayload: {
         manifestUrl,
         manifestGeneratedAt: new Date(),
-        shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId || undefined
+        shiprocketOrderId: shiprocketOrderId || undefined
       },
       trigger: 'admin_manifest_pdf',
       allowOrderStatusUpdate: false
@@ -1596,13 +1695,7 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
         'No Shiprocket order id on this order. Use Ship now first.'
       );
     }
-    const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
-    const label = await ShiprocketService.generateShippingLabel({
-      shiprocketOrderId,
-      channelOrderId: order.orderId,
-      shipmentId: order.shipmentInfo?.shipmentId,
-      expectedAwb: currentAwb
-    });
+    const label = await resolveLabelUrlForOrder(order);
     if (!label.success) {
       return jsonError(res, 502, label.code || 'LABEL_FAILED', label.message || 'Label generation failed', {
         details: label.details || null
@@ -2188,35 +2281,22 @@ exports.adminFulfillmentManifest = async (req, res) => {
       return jsonError(res, 400, 'SHIPMENT_ID_MISSING', 'No shipment_id on order.');
     }
 
-    const generated = await ShiprocketService.generateManifest({ shipmentId });
-    if (!generated.success) {
-      return jsonError(res, 502, generated.code || 'MANIFEST_GENERATE_FAILED', generated.message, {
-        details: generated.details || null
+    const resolved = await resolveManifestUrlForOrder(order);
+    if (!resolved.success || !resolved.manifestUrl) {
+      return jsonError(res, 502, resolved.code || 'MANIFEST_RESOLVE_FAILED', resolved.message, {
+        details: resolved.details || null
       });
     }
 
-    const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
-    const printed = await ShiprocketService.printManifest({
-      shiprocketOrderId,
-      channelOrderId: order.orderId
-    });
-    if (!printed.success) {
-      return jsonError(res, 502, printed.code || 'MANIFEST_PRINT_FAILED', printed.message, {
-        details: printed.details || null
-      });
-    }
-
-    const manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
-    if (!manifestUrl) {
-      return jsonError(res, 502, 'MANIFEST_URL_MISSING', 'Shiprocket did not return a manifest URL.');
-    }
+    const manifestUrl = String(resolved.manifestUrl).trim();
+    const shiprocketOrderId = resolved.shiprocketOrderId || (await resolveShiprocketOrderIdForOrder(order));
 
     await applyUpsertShipmentInfo({
       order,
       shipmentPayload: {
         manifestUrl,
         manifestGeneratedAt: new Date(),
-        shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId || undefined
+        shiprocketOrderId: shiprocketOrderId || undefined
       },
       trigger: 'admin_manifest',
       allowOrderStatusUpdate: false

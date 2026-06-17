@@ -165,8 +165,18 @@ function buildPayloadFromSnapshot(snapshot, order) {
     payload.trackingNumber = null;
   }
   if (snapshot.courier) payload.courier = snapshot.courier;
-  if (snapshot.labelUrl) payload.labelUrl = snapshot.labelUrl;
-  if (snapshot.manifestUrl) payload.manifestUrl = snapshot.manifestUrl;
+  if (snapshot.awbCode) {
+    const snapAwb = String(snapshot.awbCode).trim();
+    // Mirror panel-generated docs only when Shiprocket AWB matches the synced cycle.
+    if (snapshot.labelUrl) {
+      payload.labelUrl = snapshot.labelUrl;
+      payload.fulfillmentLabelAwb = snapAwb;
+    }
+    if (snapshot.manifestUrl) {
+      payload.manifestUrl = snapshot.manifestUrl;
+      payload.fulfillmentManifestAwb = snapAwb;
+    }
+  }
   if (snapshot.providerStatus) payload.providerStatus = snapshot.providerStatus;
   if (snapshot.shiprocketPickupId) {
     payload.shiprocketPickupId = snapshot.shiprocketPickupId;
