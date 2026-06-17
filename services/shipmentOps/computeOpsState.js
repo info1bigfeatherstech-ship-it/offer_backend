@@ -73,7 +73,7 @@ function areFulfillmentArtifactsValid(shipmentInfo, signalClassification) {
   const currentAwb = String(si.awbCode || si.trackingNumber || '').trim();
   if (currentAwb) {
     const artifactAwb = String(si.fulfillmentArtifactAwb || '').trim();
-    if ((si.manifestUrl || si.labelUrl) && (artifactAwb && artifactAwb !== currentAwb)) {
+    if ((si.manifestUrl || si.labelUrl) && artifactAwb !== currentAwb) {
       return false;
     }
   }
