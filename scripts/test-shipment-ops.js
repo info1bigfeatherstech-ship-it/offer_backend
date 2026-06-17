@@ -350,6 +350,32 @@ function testLabelPrimaryWhenManifestReady() {
   assert.strictEqual(view.actionCapabilities.downloadLabel, true);
 }
 
+function testStaleArtifactsInvalidatesState() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: 'AWBNEW',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Delhivery Surface',
+      pickupDate: '2026-06-02',
+      pickupScheduledAt: new Date('2026-06-01'),
+      manifestUrl: 'https://example.com/old-manifest.pdf',
+      labelUrl: 'https://example.com/old-label.pdf',
+      fulfillmentArtifactAwb: 'AWBOLD',
+      providerStatus: 'Pickup Generated',
+      providerSnapshot: { pickupScheduled: true, statusLabel: 'PICKUP SCHEDULED' }
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.PICKUP_SCHEDULED);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.primaryAction, 'generateManifest');
+  assert.strictEqual(view.actionCapabilities.downloadManifest, false);
+  assert.strictEqual(view.actionCapabilities.downloadLabel, false);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -364,6 +390,7 @@ function run() {
   testReadyToShipProcessingAllowsShipNow();
   testActiveAwbPickupScheduledDoesNotReset();
   testLabelPrimaryWhenManifestReady();
+  testStaleArtifactsInvalidatesState();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');

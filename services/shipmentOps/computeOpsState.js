@@ -69,6 +69,14 @@ function areFulfillmentArtifactsValid(shipmentInfo, signalClassification) {
   ) {
     return false;
   }
+  const si = shipmentInfo || {};
+  const currentAwb = String(si.awbCode || si.trackingNumber || '').trim();
+  if (currentAwb) {
+    const artifactAwb = String(si.fulfillmentArtifactAwb || '').trim();
+    if ((si.manifestUrl || si.labelUrl) && (artifactAwb && artifactAwb !== currentAwb)) {
+      return false;
+    }
+  }
   return true;
 }
 

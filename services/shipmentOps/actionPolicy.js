@@ -15,7 +15,7 @@ const {
   hasShiprocketOrderId,
   areFulfillmentArtifactsValid,
 } = require('./computeOpsState');
-const { normalizeProviderSignals } = require('./normalizeProviderSignals');
+const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
 
 /**
  * @param {string} orderStatus
@@ -60,7 +60,10 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     providerStatus: si.providerStatus,
     rawEvents: si.rawEvents,
   });
-  const artifactsValid = areFulfillmentArtifactsValid(si, signals.classification);
+  const providerSignalsValid =
+    signals.classification !== CLASSIFICATION.PICKUP_EXCEPTION &&
+    signals.classification !== CLASSIFICATION.PROVIDER_RESET;
+  const artifactsValid = providerSignalsValid && areFulfillmentArtifactsValid(si, signals.classification);
 
   /** @type {Record<string, boolean>} */
   const caps = {
@@ -124,7 +127,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
 
     case OPS_STATES.PICKUP_SCHEDULED:
       caps.generateManifest =
-        awb && shipmentId && artifactsValid && !terminal && !inTransit && st !== 'delivered';
+        awb && shipmentId && providerSignalsValid && !terminal && !inTransit && st !== 'delivered';
       caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
       caps.downloadLabel =
         awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
@@ -138,7 +141,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     case OPS_STATES.MANIFEST_READY:
       caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
       caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
-      caps.generateManifest = awb && shipmentId && artifactsValid && !terminal && !inTransit;
+      caps.generateManifest = awb && shipmentId && providerSignalsValid && !terminal && !inTransit;
       caps.syncShiprocket = shiprocket && !terminal;
       caps.refreshTracking = awb;
       caps.track = awb;
