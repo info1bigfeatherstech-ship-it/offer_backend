@@ -1633,7 +1633,7 @@ class ShiprocketService {
    * POST /external/courier/generate/label — courier shipping label (AWB sticker), NOT tax invoice.
    * Tax invoice is our GST HTML / Shiprocket print/invoice — separate from this.
    */
-  async generateShippingLabel({ shiprocketOrderId, channelOrderId, shipmentId } = {}) {
+  async generateShippingLabel({ shiprocketOrderId, channelOrderId, shipmentId, expectedAwb } = {}) {
     let sid = this.parseNumericShipmentId(shipmentId);
     let resolvedOrderId = this.parseNumericShiprocketOrderId(shiprocketOrderId);
 
@@ -1645,7 +1645,14 @@ class ShiprocketService {
           resolvedOrderId = this.parseNumericShiprocketOrderId(lookup.snapshot.shiprocketOrderId);
         }
         const snapLabel = lookup.snapshot.labelUrl;
-        if (snapLabel && !ShiprocketService.isLikelyTaxInvoiceUrl(snapLabel)) {
+        const snapAwb = String(lookup.snapshot.awbCode || '').trim();
+        // Only use the snapshot label if its AWB matches the expected AWB.
+        // If expectedAwb is not provided, we skip this shortcut and always
+        // call the generate endpoint to guarantee a fresh label.
+        const awbMatches = expectedAwb
+          ? snapAwb === String(expectedAwb).trim()
+          : false;
+        if (awbMatches && snapLabel && !ShiprocketService.isLikelyTaxInvoiceUrl(snapLabel)) {
           return {
             success: true,
             labelUrl: snapLabel,

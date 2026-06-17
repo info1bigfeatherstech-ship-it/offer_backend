@@ -108,7 +108,8 @@ function testProviderResetSnapshotIgnoredAfterReship() {
       pickupDate: '2026-05-30',
       manifestUrl: 'https://example.com/manifest.pdf',
       labelUrl: 'https://example.com/label.pdf',
-      fulfillmentArtifactAwb: '14112362507328',
+      fulfillmentManifestAwb: '14112362507328',
+      fulfillmentLabelAwb: '14112362507328',
       providerStatus: 'Pickup Generated',
       providerSnapshot: {
         resetDetected: true,
@@ -139,7 +140,8 @@ function testOutForPickupKeepsLabelAndManifestDownloads() {
       pickupScheduledAt: new Date('2026-05-29'),
       manifestUrl: 'https://example.com/manifest.pdf',
       labelUrl: 'https://example.com/label.pdf',
-      fulfillmentArtifactAwb: '14112362507328',
+      fulfillmentManifestAwb: '14112362507328',
+      fulfillmentLabelAwb: '14112362507328',
       providerStatus: 'Out For Pickup',
       rawEvents: [
         { status: 'OFP', description: 'Out For Pickup', at: '2026-05-30' },
@@ -235,7 +237,7 @@ function testPickupScheduledWithLabelStillNeedsManifest() {
       providerStatus: 'Pickup Generated',
       providerSnapshot: { pickupScheduled: true, statusLabel: 'PICKUP SCHEDULED' },
       labelUrl: 'https://example.com/label.pdf',
-      fulfillmentArtifactAwb: '14112362507328',
+      fulfillmentLabelAwb: '14112362507328',
       manifestUrl: null
     }
   };
@@ -341,7 +343,8 @@ function testLabelPrimaryWhenManifestReady() {
       pickupScheduledAt: new Date('2026-06-01'),
       manifestUrl: 'https://example.com/manifest.pdf',
       labelUrl: 'https://example.com/label.pdf',
-      fulfillmentArtifactAwb: '14112362507328',
+      fulfillmentManifestAwb: '14112362507328',
+      fulfillmentLabelAwb: '14112362507328',
       providerStatus: 'Pickup Generated'
     }
   };
@@ -366,7 +369,8 @@ function testStaleArtifactsInvalidatesState() {
       pickupScheduledAt: new Date('2026-06-01'),
       manifestUrl: 'https://example.com/old-manifest.pdf',
       labelUrl: 'https://example.com/old-label.pdf',
-      fulfillmentArtifactAwb: 'AWBOLD',
+      fulfillmentManifestAwb: 'AWBOLD',
+      fulfillmentLabelAwb: 'AWBOLD',
       providerStatus: 'Pickup Generated',
       providerSnapshot: { pickupScheduled: true, statusLabel: 'PICKUP SCHEDULED' }
     }
