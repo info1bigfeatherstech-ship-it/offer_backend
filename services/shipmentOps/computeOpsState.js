@@ -74,11 +74,13 @@ function areFulfillmentArtifactsValid(shipmentInfo, signalClassification) {
   if (currentAwb) {
     if (si.manifestUrl) {
       const manifestAwb = String(si.fulfillmentManifestAwb || '').trim();
-      if (manifestAwb !== currentAwb) return false;
+      // Only reject manifest when we know it belongs to a different AWB cycle.
+      if (manifestAwb && manifestAwb !== currentAwb) return false;
     }
     if (si.labelUrl) {
       const labelAwb = String(si.fulfillmentLabelAwb || '').trim();
-      if (labelAwb !== currentAwb) return false;
+      // Legacy/panel-sync: stale label URL without AWB tag must not block manifest/label downloads.
+      if (labelAwb && labelAwb !== currentAwb) return false;
     }
   }
   return true;
