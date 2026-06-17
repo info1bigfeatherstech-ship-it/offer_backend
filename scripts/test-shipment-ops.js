@@ -384,6 +384,31 @@ function testStaleArtifactsInvalidatesState() {
   assert.strictEqual(view.actionCapabilities.downloadLabel, false);
 }
 
+function testLegacyLabelUrlWithoutAwbTagStillAllowsLabelDownload() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      awbCode: 'AWBNEW',
+      shipmentId: '123',
+      shiprocketOrderId: '999',
+      courier: 'Delhivery Surface',
+      pickupDate: '2026-06-02',
+      pickupScheduledAt: new Date('2026-06-01'),
+      manifestUrl: 'https://example.com/manifest-new.pdf',
+      fulfillmentManifestAwb: 'AWBNEW',
+      labelUrl: 'https://example.com/old-label.pdf',
+      fulfillmentLabelAwb: null,
+      providerStatus: 'Out For Pickup'
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.LABEL_READY);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.downloadLabel, true);
+  assert.strictEqual(view.actionCapabilities.downloadManifest, true);
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -399,6 +424,7 @@ function run() {
   testActiveAwbPickupScheduledDoesNotReset();
   testLabelPrimaryWhenManifestReady();
   testStaleArtifactsInvalidatesState();
+  testLegacyLabelUrlWithoutAwbTagStillAllowsLabelDownload();
   testListUiPickupScheduled();
   testAwaitingApproval();
   console.log('All shipment ops tests passed.');
