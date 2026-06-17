@@ -486,7 +486,7 @@ async function fetchShiprocketLabelPdfBuffer(order) {
 
   const cachedUrl = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
   const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
-  const artifactAwb = String(order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
+  const artifactAwb = String(order.shipmentInfo?.fulfillmentLabelAwb || order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
   const isStale = artifactAwb !== currentAwb;
 
   let labelUrl = '';
@@ -564,7 +564,7 @@ async function fetchShiprocketManifestPdfBuffer(order) {
 
   const cachedUrl = order.shipmentInfo?.manifestUrl ? String(order.shipmentInfo.manifestUrl).trim() : '';
   const currentAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
-  const artifactAwb = String(order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
+  const artifactAwb = String(order.shipmentInfo?.fulfillmentManifestAwb || order.shipmentInfo?.fulfillmentArtifactAwb || '').trim();
   const isStale = artifactAwb !== currentAwb;
 
   let manifestUrl = '';
