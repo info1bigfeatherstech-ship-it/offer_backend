@@ -528,15 +528,23 @@ async function upsertShipmentInfo({
         if (!payloadSetsFreshManifest) {
             nextShipmentInfo.manifestUrl = null;
             nextShipmentInfo.manifestGeneratedAt = null;
+            nextShipmentInfo.fulfillmentManifestAwb = null;
         }
         if (!payloadSetsFreshLabel) {
             nextShipmentInfo.labelUrl = null;
+            nextShipmentInfo.fulfillmentLabelAwb = null;
         }
         if (!payloadSetsFreshManifest && !payloadSetsFreshLabel) {
             nextShipmentInfo.fulfillmentArtifactAwb = null;
         }
     }
 
+    if (payloadSetsFreshManifest) {
+        nextShipmentInfo.fulfillmentManifestAwb = nextAwb || null;
+    }
+    if (payloadSetsFreshLabel) {
+        nextShipmentInfo.fulfillmentLabelAwb = nextAwb || null;
+    }
     if (payloadSetsFreshManifest || payloadSetsFreshLabel) {
         nextShipmentInfo.fulfillmentArtifactAwb = nextAwb || null;
     }

@@ -104,6 +104,8 @@ const orderSchema = new mongoose.Schema(
       manifestUrl: { type: String, default: null },
       manifestGeneratedAt: Date,
       fulfillmentArtifactAwb: { type: String, default: null },
+      fulfillmentLabelAwb: { type: String, default: null },
+      fulfillmentManifestAwb: { type: String, default: null },
       shippedAt: Date,
       outForDeliveryAt: Date,
       deliveredAt: Date,
