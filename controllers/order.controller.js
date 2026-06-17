@@ -359,6 +359,11 @@ async function upsertShipmentInfo({
     allowOrderStatusUpdate = true
 }) {
     if (!order || !shipmentPayload) return false;
+    const prevSi = order.shipmentInfo || {};
+    const prevAwb = String(prevSi.awbCode || prevSi.trackingNumber || '').trim();
+    const prevCourierId = String(prevSi.assignedCourierId || '').trim();
+    const prevCourier = String(prevSi.courier || '').trim().toLowerCase();
+
     const nextShipmentInfo = {
         ...(order.shipmentInfo || {})
     };
@@ -500,6 +505,40 @@ async function upsertShipmentInfo({
                 nextShipmentInfo.deliveredAt = new Date();
             }
         }
+    }
+
+    const nextAwb = String(nextShipmentInfo.awbCode || nextShipmentInfo.trackingNumber || '').trim();
+    const nextCourierId = String(nextShipmentInfo.assignedCourierId || '').trim();
+    const nextCourier = String(nextShipmentInfo.courier || '').trim().toLowerCase();
+
+    const awbChanged = prevAwb !== nextAwb;
+    const courierIdChanged = prevCourierId !== nextCourierId;
+    const courierNameChanged = prevCourier !== nextCourier;
+
+    const payloadSetsFreshLabel =
+        Object.prototype.hasOwnProperty.call(shipmentPayload, 'labelUrl') &&
+        shipmentPayload.labelUrl != null &&
+        shipmentPayload.labelUrl !== '';
+    const payloadSetsFreshManifest =
+        Object.prototype.hasOwnProperty.call(shipmentPayload, 'manifestUrl') &&
+        shipmentPayload.manifestUrl != null &&
+        shipmentPayload.manifestUrl !== '';
+
+    if (awbChanged || courierIdChanged || courierNameChanged) {
+        if (!payloadSetsFreshManifest) {
+            nextShipmentInfo.manifestUrl = null;
+            nextShipmentInfo.manifestGeneratedAt = null;
+        }
+        if (!payloadSetsFreshLabel) {
+            nextShipmentInfo.labelUrl = null;
+        }
+        if (!payloadSetsFreshManifest && !payloadSetsFreshLabel) {
+            nextShipmentInfo.fulfillmentArtifactAwb = null;
+        }
+    }
+
+    if (payloadSetsFreshManifest || payloadSetsFreshLabel) {
+        nextShipmentInfo.fulfillmentArtifactAwb = nextAwb || null;
     }
 
     order.shipmentInfo = nextShipmentInfo;
