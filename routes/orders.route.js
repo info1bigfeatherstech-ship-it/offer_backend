@@ -23,7 +23,9 @@ const {
   listAdminReturnRequests,
   getAdminReturnRequest,
   adminDecideReturnRequest,
-  adminInitiateReturnRefund
+  adminInitiateReturnRefund,
+  sendReturnChatMessage,
+  getReturnChat
 } = require('../controllers/order.controller');
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
 
@@ -43,6 +45,8 @@ router.get('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, ge
 router.get('/items/:orderId', verifyToken, requireWholesaleUserForWholesaleStorefront, getOrder);
 router.get('/items/:orderId/track', verifyToken, requireWholesaleUserForWholesaleStorefront, trackOrder);
 router.post('/items/:orderId/return-request', verifyToken, requireWholesaleUserForWholesaleStorefront, uploadReturnProofs, createReturnRequest);
+router.post('/items/:orderId/return-chat', verifyToken, requireWholesaleUserForWholesaleStorefront, sendReturnChatMessage);
+router.get('/items/:orderId/return-chat', verifyToken, requireWholesaleUserForWholesaleStorefront, getReturnChat);
 router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholesaleStorefront, generateInvoice);
 // Intentionally commented: customer order cancellation disabled by product policy (uncomment with exports.cancelOrder in order.controller.js to restore).
 // router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
@@ -87,6 +91,20 @@ router.post(
   verifyToken,
   authorizeRoles('admin', 'order_manager'),
   adminInitiateReturnRefund
+);
+
+router.post(
+  '/admin/returns/requests/:orderId/chat',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  sendReturnChatMessage
+);
+
+router.get(
+  '/admin/returns/requests/:orderId/chat',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  getReturnChat
 );
 
 router.post(

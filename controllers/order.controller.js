@@ -2480,6 +2480,10 @@ exports.getOrder = async (req, res) => {
             }
         }
 
+        if (transformedOrder.returnInfo) {
+            transformedOrder.returnInfo.windowDays = RETURN_REQUEST_WINDOW_DAYS;
+        }
+
         const payload = {
             success: true,
             order: transformedOrder
@@ -3263,6 +3267,9 @@ exports.getAdminReturnRequest = async (req, res) => {
         if (!order.returnInfo?.requestedAt) {
             return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No return request found for this order');
         }
+        if (order.returnInfo) {
+            order.returnInfo.windowDays = RETURN_REQUEST_WINDOW_DAYS;
+        }
         return res.json({
             success: true,
             order
@@ -3512,6 +3519,93 @@ exports.refundOrderPayment = async (req, res) => {
             'REFUND_INIT_FAILED',
             error.error?.description || error.message || 'Refund failed'
         );
+    }
+};
+
+// ========== RETURN CHAT SUPPORT ==========
+exports.sendReturnChatMessage = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const { message } = req.body;
+        const isAdmin = req.userRole === 'admin' || req.userRole === 'order_manager';
+
+        if (!message || !message.trim()) {
+            return respondOrderError(res, 400, 'MESSAGE_REQUIRED', 'Message content is required');
+        }
+
+        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const order = await Order.findOne(query);
+
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        const requestedAt = order.returnInfo?.requestedAt;
+        if (!requestedAt) {
+            return respondOrderError(res, 400, 'RETURN_NOT_REQUESTED', 'Chat is only available for orders with active return requests');
+        }
+
+        const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
+        const deadlineAt = new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000);
+        const isExpired = new Date() > deadlineAt;
+
+        if (isExpired) {
+            return respondOrderError(res, 403, 'CHAT_WINDOW_EXPIRED', `Support chat window of ${windowDays} days has expired`);
+        }
+
+        const sender = isAdmin ? 'admin' : 'user';
+
+        if (!order.returnInfo.chat) {
+            order.returnInfo.chat = [];
+        }
+
+        order.returnInfo.chat.push({
+            sender,
+            message: message.trim(),
+            createdAt: new Date()
+        });
+
+        order.markModified('returnInfo.chat');
+        await order.save();
+
+        return res.json({
+            success: true,
+            chat: order.returnInfo.chat,
+            chatWindowDeadline: deadlineAt.toISOString(),
+            isChatActive: !isExpired
+        });
+    } catch (error) {
+        logger.error('sendReturnChatMessage failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'SEND_CHAT_FAILED', 'Could not send chat message');
+    }
+};
+
+exports.getReturnChat = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const isAdmin = req.userRole === 'admin' || req.userRole === 'order_manager';
+
+        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const order = await Order.findOne(query);
+
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        const requestedAt = order.returnInfo?.requestedAt;
+        const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
+        const deadlineAt = requestedAt ? new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000) : null;
+        const isExpired = deadlineAt ? (new Date() > deadlineAt) : true;
+
+        return res.json({
+            success: true,
+            chat: order.returnInfo?.chat || [],
+            chatWindowDeadline: deadlineAt ? deadlineAt.toISOString() : null,
+            isChatActive: requestedAt ? !isExpired : false
+        });
+    } catch (error) {
+        logger.error('getReturnChat failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'GET_CHAT_FAILED', 'Could not fetch chat history');
     }
 };
 
