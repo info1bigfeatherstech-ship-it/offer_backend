@@ -35,6 +35,25 @@ const PIPELINE_ORDER_STATUSES = Object.freeze([
 const GMV_EXCLUDED_ORDER_STATUSES = Object.freeze(['cancelled', 'payment_failed']);
 
 /**
+ * Panel tab buckets whose orders may still have an in-flight Shiprocket forward shipment.
+ * Derived from {@link BUCKET_TO_ORDER_STATUSES} — excludes terminal tabs (Delivered, Cancelled/others).
+ * Single source of truth for admin auto-sync eligibility (do not duplicate status lists elsewhere).
+ */
+const ACTIVE_FORWARD_SYNC_BUCKET_KEYS = Object.freeze(['new', 'bill_sent', 'ready_to_pick', 'in_transit']);
+
+/** @type {readonly string[]} */
+const ACTIVE_FORWARD_SYNC_STATUSES = Object.freeze(
+  ACTIVE_FORWARD_SYNC_BUCKET_KEYS.flatMap((key) => BUCKET_TO_ORDER_STATUSES[key] || [])
+);
+
+/**
+ * @param {string} orderStatus
+ */
+function isActiveForwardSyncOrderStatus(orderStatus) {
+  return ACTIVE_FORWARD_SYNC_STATUSES.includes(String(orderStatus || '').trim());
+}
+
+/**
  * @param {string} orderStatus
  * @returns {keyof typeof BUCKET_TO_ORDER_STATUSES | 'all'}
  */
@@ -88,6 +107,9 @@ module.exports = {
   BUCKET_TO_ORDER_STATUSES,
   PIPELINE_ORDER_STATUSES,
   GMV_EXCLUDED_ORDER_STATUSES,
+  ACTIVE_FORWARD_SYNC_BUCKET_KEYS,
+  ACTIVE_FORWARD_SYNC_STATUSES,
+  isActiveForwardSyncOrderStatus,
   fulfillmentBucketKeyFromOrderStatus,
   fulfillmentLabelFromOrderStatus,
   paymentLabelForUi
