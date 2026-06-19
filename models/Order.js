@@ -165,7 +165,17 @@ const orderSchema = new mongoose.Schema(
       refundId: String,
       status: String,
       /** `cancellation` = order cancelled before delivery; `product_return` = post-delivery return flow */
-      refundContext: { type: String, enum: ['cancellation', 'product_return', null], default: null }
+      refundContext: { type: String, enum: ['cancellation', 'product_return', null], default: null },
+      chat: {
+        type: [
+          {
+            sender: { type: String, enum: ['user', 'admin'], required: true },
+            message: { type: String, required: true },
+            createdAt: { type: Date, default: Date.now }
+          }
+        ],
+        default: []
+      }
     },
     appliedCoupon: {
         code: { type: String },
