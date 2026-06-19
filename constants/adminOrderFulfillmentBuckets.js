@@ -16,9 +16,9 @@ const BUCKET_TO_ORDER_STATUSES = Object.freeze({
   /** Courier handoff */
   in_transit: ['shipped', 'out_for_delivery'],
   /** Delivered to customer */
-  completed: ['delivered'],
+  completed: ['delivered', 'return_requested'],
   /** Terminal / exceptional */
-  others: ['cancelled', 'return_requested', 'payment_failed']
+  others: ['cancelled', 'payment_failed']
 });
 
 /** Statuses that count as “still in pipeline” for summary card “pending” */
@@ -27,8 +27,7 @@ const PIPELINE_ORDER_STATUSES = Object.freeze([
   'confirmed',
   'processing',
   'shipped',
-  'out_for_delivery',
-  'return_requested'
+  'out_for_delivery'
 ]);
 
 /** Revenue / GMV: include these (exclude cancelled & payment_failed) */
