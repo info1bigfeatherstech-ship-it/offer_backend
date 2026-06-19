@@ -217,10 +217,9 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     bill_sent: byStatus.confirmed || 0,
     ready_to_pick: byStatus.processing || 0,
     in_transit: (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0),
-    completed: byStatus.delivered || 0,
+    completed: (byStatus.delivered || 0) + (byStatus.return_requested || 0),
     others:
       (byStatus.cancelled || 0) +
-      (byStatus.return_requested || 0) +
       (byStatus.payment_failed || 0)
   };
 
