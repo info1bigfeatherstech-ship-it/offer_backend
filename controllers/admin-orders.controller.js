@@ -11,6 +11,7 @@ const {
   aggregateSummary,
   mapOrderRow
 } = require('../services/adminOrderDashboard.service');
+const { autoSyncStaleOrdersInRange } = require('../services/adminOrderAutoSync.service');
 
 function sendError(res, err, fallbackMessage) {
   const status = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
@@ -106,7 +107,8 @@ exports.getOrdersList = async (req, res) => {
     const dateMatch = { createdAt: { $gte: range.from, $lte: range.to } };
     const scopeMatch = req.adminScope?.orderMatch || {};
     const search = buildSearchFilter(req.query.search);
-    const bucket = buildBucketMatch(req.query.bucket);
+    /** Global search: skip status bucket so order ID / phone matches any tab (incl. cancelled). */
+    const bucket = search ? {} : buildBucketMatch(req.query.bucket);
     const filter = mergeFilters(
       Object.keys(scopeMatch).length ? { $and: [dateMatch, scopeMatch] } : dateMatch,
       search,
@@ -169,5 +171,67 @@ exports.getOrdersList = async (req, res) => {
     });
   } catch (err) {
     return sendError(res, err, 'Could not load orders');
+  }
+};
+
+/**
+ * POST /api/admin/orders/auto-sync-statuses
+ * Background sync: reconcile all stale in-range orders from Shiprocket → DB (admin Orders tab).
+ * Query: from, to, rangePreset, presetDays — same as summary/list; optional staleMinutes, concurrency, maxRunMs
+ */
+exports.autoSyncOrderStatuses = async (req, res) => {
+  try {
+    let presetDays = req.query.presetDays;
+    if (presetDays == null && String(req.query.preset || '').toLowerCase() === '30d') {
+      presetDays = 30;
+    }
+
+    const rangePreset = req.query.rangePreset || req.query.range;
+
+    const range = resolveDateRange({
+      from: req.query.from,
+      to: req.query.to,
+      presetDays,
+      rangePreset
+    });
+
+    const scopeMatch = req.adminScope?.orderMatch || {};
+    const staleMinutes = Math.min(
+      120,
+      Math.max(1, parseInt(String(req.query.staleMinutes || '5'), 10) || 5)
+    );
+    const concurrency = Math.min(
+      8,
+      Math.max(1, parseInt(String(req.query.concurrency || '4'), 10) || 4)
+    );
+    const maxRunMs = Math.min(
+      180_000,
+      Math.max(10_000, parseInt(String(req.query.maxRunMs || '120000'), 10) || 120_000)
+    );
+
+    const syncResult = await autoSyncStaleOrdersInRange({
+      from: range.from,
+      to: range.to,
+      scopeMatch,
+      staleMs: staleMinutes * 60 * 1000,
+      concurrency,
+      maxRunMs
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        dateRange: {
+          from: range.from.toISOString(),
+          to: range.to.toISOString(),
+          preset: range.presetLabel
+        },
+        scope: req.adminScope?.storefront || 'ecomm',
+        summary: syncResult.summary,
+        results: syncResult.results
+      }
+    });
+  } catch (err) {
+    return sendError(res, err, 'Could not auto-sync order statuses');
   }
 };
