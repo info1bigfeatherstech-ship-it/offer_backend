@@ -175,7 +175,9 @@ const orderSchema = new mongoose.Schema(
           }
         ],
         default: []
-      }
+      },
+      userLastRead: { type: Date, default: null },
+      adminLastRead: { type: Date, default: null }
     },
     appliedCoupon: {
         code: { type: String },

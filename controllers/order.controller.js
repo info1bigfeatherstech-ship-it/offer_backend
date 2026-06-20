@@ -3565,12 +3565,20 @@ exports.sendReturnChatMessage = async (req, res) => {
             createdAt: new Date()
         });
 
-        order.markModified('returnInfo.chat');
+        if (isAdmin) {
+            order.returnInfo.adminLastRead = new Date();
+        } else {
+            order.returnInfo.userLastRead = new Date();
+        }
+
+        order.markModified('returnInfo');
         await order.save();
 
         return res.json({
             success: true,
             chat: order.returnInfo.chat,
+            userLastRead: order.returnInfo.userLastRead,
+            adminLastRead: order.returnInfo.adminLastRead,
             chatWindowDeadline: deadlineAt.toISOString(),
             isChatActive: !isExpired
         });
@@ -3592,6 +3600,16 @@ exports.getReturnChat = async (req, res) => {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
+        if (order.returnInfo) {
+            if (isAdmin) {
+                order.returnInfo.adminLastRead = new Date();
+            } else {
+                order.returnInfo.userLastRead = new Date();
+            }
+            order.markModified('returnInfo');
+            await order.save();
+        }
+
         const requestedAt = order.returnInfo?.requestedAt;
         const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
         const deadlineAt = requestedAt ? new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000) : null;
@@ -3600,6 +3618,8 @@ exports.getReturnChat = async (req, res) => {
         return res.json({
             success: true,
             chat: order.returnInfo?.chat || [],
+            userLastRead: order.returnInfo?.userLastRead,
+            adminLastRead: order.returnInfo?.adminLastRead,
             chatWindowDeadline: deadlineAt ? deadlineAt.toISOString() : null,
             isChatActive: requestedAt ? !isExpired : false
         });
