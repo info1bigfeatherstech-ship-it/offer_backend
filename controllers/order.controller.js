@@ -346,6 +346,11 @@ function mapExternalShipmentStatusToOrderStatus(rawStatus) {
     return mapProviderStatusToOrderStatus(rawStatus);
 }
 
+const {
+    canApplyProviderOrderStatus,
+    repairOrderStatusForShiprocketRto
+} = require('../constants/rtoOrderQuery');
+
 function normalizeShipmentEventTimestamp(value) {
     if (!value) return null;
     const dt = new Date(value);
@@ -488,12 +493,9 @@ async function upsertShipmentInfo({
         nextShipmentInfo.rawEvents = shipmentPayload.events.slice(0, 50);
     }
 
-    if (
-        allowOrderStatusUpdate &&
-        (!order.orderStatus || ['confirmed', 'processing', 'shipped', 'out_for_delivery'].includes(order.orderStatus))
-    ) {
+    if (allowOrderStatusUpdate) {
         const mappedOrderStatus = mapExternalShipmentStatusToOrderStatus(providerStatus);
-        if (mappedOrderStatus) {
+        if (mappedOrderStatus && canApplyProviderOrderStatus(order.orderStatus, mappedOrderStatus)) {
             order.orderStatus = mappedOrderStatus;
             if (mappedOrderStatus === 'shipped' && !nextShipmentInfo.shippedAt) {
                 nextShipmentInfo.shippedAt = new Date();
@@ -504,6 +506,8 @@ async function upsertShipmentInfo({
             if (mappedOrderStatus === 'delivered' && !nextShipmentInfo.deliveredAt) {
                 nextShipmentInfo.deliveredAt = new Date();
             }
+        } else {
+            repairOrderStatusForShiprocketRto(order);
         }
     }
 

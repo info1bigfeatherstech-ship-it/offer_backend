@@ -7,7 +7,8 @@ const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProvide
 const {
   classifyForwardStatusCode,
   isForwardProgressStatus,
-  isProviderStatusInTransit
+  isProviderStatusInTransit,
+  isRtoProviderStatus
 } = require('./shiprocketStatusMap');
 
 /**
@@ -150,9 +151,11 @@ function computeOpsState(order) {
   }
 
   const providerInTransit = isProviderStatusInTransit(si.providerStatus);
+  const shiprocketRto = orderStatus === 'rto' || isRtoProviderStatus(si.providerStatus);
 
-  if (orderStatus === 'cancelled') return OPS_STATES.CANCELLED;
+  if (orderStatus === 'cancelled' && !shiprocketRto) return OPS_STATES.CANCELLED;
   if (orderStatus === 'payment_failed') return OPS_STATES.PAYMENT_FAILED;
+  if (shiprocketRto) return OPS_STATES.RTO;
   if (orderStatus === 'delivered' || effectiveClass === CLASSIFICATION.DELIVERED) {
     return OPS_STATES.DELIVERED;
   }

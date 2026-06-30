@@ -70,7 +70,7 @@ function buildListRowFulfillmentUi(order) {
  */
 function isPostConfirmOrderStatus(orderStatus) {
   const st = String(orderStatus || '').toLowerCase();
-  return st && !['pending', 'cancelled', 'payment_failed'].includes(st);
+  return st && !['pending', 'cancelled', 'payment_failed', 'rto'].includes(st);
 }
 
 module.exports = {

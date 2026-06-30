@@ -3,7 +3,8 @@
  * {@link Order#orderStatus} values. Adjust here if your ops workflow changes.
  */
 
-/** @typedef {'all'|'new'|'bill_sent'|'ready_to_pick'|'in_transit'|'completed'|'others'} AdminOrderBucketKey */
+const { fulfillmentLabelForRtoAwareOrder } = require('./rtoOrderQuery');
+/** @typedef {'all'|'new'|'bill_sent'|'ready_to_pick'|'in_transit'|'completed'|'rto'|'others'} AdminOrderBucketKey */
 
 /** @type {Record<Exclude<AdminOrderBucketKey, 'all'>, string[]>} */
 const BUCKET_TO_ORDER_STATUSES = Object.freeze({
@@ -17,6 +18,8 @@ const BUCKET_TO_ORDER_STATUSES = Object.freeze({
   in_transit: ['shipped', 'out_for_delivery'],
   /** Delivered to customer */
   completed: ['delivered', 'return_requested'],
+  /** Shiprocket RTO flow — exact carrier label in shipmentInfo.providerStatus */
+  rto: ['rto'],
   /** Terminal / exceptional */
   others: ['cancelled', 'payment_failed']
 });
@@ -64,10 +67,14 @@ function fulfillmentBucketKeyFromOrderStatus(orderStatus) {
 }
 
 /**
- * Human-readable label for {@link Order#orderStatus} — matches schema enum, not legacy bucket nicknames.
+ * Human-readable label for list/detail — RTO orders use exact Shiprocket providerStatus.
  * @param {string} orderStatus
+ * @param {string} [providerStatus]
  */
-function fulfillmentLabelFromOrderStatus(orderStatus) {
+function fulfillmentLabelFromOrderStatus(orderStatus, providerStatus) {
+  const rtoLabel = fulfillmentLabelForRtoAwareOrder(orderStatus, providerStatus);
+  if (rtoLabel) return rtoLabel;
+
   const map = {
     pending: 'Pending',
     confirmed: 'Confirmed',
@@ -77,7 +84,8 @@ function fulfillmentLabelFromOrderStatus(orderStatus) {
     delivered: 'Delivered',
     cancelled: 'Cancelled',
     return_requested: 'Return requested',
-    payment_failed: 'Payment failed'
+    payment_failed: 'Payment failed',
+    rto: providerStatus ? String(providerStatus).trim() : 'RTO'
   };
   const key = String(orderStatus || '').trim();
   if (map[key]) return map[key];

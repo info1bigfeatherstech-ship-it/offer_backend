@@ -2,7 +2,7 @@
  * Evaluate and optionally persist shipment ops snapshot on an order.
  */
 
-const Order = require('../../models/Order');
+const { repairOrderStatusForShiprocketRto } = require('../../constants/rtoOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../../utils/orderFulfillmentPaymentGate');
 const { OPS_STATE_LABELS, ACTION_KEYS, OPS_STATES } = require('./constants');
 const { computeOpsState, hasAwb } = require('./computeOpsState');
@@ -50,6 +50,7 @@ function buildShipmentOpsView(orderInput, options = {}) {
   });
   const courierOps = buildCourierOpsDisplay({ opsState, order });
   const externalLinks = buildExternalLinks(order);
+  const providerStatusRaw = order.shipmentInfo?.providerStatus || null;
   let primaryActionLabel = policy.primaryActionLabel;
   if (
     policy.primaryAction === ACTION_KEYS.generateManifest &&
@@ -60,8 +61,11 @@ function buildShipmentOpsView(orderInput, options = {}) {
 
   return {
     opsState,
-    opsStateLabel: OPS_STATE_LABELS[opsState] || opsState,
-    providerStatusRaw: order.shipmentInfo?.providerStatus || null,
+    opsStateLabel:
+      opsState === OPS_STATES.RTO && providerStatusRaw
+        ? String(providerStatusRaw).trim()
+        : OPS_STATE_LABELS[opsState] || opsState,
+    providerStatusRaw,
     courierOpsLine1: courierOps.line1,
     courierOpsLine2: courierOps.line2,
     primaryAction: policy.primaryAction,
@@ -121,6 +125,7 @@ function maybeRevertOrderStatusForProviderReset(orderDoc) {
 async function evaluateAndPersistShipmentOps(orderDoc, options = {}) {
   if (!orderDoc) return null;
   maybeRevertOrderStatusForProviderReset(orderDoc);
+  repairOrderStatusForShiprocketRto(orderDoc);
   const view = buildShipmentOpsView(orderDoc, options);
   orderDoc.shipmentOps = view;
   orderDoc.markModified('shipmentOps');

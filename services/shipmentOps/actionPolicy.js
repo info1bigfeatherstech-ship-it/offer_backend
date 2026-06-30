@@ -16,13 +16,14 @@ const {
   areFulfillmentArtifactsValid,
 } = require('./computeOpsState');
 const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
+const { isRtoProviderStatus } = require('./shiprocketStatusMap');
 
 /**
  * @param {string} orderStatus
  */
 function isPostConfirmOrderStatus(orderStatus) {
   const st = String(orderStatus || '').toLowerCase();
-  return st && !['pending', 'cancelled', 'payment_failed'].includes(st);
+  return st && !['pending', 'cancelled', 'payment_failed', 'rto'].includes(st);
 }
 
 /**
@@ -54,7 +55,9 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
   const awb = hasAwb(si);
   const shipmentId = hasShipmentId(si);
   const shiprocket = hasShiprocketOrderId(si) || shipmentId || awb;
-  const terminal = ['cancelled', 'payment_failed'].includes(st) && st !== 'delivered';
+  const shiprocketRto = st === 'rto' || isRtoProviderStatus(si.providerStatus);
+  const terminal =
+    (['cancelled', 'payment_failed'].includes(st) && !shiprocketRto) || shiprocketRto;
   const inTransit = IN_TRANSIT_ORDER_STATUSES.includes(st);
   const signals = normalizeProviderSignals({
     providerStatus: si.providerStatus,

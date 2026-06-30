@@ -13,6 +13,7 @@ const OPS_STATES = Object.freeze({
   IN_TRANSIT: 'IN_TRANSIT',
   OUT_FOR_DELIVERY: 'OUT_FOR_DELIVERY',
   DELIVERED: 'DELIVERED',
+  RTO: 'RTO',
   PICKUP_EXCEPTION: 'PICKUP_EXCEPTION',
   PROVIDER_RESET: 'PROVIDER_RESET',
   CANCELLED: 'CANCELLED',
@@ -31,6 +32,7 @@ const OPS_STATE_LABELS = Object.freeze({
   [OPS_STATES.IN_TRANSIT]: 'In transit',
   [OPS_STATES.OUT_FOR_DELIVERY]: 'Out for delivery',
   [OPS_STATES.DELIVERED]: 'Delivered',
+  [OPS_STATES.RTO]: 'RTO',
   [OPS_STATES.PICKUP_EXCEPTION]: 'Pickup exception',
   [OPS_STATES.PROVIDER_RESET]: 'Shipment reset on Shiprocket',
   [OPS_STATES.CANCELLED]: 'Cancelled',
@@ -95,7 +97,7 @@ const PRIMARY_ACTION_ORDER = Object.freeze([
   ACTION_KEYS.openDetail,
 ]);
 
-const TERMINAL_ORDER_STATUSES = Object.freeze(['cancelled', 'payment_failed', 'delivered']);
+const TERMINAL_ORDER_STATUSES = Object.freeze(['cancelled', 'payment_failed', 'delivered', 'rto']);
 
 const IN_TRANSIT_ORDER_STATUSES = Object.freeze(['shipped', 'out_for_delivery']);
 
