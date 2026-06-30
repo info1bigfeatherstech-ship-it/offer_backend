@@ -4,6 +4,7 @@
 
 const { OPS_STATES } = require('./constants');
 const { hasAwb } = require('./computeOpsState');
+const { isRtoProviderStatus } = require('./shiprocketStatusMap');
 
 /**
  * @param {Date|string|null|undefined} dt
@@ -55,7 +56,9 @@ function buildCourierOpsDisplay({ opsState, order }) {
   const pickupDate = si.pickupDate ? String(si.pickupDate).trim() : null;
   const awb = String(si.awbCode || si.trackingNumber || '').trim();
 
-  if (st === 'cancelled') return { line1: 'Cancelled', line2: null };
+  if (st === 'cancelled' && !isRtoProviderStatus(providerStatus)) {
+    return { line1: 'Cancelled', line2: null };
+  }
   if (st === 'payment_failed') return { line1: 'Payment failed', line2: null };
 
   switch (opsState) {
@@ -114,6 +117,13 @@ function buildCourierOpsDisplay({ opsState, order }) {
       };
     case OPS_STATES.OUT_FOR_DELIVERY:
       return { line1: 'Out for delivery', line2: courier || null };
+    case OPS_STATES.RTO: {
+      const line1 = providerStatus || 'RTO';
+      const parts = [];
+      if (courier) parts.push(courier);
+      if (awb) parts.push(`AWB ${maskAwb(awb)}`);
+      return { line1, line2: parts.length ? parts.join(' · ') : null };
+    }
     case OPS_STATES.DELIVERED: {
       const deliveredAt = si.deliveredAt ? formatShortDateTime(si.deliveredAt) : null;
       return {

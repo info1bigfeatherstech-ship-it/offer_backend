@@ -409,6 +409,59 @@ function testLegacyLabelUrlWithoutAwbTagStillAllowsLabelDownload() {
   assert.strictEqual(view.actionCapabilities.downloadManifest, true);
 }
 
+function testRtoProviderStatusMapping() {
+  const { mapProviderStatusToOrderStatus, isRtoProviderStatus } = require('../services/shipmentOps/shiprocketStatusMap');
+  assert.strictEqual(isRtoProviderStatus('RTO Delivered'), true);
+  assert.strictEqual(isRtoProviderStatus('RTO IN TRANSIT'), true);
+  assert.strictEqual(isRtoProviderStatus('RTO Initiated'), true);
+  assert.strictEqual(isRtoProviderStatus('Delivered'), false);
+  assert.strictEqual(isRtoProviderStatus('Undelivered'), false);
+  assert.strictEqual(mapProviderStatusToOrderStatus('RTO Delivered'), 'rto');
+  assert.strictEqual(mapProviderStatusToOrderStatus('RTO IN TRANSIT'), 'rto');
+  assert.strictEqual(mapProviderStatusToOrderStatus('RTO Initiated'), 'rto');
+  assert.strictEqual(mapProviderStatusToOrderStatus('Delivered'), 'delivered');
+  assert.strictEqual(mapProviderStatusToOrderStatus('Cancelled'), 'cancelled');
+}
+
+function testRtoOpsStateUsesShiprocketLabel() {
+  const order = {
+    orderStatus: 'rto',
+    shipmentInfo: {
+      awbCode: '14112365632460',
+      courier: 'Xpressbees Surface',
+      providerStatus: 'RTO Delivered'
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.RTO);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.courierOpsLine1, 'RTO Delivered');
+  assert.strictEqual(view.opsStateLabel, 'RTO Delivered');
+  assert.strictEqual(view.actionCapabilities.shipNow, false);
+}
+
+function testLegacyCancelledWithRtoProviderStatus() {
+  const order = {
+    orderStatus: 'cancelled',
+    shipmentInfo: {
+      awbCode: '14112365632460',
+      providerStatus: 'RTO Delivered'
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.RTO);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.courierOpsLine1, 'RTO Delivered');
+}
+
+function testRtoFulfillmentLabel() {
+  const { fulfillmentLabelFromOrderStatus } = require('../constants/adminOrderFulfillmentBuckets');
+  assert.strictEqual(fulfillmentLabelFromOrderStatus('rto', 'RTO Delivered'), 'RTO Delivered');
+  assert.strictEqual(fulfillmentLabelFromOrderStatus('cancelled', 'RTO Delivered'), 'RTO Delivered');
+}
+
 function run() {
   testPickupExceptionState();
   testProviderResetState();
@@ -427,6 +480,10 @@ function run() {
   testLegacyLabelUrlWithoutAwbTagStillAllowsLabelDownload();
   testListUiPickupScheduled();
   testAwaitingApproval();
+  testRtoProviderStatusMapping();
+  testRtoOpsStateUsesShiprocketLabel();
+  testLegacyCancelledWithRtoProviderStatus();
+  testRtoFulfillmentLabel();
   console.log('All shipment ops tests passed.');
 }
 

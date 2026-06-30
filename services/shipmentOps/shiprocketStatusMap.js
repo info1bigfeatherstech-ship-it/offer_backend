@@ -212,11 +212,24 @@ function classifyForwardStatusCode(statusCode, statusLabel) {
 }
 
 /**
+ * True when Shiprocket carrier label indicates RTO (return-to-origin) flow.
+ * Uses only patterns present in Shiprocket status text — not generic undelivered/NDR.
+ * @param {string|null|undefined} rawStatus
+ */
+function isRtoProviderStatus(rawStatus) {
+  const s = normalizeText(rawStatus);
+  if (!s) return false;
+  if (/pickup scheduled|pickup generated/.test(s)) return false;
+  return /\brto\b/.test(s) || /return to origin/.test(s) || /returned to origin/.test(s);
+}
+
+/**
  * Map live Shiprocket provider label → internal orderStatus.
  * Pre-transit (AWB, ready to ship, pickup pending) stays `processing`.
  * Only true movement → `shipped` / later.
+ * RTO labels → `rto` (exact Shiprocket text kept in shipmentInfo.providerStatus).
  * @param {string|null|undefined} rawStatus
- * @returns {'processing'|'shipped'|'out_for_delivery'|'delivered'|'cancelled'|null}
+ * @returns {'processing'|'shipped'|'out_for_delivery'|'delivered'|'cancelled'|'rto'|null}
  */
 function mapProviderStatusToOrderStatus(rawStatus) {
   const s = normalizeText(rawStatus);
@@ -224,12 +237,11 @@ function mapProviderStatusToOrderStatus(rawStatus) {
 
   if (['shipment created', 'order created', 'created', 'new'].includes(s)) return null;
 
+  if (isRtoProviderStatus(s)) return 'rto';
+
   if (/out for delivery|\bofd\b/.test(s)) return 'out_for_delivery';
   if (/delivered|delivery completed/.test(s)) return 'delivered';
-  if (
-    /cancel|undelivered|rto|return to origin/.test(s) &&
-    !/pickup scheduled|pickup generated/.test(s)
-  ) {
+  if (/cancel|undelivered/.test(s) && !/pickup scheduled|pickup generated/.test(s)) {
     return 'cancelled';
   }
 
@@ -265,6 +277,7 @@ module.exports = {
   isForwardProgressStatus,
   isStaleCancelTimelineStatus,
   sanitizeTrackingEventsForProvider,
+  isRtoProviderStatus,
   mapProviderStatusToOrderStatus,
   isProviderStatusInTransit
 };

@@ -11,6 +11,12 @@ const {
   fulfillmentLabelFromOrderStatus,
   paymentLabelForUi
 } = require('../constants/adminOrderFulfillmentBuckets');
+const {
+  buildRtoBucketMatch,
+  buildRtoExclusionForNonRtoBucket,
+  repairOrderStatusForShiprocketRto,
+  isRtoProviderStatus
+} = require('../constants/rtoOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmentUi');
 
@@ -126,6 +132,9 @@ function buildBucketMatch(bucket) {
   if (b === 'all') {
     return { orderStatus: { $nin: ALL_TAB_EXCLUDED_ORDER_STATUSES } };
   }
+  if (b === 'rto') {
+    return buildRtoBucketMatch();
+  }
   const statuses = BUCKET_TO_ORDER_STATUSES[/** @type {keyof typeof BUCKET_TO_ORDER_STATUSES} */ (b)];
   if (!statuses) {
     const err = new Error(`Invalid bucket: ${bucket}`);
@@ -133,7 +142,12 @@ function buildBucketMatch(bucket) {
     err.code = 'INVALID_BUCKET';
     throw err;
   }
-  return { orderStatus: { $in: statuses } };
+  const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
+  const statusMatch = { orderStatus: { $in: statuses } };
+  if (rtoExclude) {
+    return { $and: [statusMatch, rtoExclude] };
+  }
+  return statusMatch;
 }
 
 /**
@@ -211,16 +225,30 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
   const t = row?.totals?.[0] || {};
   const byStatus = Object.fromEntries((row?.byStatus || []).map((x) => [x._id, x.count]));
 
+  const { RTO_PROVIDER_STATUS_REGEX } = require('../constants/rtoOrderQuery');
+  const rtoProviderMatch = { $regex: RTO_PROVIDER_STATUS_REGEX, $options: 'i' };
+
+  const [rtoCount, legacyRtoInCancelled, legacyRtoInDelivered] = await Promise.all([
+    Order.countDocuments({ $and: [baseMatch, buildRtoBucketMatch()] }),
+    Order.countDocuments({
+      $and: [baseMatch, { orderStatus: 'cancelled', 'shipmentInfo.providerStatus': rtoProviderMatch }]
+    }),
+    Order.countDocuments({
+      $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': rtoProviderMatch }]
+    })
+  ]);
+
   const countsByBucket = {
     all: t.totalOrders || 0,
     new: byStatus.pending || 0,
     bill_sent: byStatus.confirmed || 0,
     ready_to_pick: byStatus.processing || 0,
     in_transit: (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0),
-    completed: (byStatus.delivered || 0) + (byStatus.return_requested || 0),
+    completed:
+      Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered) + (byStatus.return_requested || 0),
+    rto: rtoCount,
     others:
-      (byStatus.cancelled || 0) +
-      (byStatus.payment_failed || 0)
+      Math.max(0, (byStatus.cancelled || 0) - legacyRtoInCancelled) + (byStatus.payment_failed || 0)
   };
 
   return {
@@ -259,15 +287,19 @@ function normalizeFinancialView(o) {
  */
 function mapOrderRow(order) {
   const o = order && typeof order.toObject === 'function' ? order.toObject() : order;
+  repairOrderStatusForShiprocketRto(o);
   const phone =
     o.addressSnapshot?.phone ||
     o.addressSnapshot?.mobile ||
     o.addressSnapshot?.phoneNumber ||
     '';
   const itemCount = Array.isArray(o.items) ? o.items.length : 0;
-  const bucketKey = fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
-  const financials = normalizeFinancialView(o);
   const si = o.shipmentInfo || {};
+  const bucketKey =
+    isRtoProviderStatus(si.providerStatus) || o.orderStatus === 'rto'
+      ? 'rto'
+      : fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
+  const financials = normalizeFinancialView(o);
   const hasAwb = Boolean(si.awbCode || si.trackingNumber);
   const hasShipmentId = Boolean(si.shipmentId);
   const pickupScheduled = Boolean(si.pickupScheduledAt || si.pickupDate);
@@ -312,7 +344,7 @@ function mapOrderRow(order) {
     amountInr: roundMoney(Number(o.totalAmount) || 0),
     currency: 'INR',
     orderStatus: o.orderStatus,
-    fulfillmentLabel: fulfillmentLabelFromOrderStatus(o.orderStatus),
+    fulfillmentLabel: fulfillmentLabelFromOrderStatus(o.orderStatus, si.providerStatus),
     fulfillmentBucket: bucketKey,
     itemCount,
     paymentStatus: o.paymentStatus,

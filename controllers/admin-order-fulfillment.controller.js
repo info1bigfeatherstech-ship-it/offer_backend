@@ -1964,7 +1964,7 @@ exports.adminFulfillmentListCouriers = async (req, res) => {
   }
 };
 
-const BULK_DOC_SKIP_STATUSES = new Set(['cancelled', 'payment_failed']);
+const BULK_DOC_SKIP_STATUSES = new Set(['cancelled', 'payment_failed', 'rto']);
 
 /** POST /orders/admin/items/bulk-documents/tax-invoices-zip — ZIP of GST invoice HTML + manifest.json */
 exports.adminBulkTaxInvoicesZip = async (req, res) => {
