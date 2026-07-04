@@ -205,8 +205,11 @@ const orderSchema = new mongoose.Schema(
         forwardShipping: { type: Number, default: 0 },
         rtoShipping: { type: Number, default: 0 },
         platformFee: { type: Number, default: 0 },
-        platformFeePercent: { type: Number, default: 0 }
+        platformFeePercent: { type: Number, default: 0 },
+        orderTotal: { type: Number, default: 0 },
+        cartValue: { type: Number, default: 0 }
       },
+      rtoShippingCharges: { type: Number, default: null },
       rtoHistory: {
         type: [
           {

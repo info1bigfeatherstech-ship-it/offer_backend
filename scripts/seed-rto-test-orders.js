@@ -14,6 +14,7 @@ const Order = require('../models/Order');
 const {
   calculateRtoRefund,
   calculatePlatformFee,
+  getRtoOrderTotal,
   mapShiprocketRtoStage,
   classifyRtoPaymentType,
   isRtoDeliveredToWarehouse
@@ -156,12 +157,19 @@ function buildLineItem(templateItem, subtotal) {
 
 function buildOrderDoc(spec, template) {
   const item = buildLineItem(template?.items?.[0], spec.subtotal);
-  const { fee: platformFee, percent: platformFeePercent } = calculatePlatformFee(spec.subtotal);
+  const orderStub = {
+    subtotal: spec.subtotal,
+    deliveryCharges: spec.deliveryCharges
+  };
+  const orderTotal = getRtoOrderTotal(orderStub);
+  const { fee: platformFee, percent: platformFeePercent } = calculatePlatformFee(orderTotal);
   const rtoDeductions = {
     forwardShipping: spec.deliveryCharges,
     rtoShipping: spec.rtoFreightCharge,
     platformFee,
-    platformFeePercent
+    platformFeePercent,
+    orderTotal,
+    cartValue: spec.subtotal
   };
   return {
     orderId: spec.orderId,

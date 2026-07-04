@@ -1,16 +1,14 @@
 /**
  * RTO platform fee tiers — loaded from RTO_PLATFORM_FEE_TIERS env (JSON).
- * Percent applied on cart subtotal only; each tier has a max cap (INR).
+ * Percent applied on order total (subtotal + deliveryCharges); each tier has a max cap (INR).
  */
 const logger = require('../utils/logger');
 
 const DEFAULT_TIERS = [
-  { min: 0, max: 500, percent: 6, cap: 30 },
-  { min: 501, max: 1000, percent: 5.5, cap: 55 },
-  { min: 1001, max: 1500, percent: 5, cap: 75 },
-  { min: 1501, max: 2000, percent: 4.5, cap: 90 },
-  { min: 2001, max: 3000, percent: 4, cap: 120 },
-  { min: 3001, max: null, percent: 3.5, cap: 200 }
+  { min: 100, max: 200, percent: 8, cap: 16 },
+  { min: 201, max: 500, percent: 6, cap: 30 },
+  { min: 501, max: 1000, percent: 5, cap: 50 },
+  { min: 1001, max: null, percent: 4.5, cap: 200 }
 ];
 
 let cachedTiers = null;

@@ -1,8 +1,19 @@
 /**
- * RTO refund calculation & eligibility — platform fee from env tiers (cart subtotal only).
+ * RTO refund calculation & eligibility — platform fee from env tiers on order total
+ * (subtotal + deliveryCharges). Full online payment only; COD/partial → no refund.
  */
 const { roundMoney2 } = require('./checkoutComputation.service');
 const { loadPlatformFeeTiers } = require('../config/rtoPlatformFee.config');
+
+function getMinOrderValueForRefund() {
+  const n = Number(process.env.RTO_MIN_ORDER_VALUE_FOR_REFUND);
+  return Number.isFinite(n) && n >= 0 ? roundMoney2(n) : 100;
+}
+
+function getMinRefundThreshold() {
+  const n = Number(process.env.RTO_MIN_REFUND_THRESHOLD);
+  return Number.isFinite(n) && n >= 0 ? roundMoney2(n) : 20;
+}
 
 const CUSTOMER_RTO_REASON_RE =
   /refus|unavail|not available|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|customer unavailable|refused to accept/i;
@@ -16,22 +27,33 @@ const COURIER_RTO_PROVIDER_REGEX =
   'wrong address|address issue|pincode|pin code|delivery failed|undelivered|could not deliver|oda|out of delivery|non serviceable|nsz|misroute|damaged in transit|maximum attempt|address incomplete|invalid address';
 
 /**
- * @param {number} cartValueInr — order subtotal
+ * @param {number} orderTotalInr — subtotal + deliveryCharges
  * @returns {{ percent: number, fee: number, tier: object|null }}
  */
-function calculatePlatformFee(cartValueInr) {
-  const cart = roundMoney2(Number(cartValueInr) || 0);
+function calculatePlatformFee(orderTotalInr) {
+  const orderTotal = roundMoney2(Number(orderTotalInr) || 0);
   const tiers = loadPlatformFeeTiers();
   const tier =
     tiers.find((t) => {
-      const aboveMin = cart >= t.min;
-      const belowMax = t.max == null || cart <= t.max;
+      const aboveMin = orderTotal >= t.min;
+      const belowMax = t.max == null || orderTotal <= t.max;
       return aboveMin && belowMax;
     }) || tiers[tiers.length - 1];
 
-  const rawFee = roundMoney2((cart * tier.percent) / 100);
+  const rawFee = roundMoney2((orderTotal * tier.percent) / 100);
   const fee = roundMoney2(Math.min(rawFee, tier.cap));
   return { percent: tier.percent, fee, tier };
+}
+
+/**
+ * RTO order total for fee + refund base: cart value + forward shipping (excludes tax/discount).
+ * @param {import('mongoose').Document|object} order
+ * @returns {number}
+ */
+function getRtoOrderTotal(order) {
+  const cartValue = roundMoney2(Number(order?.subtotal) || 0);
+  const forwardShipping = getForwardShippingFromOrder(order);
+  return roundMoney2(cartValue + forwardShipping);
 }
 
 /**
@@ -137,36 +159,57 @@ function calculateRtoRefund(order, options = {}) {
   const eligibility = classifyRtoRefundEligibility(order);
   const cartValue = roundMoney2(Number(order?.subtotal) || 0);
   const forwardShipping = getForwardShippingFromOrder(order);
+  const orderTotal = getRtoOrderTotal(order);
   const rtoShipping =
     options.rtoShippingOverride != null && Number.isFinite(Number(options.rtoShippingOverride))
       ? roundMoney2(Number(options.rtoShippingOverride))
       : getRtoShippingFromOrder(order);
-  const { percent: platformFeePercent, fee: platformFee } = calculatePlatformFee(cartValue);
+  const { percent: platformFeePercent, fee: platformFee } = calculatePlatformFee(orderTotal);
 
   const deductions = {
     forwardShipping,
     rtoShipping,
     platformFee,
-    platformFeePercent
+    platformFeePercent,
+    orderTotal,
+    cartValue
   };
 
   const totalDeductions = roundMoney2(forwardShipping + rtoShipping + platformFee);
+  const minOrderValue = getMinOrderValueForRefund();
+  const minRefundThreshold = getMinRefundThreshold();
+
+  const buildBlocked = (reason, extra = {}) => ({
+    eligible: false,
+    reason,
+    cartValue,
+    orderTotal,
+    deductions,
+    totalDeductions,
+    netRefund: 0,
+    maxRefundableInr: 0,
+    minOrderValue,
+    minRefundThreshold,
+    ...extra
+  });
 
   if (!eligibility.eligible) {
-    return {
-      eligible: false,
-      reason: eligibility.reason,
-      cartValue,
-      orderTotal: roundMoney2(Number(order?.totalAmount) || 0),
-      deductions,
-      totalDeductions,
-      netRefund: 0,
-      maxRefundableInr: 0
-    };
+    return buildBlocked(eligibility.reason);
   }
 
-  const rawNet = roundMoney2(cartValue - totalDeductions);
+  if (orderTotal + 0.005 < minOrderValue) {
+    return buildBlocked('order_below_min_value', { orderTotalBelowMin: true });
+  }
+
+  const rawNet = roundMoney2(orderTotal - totalDeductions);
   const netRefund = rawNet > 0 ? rawNet : 0;
+
+  if (netRefund <= minRefundThreshold + 0.005) {
+    return buildBlocked('refund_below_min_threshold', {
+      netRefund,
+      refundBelowMin: true
+    });
+  }
 
   const alreadyRefundedInr = roundMoney2(
     (order?.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
@@ -175,15 +218,22 @@ function calculateRtoRefund(order, options = {}) {
   const maxRefundableInr = roundMoney2(Math.max(0, Math.min(netRefund, paidInr - alreadyRefundedInr)));
 
   return {
-    eligible: maxRefundableInr > 0,
-    reason: maxRefundableInr > 0 ? eligibility.reason : 'zero_or_negative_net_refund',
+    eligible: maxRefundableInr > minRefundThreshold + 0.005,
+    reason:
+      maxRefundableInr > minRefundThreshold + 0.005
+        ? eligibility.reason
+        : maxRefundableInr <= 0
+          ? 'zero_or_negative_net_refund'
+          : 'refund_below_min_threshold',
     cartValue,
-    orderTotal: roundMoney2(Number(order?.totalAmount) || 0),
+    orderTotal,
     deductions,
     totalDeductions,
     netRefund,
     maxRefundableInr,
     alreadyRefundedInr,
+    minOrderValue,
+    minRefundThreshold,
     negativeNetBeforeClamp: rawNet < 0
   };
 }
@@ -397,7 +447,9 @@ function mergeReturnInfo(existing, patch = {}) {
       forwardShipping: Number(d.forwardShipping) || 0,
       rtoShipping: Number(d.rtoShipping) || 0,
       platformFee: Number(d.platformFee) || 0,
-      platformFeePercent: Number(d.platformFeePercent) || 0
+      platformFeePercent: Number(d.platformFeePercent) || 0,
+      orderTotal: Number(d.orderTotal) || 0,
+      cartValue: Number(d.cartValue) || 0
     };
   } else if (out.rtoDeductions === undefined) {
     delete out.rtoDeductions;
@@ -439,6 +491,9 @@ function hasRtoRefundBeenInitiated(order) {
 module.exports = {
   calculatePlatformFee,
   calculateRtoRefund,
+  getRtoOrderTotal,
+  getMinOrderValueForRefund,
+  getMinRefundThreshold,
   classifyRtoRefundEligibility,
   classifyRtoReasonCategory,
   classifyRtoReasonLabel,

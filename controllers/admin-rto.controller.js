@@ -26,6 +26,10 @@ const {
   buildCustomerRtoSectionMatch,
   buildCourierRtoSectionMatch
 } = require('../services/rtoRefund.service');
+const {
+  notifyRefundInitiated,
+  notifyRefundRejectedByAdmin
+} = require('../services/rtoNotification.service');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -289,7 +293,13 @@ function mapRtoOrderRow(order) {
             ? 'Partial payment — close case (no Razorpay)'
             : paymentType.key === 'cod'
               ? 'COD — close case (no Razorpay)'
-              : null
+              : calc.reason === 'order_below_min_value'
+                ? `Order total below ₹${calc.minOrderValue ?? 100} — no refund`
+                : calc.reason === 'refund_below_min_threshold'
+                  ? `Net refund ₹${calc.netRefund ?? 0} — must exceed ₹${calc.minRefundThreshold ?? 20}`
+                  : calc.reason === 'zero_or_negative_net_refund'
+                    ? 'Deductions exceed order total — no refund'
+                    : null
           : null
   };
 }
@@ -477,7 +487,11 @@ exports.processRtoRefund = async (req, res) => {
           ? 'COD orders are not eligible for refund. Mark as resolved instead.'
           : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
             ? 'Partial payment orders are not eligible for refund. Mark as resolved instead.'
-            : 'This order is not eligible for RTO refund.'
+            : calc.reason === 'order_below_min_value'
+              ? `Order total is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
+              : calc.reason === 'refund_below_min_threshold'
+                ? `Net refund must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
+                : 'This order is not eligible for RTO refund.'
       );
     }
 
@@ -515,6 +529,15 @@ exports.processRtoRefund = async (req, res) => {
     });
 
     await applyRtoRefundEntryToOrder(order, refund, req.user?.id || req.user?._id, calc);
+
+    try {
+      await notifyRefundInitiated(order, refundInr);
+    } catch (notifyErr) {
+      logger.warn('[rtoNotification] refund initiated notify failed', {
+        orderId: order.orderId,
+        message: notifyErr.message
+      });
+    }
 
     return res.json({
       success: true,
@@ -588,6 +611,15 @@ exports.rejectRtoRefund = async (req, res) => {
     order.markModified('returnInfo');
     await order.save();
 
+    try {
+      await notifyRefundRejectedByAdmin(order, { isNoRefundCase });
+    } catch (notifyErr) {
+      logger.warn('[rtoNotification] refund rejected notify failed', {
+        orderId: order.orderId,
+        message: notifyErr.message
+      });
+    }
+
     return res.json({
       success: true,
       message: isNoRefundCase
@@ -656,6 +688,15 @@ exports.bulkRtoAction = async (req, res) => {
           });
           order.markModified('returnInfo');
           await order.save();
+          try {
+            const payType = classifyRtoPaymentType(order);
+            await notifyRefundRejectedByAdmin(order, { isNoRefundCase: !payType.refundAllowed });
+          } catch (notifyErr) {
+            logger.warn('[rtoNotification] bulk reject notify failed', {
+              orderId: order.orderId,
+              message: notifyErr.message
+            });
+          }
           results.push({ orderId, success: true });
         } else {
           const order = await findRtoOrderOrThrow(orderId, scopeMatch);
@@ -710,6 +751,14 @@ exports.bulkRtoAction = async (req, res) => {
             rtoRefundError: null
           });
           await applyRtoRefundEntryToOrder(order, refund, adminId, calc);
+          try {
+            await notifyRefundInitiated(order, calc.maxRefundableInr);
+          } catch (notifyErr) {
+            logger.warn('[rtoNotification] bulk refund notify failed', {
+              orderId: order.orderId,
+              message: notifyErr.message
+            });
+          }
           results.push({ orderId, success: true, refundId: refund.id, amountInr: calc.maxRefundableInr });
         }
       } catch (rowErr) {
