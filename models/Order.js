@@ -46,10 +46,10 @@ const orderSchema = new mongoose.Schema(
     /** Checkout channel at order place (for ID prefix + admin scope) */
     storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
     
-    orderStatus: { 
-      type: String, 
-      enum: ['pending', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed', 'rto'], 
-      default: 'pending' 
+    orderStatus: {
+      type: String,
+      enum: ['pending', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed', 'rto', 'pickup_exception'],
+      default: 'pending'
     },
     
     paymentStatus: { 
@@ -102,6 +102,8 @@ const orderSchema = new mongoose.Schema(
       labelUrl: String,
       /** Shiprocket handover manifest PDF URL */
       manifestUrl: { type: String, default: null },
+      manifestDownloaded: { type: Boolean, default: false },
+      labelDownloaded: { type: Boolean, default: false },
       manifestGeneratedAt: Date,
       fulfillmentArtifactAwb: { type: String, default: null },
       fulfillmentLabelAwb: { type: String, default: null },

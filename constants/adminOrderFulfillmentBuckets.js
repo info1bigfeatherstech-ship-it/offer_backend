@@ -12,6 +12,8 @@ const BUCKET_TO_ORDER_STATUSES = Object.freeze({
   new: ['pending'],
   /** Order accepted; ready for invoicing / packing queue */
   bill_sent: ['confirmed'],
+  /** Ready to ship */
+  ready_to_ship: ['processing'],
   /** Warehouse / fulfilment */
   ready_to_pick: ['processing'],
   /** Courier handoff */
@@ -20,6 +22,7 @@ const BUCKET_TO_ORDER_STATUSES = Object.freeze({
   completed: ['delivered', 'return_requested'],
   /** Shiprocket RTO flow — exact carrier label in shipmentInfo.providerStatus */
   rto: ['rto'],
+  pickup_exception: ['pickup_exception'],
   /** Terminal / exceptional */
   others: ['cancelled', 'payment_failed']
 });
@@ -41,7 +44,7 @@ const GMV_EXCLUDED_ORDER_STATUSES = Object.freeze(['cancelled', 'payment_failed'
  * Derived from {@link BUCKET_TO_ORDER_STATUSES} — excludes terminal tabs (Delivered, Cancelled/others).
  * Single source of truth for admin auto-sync eligibility (do not duplicate status lists elsewhere).
  */
-const ACTIVE_FORWARD_SYNC_BUCKET_KEYS = Object.freeze(['new', 'bill_sent', 'ready_to_pick', 'in_transit']);
+const ACTIVE_FORWARD_SYNC_BUCKET_KEYS = Object.freeze(['new', 'bill_sent', 'ready_to_ship', 'ready_to_pick', 'in_transit']);
 
 /** @type {readonly string[]} */
 const ACTIVE_FORWARD_SYNC_STATUSES = Object.freeze(

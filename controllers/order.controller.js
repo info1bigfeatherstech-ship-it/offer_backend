@@ -476,6 +476,12 @@ async function upsertShipmentInfo({
     if (shipmentPayload.estimatedDelivery) {
         nextShipmentInfo.estimatedDelivery = shipmentPayload.estimatedDelivery;
     }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'manifestDownloaded')) {
+        nextShipmentInfo.manifestDownloaded = Boolean(shipmentPayload.manifestDownloaded);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'labelDownloaded')) {
+        nextShipmentInfo.labelDownloaded = Boolean(shipmentPayload.labelDownloaded);
+    }
 
     const providerStatus = shipmentPayload.providerStatus || shipmentPayload.currentStatus || null;
     if (providerStatus) {

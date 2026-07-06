@@ -339,7 +339,7 @@ exports.getRtoOrders = async (req, res) => {
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const dateMatch = { createdAt: { $gte: range.from, $lte: range.to } };
-    const search = buildSearchFilter(req.query.search);
+    const search = await buildSearchFilter(req.query.search);
     const sectionMatch = buildRtoSectionMatch(req.query.section);
     const statusMatch = buildRtoStatusFilterMatch(req.query.status);
 

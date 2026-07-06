@@ -1737,6 +1737,13 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
     let buf;
     try {
       buf = await fetchShiprocketLabelPdfBuffer(order);
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: { labelDownloaded: true },
+        trigger: 'admin_label_downloaded',
+        allowOrderStatusUpdate: false
+      });
+      await evaluateAndPersistShipmentOps(order, { source: 'admin_label_downloaded' });
     } catch (fetchErr) {
       logger.error('adminFulfillmentShippingLabelFile fetch', {
         message: fetchErr.message,
@@ -2066,6 +2073,13 @@ exports.adminBulkManifestsZip = async (req, res) => {
           };
         }
         const pdfBuf = await fetchShiprocketManifestPdfBuffer(order);
+        await applyUpsertShipmentInfo({
+          order,
+          shipmentPayload: { manifestDownloaded: true },
+          trigger: 'admin_bulk_manifest_downloaded',
+          allowOrderStatusUpdate: false
+        });
+        await evaluateAndPersistShipmentOps(order, { source: 'admin_bulk_manifest_downloaded' });
         const entryName = safeZipEntryBase(oid, '-manifest.pdf');
         return { orderId: oid, success: true, entryName, pdfBuf };
       } catch (err) {
@@ -2130,6 +2144,13 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
           };
         }
         const pdfBuf = await fetchShiprocketLabelPdfBuffer(order);
+        await applyUpsertShipmentInfo({
+          order,
+          shipmentPayload: { labelDownloaded: true },
+          trigger: 'admin_bulk_label_downloaded',
+          allowOrderStatusUpdate: false
+        });
+        await evaluateAndPersistShipmentOps(order, { source: 'admin_bulk_label_downloaded' });
         const entryName = safeZipEntryBase(oid, '-shipping-label.pdf');
         return { orderId: oid, success: true, entryName, pdfBuf };
       } catch (err) {
@@ -2329,6 +2350,13 @@ exports.adminFulfillmentManifestFile = async (req, res) => {
     let buf;
     try {
       buf = await fetchShiprocketManifestPdfBuffer(order);
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: { manifestDownloaded: true },
+        trigger: 'admin_manifest_downloaded',
+        allowOrderStatusUpdate: false
+      });
+      await evaluateAndPersistShipmentOps(order, { source: 'admin_manifest_downloaded' });
     } catch (fetchErr) {
       const code = fetchErr.code || 'MANIFEST_FILE_FAILED';
       if (code === 'AWB_REQUIRED' || code === 'SHIPMENT_ID_MISSING' || code === 'SHIPROCKET_ORDER_ID_MISSING') {

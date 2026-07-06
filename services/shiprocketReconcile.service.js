@@ -46,6 +46,8 @@ async function applyLocalShipmentReset(order, options = {}) {
     shiprocketPickupId: null,
     manifestUrl: null,
     labelUrl: null,
+    manifestDownloaded: false,
+    labelDownloaded: false,
     manifestGeneratedAt: null,
     lastPickupError: null,
     providerStatus: reason,
@@ -145,6 +147,8 @@ function buildPayloadFromSnapshot(snapshot, order) {
         assignedCourierId: null,
         manifestUrl: null,
         labelUrl: null,
+        manifestDownloaded: false,
+        labelDownloaded: false,
         shiprocketPickupId: null,
         events: appendResetEvent(si.rawEvents, reset.reason)
       }
