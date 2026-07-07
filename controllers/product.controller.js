@@ -6042,6 +6042,393 @@ const getVariantByproductCode = async (req, res) => {
 //     });
 //   }
 // };
+// =============================================
+// EXPORT ALL PRODUCTS TO EXCEL (.xlsx)
+// =============================================
+const exportProductsCSV = async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+
+    // Fetch ALL products - no pagination, include all statuses
+    const products = await Product.find({})
+      .populate('category', 'name slug')
+      .sort({ createdAt: -1 })
+      .lean({ virtuals: true });
+
+    if (!products || products.length === 0) {
+      return res.status(200).json({ success: true, message: 'No products found to export.' });
+    }
+
+    // Column headers matching bulk upload template + images field
+    const HEADERS = [
+      'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
+      'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
+      'weight', 'length', 'width', 'height',
+      'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
+      'productAttributes', 'images', 'hsnCode', 'gstRate', 'isFragile',
+      'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
+    ];
+
+    // Build data rows as array-of-arrays (faster than json2xlsx for large sets)
+    const dataRows = [];
+
+    for (const product of products) {
+      const variants = Array.isArray(product.variants) && product.variants.length > 0
+        ? product.variants
+        : [null];
+
+      for (const variant of variants) {
+        const categoryName = product.category ? (product.category.name || '') : '';
+
+        // Variant attributes: e.g. Color:Red|Size:M
+        let variantAttributes = '';
+        if (variant && Array.isArray(variant.attributes) && variant.attributes.length > 0) {
+          variantAttributes = variant.attributes
+            .map(a => `${a.key || ''}:${a.value || ''}`)
+            .join('|');
+        }
+
+        // Product-level custom attributes
+        let productAttributes = '';
+        if (Array.isArray(product.attributes) && product.attributes.length > 0) {
+          productAttributes = product.attributes
+            .map(a => `${a.key || ''}:${a.value || ''}`)
+            .join('|');
+        }
+
+        // Images: all image URLs sorted by order, comma-separated
+        let imageUrls = '';
+        if (variant && Array.isArray(variant.images) && variant.images.length > 0) {
+          imageUrls = variant.images
+            .slice()
+            .sort((a, b) => (a.order || 0) - (b.order || 0))
+            .map(img => img.url || '')
+            .filter(Boolean)
+            .join(', ');
+        }
+
+        // Shipping: variant-level falls back to product-level
+        const shippingObj = (variant && variant.shipping) ? variant.shipping : (product.shipping || {});
+        const dimObj = shippingObj.dimensions || {};
+        const weight      = (shippingObj.weight != null) ? shippingObj.weight : '';
+        const dimLength   = (dimObj.length != null) ? dimObj.length : '';
+        const dimWidth    = (dimObj.width  != null) ? dimObj.width  : '';
+        const dimHeight   = (dimObj.height != null) ? dimObj.height : '';
+
+        // Pricing & inventory from variant
+        const basePrice           = variant && variant.price ? variant.price.base : '';
+        const salePrice           = variant && variant.price && variant.price.sale != null ? variant.price.sale : '';
+        const quantity            = variant && variant.inventory ? variant.inventory.quantity : '';
+        const productCode         = variant ? (variant.productCode || '') : '';
+        const wholesale           = variant ? (variant.wholesale ? 'TRUE' : 'FALSE') : 'FALSE';
+        const wholesaleBase       = variant && variant.price && variant.price.wholesaleBase != null ? variant.price.wholesaleBase : '';
+        const wholesaleSale       = variant && variant.price && variant.price.wholesaleSale != null ? variant.price.wholesaleSale : '';
+        const minimumOrderQty     = variant && variant.minimumOrderQuantity != null ? variant.minimumOrderQuantity : '';
+
+        dataRows.push([
+          product.name        || '',
+          product.title       || '',
+          product.description || '',
+          categoryName,
+          product.brand       || '',
+          product.status      || '',
+          product.isFeatured  ? 'TRUE' : 'FALSE',
+          basePrice,
+          salePrice,
+          quantity,
+          productCode,
+          variantAttributes,
+          weight,
+          dimLength,
+          dimWidth,
+          dimHeight,
+          product.soldInfo ? (product.soldInfo.enabled ? 'TRUE' : 'FALSE') : '',
+          product.soldInfo ? product.soldInfo.count : '',
+          product.fomo ? (product.fomo.enabled ? 'TRUE' : 'FALSE') : '',
+          product.fomo ? (product.fomo.type || '') : '',
+          product.fomo ? product.fomo.viewingNow : '',
+          product.fomo ? product.fomo.productLeft : '',
+          product.fomo ? (product.fomo.customMessage || '') : '',
+          productAttributes,
+          imageUrls,
+          product.hsnCode  || '',
+          product.gstRate  != null ? product.gstRate : '',
+          product.isFragile ? 'TRUE' : 'FALSE',
+          wholesale,
+          wholesaleBase,
+          wholesaleSale,
+          minimumOrderQty,
+          '' // countryOfOrigin — not in current schema
+        ]);
+      }
+    }
+
+    // ── Build workbook ──────────────────────────────────────────────────────
+    const wb = XLSX.utils.book_new();
+
+    // Combine header + data into one 2-D array for sheet_from_array_of_arrays
+    const sheetData = [HEADERS, ...dataRows];
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+
+    // ── Style: bold header row ──────────────────────────────────────────────
+    HEADERS.forEach((_, colIdx) => {
+      const cellAddr = XLSX.utils.encode_cell({ r: 0, c: colIdx });
+      if (!ws[cellAddr]) ws[cellAddr] = {};
+      ws[cellAddr].s = {
+        font: { bold: true, color: { rgb: 'FFFFFF' } },
+        fill: { fgColor: { rgb: '1D4ED8' } }, // blue header background
+        alignment: { horizontal: 'center', vertical: 'center', wrapText: false }
+      };
+    });
+
+    // ── Auto column widths (based on max char length in first 200 rows) ─────
+    const colWidths = HEADERS.map((h, ci) => {
+      let max = h.length;
+      for (let ri = 1; ri < Math.min(sheetData.length, 200); ri++) {
+        const val = sheetData[ri][ci];
+        if (val != null) max = Math.max(max, String(val).length);
+      }
+      return { wch: Math.min(max + 2, 80) }; // cap at 80 chars
+    });
+    ws['!cols'] = colWidths;
+
+    // ── Freeze first row ────────────────────────────────────────────────────
+    ws['!freeze'] = { xSplit: 0, ySplit: 1, topLeftCell: 'A2', activePane: 'bottomLeft' };
+
+    XLSX.utils.book_append_sheet(wb, ws, 'Products');
+
+    // ── Write to buffer and send ────────────────────────────────────────────
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+
+    const today    = new Date().toISOString().slice(0, 10);
+    const filename = `products_export_${today}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', xlsxBuffer.length);
+    res.send(xlsxBuffer);
+
+  } catch (error) {
+    console.error('Export products Excel error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error exporting products',
+      error: error.message
+    });
+  }
+};
+
+// =============================================
+// DOWNLOAD BULK UPLOAD TEMPLATE (with data validation)
+// =============================================
+const downloadBulkUploadTemplate = async (req, res) => {
+  try {
+    const ExcelJS = require('exceljs');
+    const XLSX = require('xlsx');
+    const path = require('path');
+    const fs = require('fs');
+
+    const templatePath = 'c:/BigFeathers/offerWaaleBaba/OWB-bulkUploadFormat-ForNewProducts-FinalUpdated.xlsx';
+
+    // ── Fetch dynamic categories ─────────────────────────────────────────────
+    const categories = await Category.find({ status: 'active' })
+      .sort({ name: 1 })
+      .lean();
+    const categoryNames = categories.map(c => c.name);
+
+    const workbook = new ExcelJS.Workbook();
+    
+    // Set active worksheet tab to BulkUpload_NewProducts (index 1) when workbook is opened
+    workbook.views = [
+      {
+        firstSheet: 0,
+        activeTab: 1, // 0-indexed: index 1 refers to BulkUpload_NewProducts worksheet
+        visibility: 'visible'
+      }
+    ];
+    
+    // Create worksheets
+    const wsInstructions = workbook.addWorksheet('Instructions');
+    const wsProducts = workbook.addWorksheet('BulkUpload_NewProducts');
+    const wsImageGuide = workbook.addWorksheet('Image_ZIP_Guide');
+    const wsLookups = workbook.addWorksheet('Lookups');
+
+    let productsRows = [];
+
+    if (fs.existsSync(templatePath)) {
+      // ── Use SheetJS (xlsx) to read the template file ───────────────────────
+      const workbookTemplate = XLSX.readFile(templatePath);
+      
+      // 1. Read Instructions
+      const instructionsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Instructions'], { header: 1 });
+      instructionsRows.forEach(row => {
+        const fieldName = String(row[1] || '').trim();
+        if (['weight', 'length', 'width', 'height'].includes(fieldName)) {
+          row[2] = '✅ Yes'; // Update validation column description to show "Required"
+        }
+        wsInstructions.addRow(row);
+      });
+
+      // Style Instructions sheet
+      wsInstructions.getCell('A1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
+      const instHeader = wsInstructions.getRow(5);
+      instHeader.height = 24;
+      instHeader.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF475569' }
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'left' };
+      });
+      wsInstructions.columns = [
+        { width: 10 }, // Column
+        { width: 22 }, // Field Name
+        { width: 12 }, // Required?
+        { width: 12 }, // Data Type
+        { width: 45 }, // Allowed Values / Format
+        { width: 30 }, // Example
+        { width: 70 }  // Notes
+      ];
+
+      // 2. Read Products & examples
+      productsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['BulkUpload_NewProducts'], { header: 1 });
+      productsRows.forEach(row => {
+        wsProducts.addRow(row);
+      });
+
+      // Style Products header
+      const prodHeader = wsProducts.getRow(1);
+      prodHeader.height = 26;
+      prodHeader.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF1D4ED8' }
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      });
+      wsProducts.columns = productsRows[0].map(h => ({
+        header: h,
+        width: Math.max(String(h || '').length + 4, 16)
+      }));
+      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+
+      // 3. Read Image Guide
+      const imageGuideRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Image_ZIP_Guide'], { header: 1 });
+      imageGuideRows.forEach(row => {
+        wsImageGuide.addRow(row);
+      });
+
+      // Style Image Guide
+      wsImageGuide.getCell('B1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
+      wsImageGuide.columns = [
+        { width: 6 },
+        { width: 80 }
+      ];
+    } else {
+      // Fallback if template is not found
+      productsRows = [[
+        'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
+        'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
+        'weight', 'length', 'width', 'height',
+        'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
+        'productAttributes', 'images (LEAVE BLANK)', 'hsnCode', 'gstRate', 'isFragile',
+        'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
+      ]];
+      wsProducts.addRow(productsRows[0]);
+      
+      const prodHeader = wsProducts.getRow(1);
+      prodHeader.height = 26;
+      prodHeader.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF1D4ED8' }
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      });
+      wsProducts.columns = productsRows[0].map(h => ({ header: h, width: Math.max(h.length + 4, 16) }));
+      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+    }
+
+    // ── Create Lookups sheet ─────────────────────────────────────────────────
+    const STATUS_OPTIONS    = ['active', 'draft', 'archived'];
+    const BOOL_OPTIONS      = ['true', 'false'];
+    const FOMO_TYPE_OPTIONS = ['viewing_now', 'product_left', 'custom'];
+    const GST_OPTIONS       = ['0', '5', '12', '18', '28'];
+
+    // Write lists to Lookups sheet columns
+    wsLookups.getColumn(1).values = ['category', ...categoryNames];
+    wsLookups.getColumn(2).values = ['status', ...STATUS_OPTIONS];
+    wsLookups.getColumn(3).values = ['boolean', ...BOOL_OPTIONS];
+    wsLookups.getColumn(4).values = ['fomoType', ...FOMO_TYPE_OPTIONS];
+    wsLookups.getColumn(5).values = ['gstRate', ...GST_OPTIONS];
+
+    // Hide lookups sheet completely
+    wsLookups.state = 'veryHidden';
+
+    // ── Build map from headers to column index ──────────────────────────────
+    const colMap = {};
+    const headerRow = wsProducts.getRow(1);
+    headerRow.eachCell((cell, colNumber) => {
+      const val = String(cell.value || '').trim();
+      const name = val.replace(/\s*\(.*\)/, '').trim(); // 'images (LEAVE BLANK)' -> 'images'
+      colMap[name] = colNumber;
+    });
+
+    // Define validation ranges referencing Lookups
+    const VALIDATIONS = {
+      'category': `Lookups!$A$2:$A$${categoryNames.length + 1}`,
+      'status': `Lookups!$B$2:$B$${STATUS_OPTIONS.length + 1}`,
+      'isfeatured': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      'soldEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      'fomoEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      'fomoType': `Lookups!$D$2:$D$${FOMO_TYPE_OPTIONS.length + 1}`,
+      'isFragile': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      'wholesale': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      'gstRate': `Lookups!$E$2:$E$${GST_OPTIONS.length + 1}`
+    };
+
+    // Apply validations to wsProducts (rows 2 to 5000)
+    Object.keys(VALIDATIONS).forEach((colName) => {
+      const colNumber = colMap[colName];
+      if (!colNumber) return;
+
+      const colLetter = wsProducts.getColumn(colNumber).letter;
+      const validationFormula = VALIDATIONS[colName];
+
+      wsProducts.dataValidations.add(`${colLetter}2:${colLetter}5000`, {
+        type: 'list',
+        allowBlank: true,
+        formulae: [validationFormula],
+        showErrorMessage: true,
+        errorStyle: 'warning',
+        errorTitle: 'Invalid Selection',
+        error: `Please select a valid ${colName} from the list.`
+      });
+    });
+
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="bulk_upload_template.xlsx"');
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+
+  } catch (error) {
+    console.error('Download bulk upload template error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error generating template',
+      error: error.message
+    });
+  }
+};
+
 
 module.exports = {
   createProduct,
@@ -6056,16 +6443,18 @@ module.exports = {
   getArchivedProducts,
   getDraftProducts,
   getAllActiveProducts,
-  getProductBySlug ,
-   bulkRestore  , 
-   importProductsFromCSV ,
-   previewImportProductsFromCSV,
-   getAllProductsAdmin , 
-   addVariant,
+  getProductBySlug,
+  bulkRestore,
+  importProductsFromCSV,
+  previewImportProductsFromCSV,
+  getAllProductsAdmin,
+  addVariant,
   updateVariantChannelVisibility,
-   deleteVariant,
-   getVariantByproductCode,
-   bulkUploadNewProductsWithImages,
-   downloadErrorReport,
-   previewBulkUpload
+  deleteVariant,
+  getVariantByproductCode,
+  bulkUploadNewProductsWithImages,
+  downloadErrorReport,
+  previewBulkUpload,
+  exportProductsCSV,
+  downloadBulkUploadTemplate
 };

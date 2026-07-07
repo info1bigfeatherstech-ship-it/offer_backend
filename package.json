@@ -34,6 +34,7 @@
     "cross-env": "^7.0.3",
     "csv-parser": "^3.2.0",
     "dotenv": "^17.3.1",
+    "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "express-validator": "^7.3.1",
@@ -55,7 +56,8 @@
     "twilio": "^5.12.2",
     "unzipper": "^0.12.3",
     "web-push": "^3.6.7",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
