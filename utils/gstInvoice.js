@@ -82,9 +82,13 @@ function buildGstInvoiceViewModel(order, populatedItems = []) {
 
   const snap = order.addressSnapshot || {};
   const buyerAddressLines = [
+    snap.houseNumber,
+    snap.building,
+    snap.floor,
     snap.addressLine1,
     snap.addressLine2,
     snap.area,
+    snap.landmark,
     [snap.city, snap.postalCode].filter(Boolean).join(' '),
     snap.state,
     snap.country

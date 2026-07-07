@@ -33,6 +33,20 @@ const addressSchema = new mongoose.Schema({
     trim: true
   },
 
+  // Building (optional)
+  building: {
+    type: String,
+    trim: true,
+    default: ""
+  },
+
+  // Floor (optional)
+  floor: {
+    type: String,
+    trim: true,
+    default: ""
+  },
+
   //  Landmark (VERY useful)
   landmark: {
     type: String,

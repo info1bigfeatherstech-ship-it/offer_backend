@@ -22,6 +22,8 @@ const addAddress = async (req, res) => {
       fullName: clean(req.body.fullName),
       phone: clean(req.body.phone),
       houseNumber: clean(req.body.houseNumber),
+      building: clean(req.body.building),
+      floor: clean(req.body.floor),
       area: clean(req.body.area),
       landmark: clean(req.body.landmark),
       addressLine1: clean(req.body.addressLine1),
@@ -87,6 +89,8 @@ const addAddress = async (req, res) => {
       fullName: d.fullName,
       phone: d.phone,
       houseNumber: d.houseNumber,
+      building: d.building || "",
+      floor: d.floor || "",
       area: d.area,
       landmark: d.landmark || "",
       addressLine1: d.addressLine1,
@@ -199,6 +203,12 @@ const updateAddress = async (req, res) => {
     }
     if (updates.houseNumber) {
       updates.houseNumber = clean(updates.houseNumber);
+    }
+    if (updates.building !== undefined) {
+      updates.building = clean(updates.building);
+    }
+    if (updates.floor !== undefined) {
+      updates.floor = clean(updates.floor);
     }
     if (updates.area) {
       updates.area = clean(updates.area);

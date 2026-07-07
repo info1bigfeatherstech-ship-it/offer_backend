@@ -78,6 +78,8 @@ function validatePhysicalAddressForSave(body) {
   const phoneRaw = trimStr(body.phone);
   const phoneDigits = phoneRaw.replace(/\D/g, '');
   const houseNumber = trimStr(body.houseNumber);
+  const building = trimStr(body.building);
+  const floor = trimStr(body.floor);
   const area = trimStr(body.area);
   const landmark = trimStr(body.landmark);
   const city = trimStr(body.city);
@@ -97,6 +99,12 @@ function validatePhysicalAddressForSave(body) {
     errors.push({ field: 'houseNumber', code: 'REQUIRED', message: 'House / flat / building number is required.' });
   } else if (houseNumber.length > 80) {
     errors.push({ field: 'houseNumber', code: 'TOO_LONG', message: 'House / flat number is too long.' });
+  }
+  if (building && building.length > 150) {
+    errors.push({ field: 'building', code: 'TOO_LONG', message: 'Building name is too long.' });
+  }
+  if (floor && floor.length > 80) {
+    errors.push({ field: 'floor', code: 'TOO_LONG', message: 'Floor details are too long.' });
   }
   if (!area) {
     errors.push({ field: 'area', code: 'REQUIRED', message: 'Area / locality is required.' });
@@ -137,6 +145,8 @@ function validatePhysicalAddressForSave(body) {
       fullName,
       phone: phoneDigits,
       houseNumber,
+      building,
+      floor,
       area,
       landmark,
       addressLine1: street.line1,
