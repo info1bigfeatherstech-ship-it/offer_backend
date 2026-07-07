@@ -57,6 +57,22 @@ function createHttpError(statusCode, code, message) {
   return err;
 }
 
+function normalizeRtoTerminalStatus(status) {
+  const st = String(status || '').trim().toLowerCase();
+  if (!st || st === 'pending') return 'pending';
+  if (st === 'resolved') return 'closed';
+  return st;
+}
+
+function normalizeRtoAdminAction(action, { paymentType } = {}) {
+  const raw = String(action || '').trim().toLowerCase();
+  if (paymentType && !paymentType.refundAllowed) return 'close';
+  if (raw === 'close' || raw === 'closed') return 'close';
+  if (raw === 'reject' || raw === 'deny') return 'reject';
+  if (raw === 'resolve') return 'close';
+  return 'reject';
+}
+
 /** Combine multiple MongoDB filter fragments. */
 function mergeRtoFilters(...parts) {
   const valid = parts.filter((p) => p && typeof p === 'object' && Object.keys(p).length);
@@ -200,7 +216,10 @@ function buildRtoSectionMatch(section) {
     };
   }
   if (key === 'refund_rejected') {
-    return { 'returnInfo.rtoStatus': { $in: ['refund_rejected', 'refund_failed'] } };
+    return { 'returnInfo.rtoStatus': 'refund_rejected' };
+  }
+  if (key === 'closed') {
+    return { 'returnInfo.rtoStatus': { $in: ['closed', 'resolved'] } };
   }
   if (key === 'resolved') {
     return { 'returnInfo.rtoStatus': 'resolved' };
@@ -213,6 +232,7 @@ function buildRtoStatusFilterMatch(statusFilter) {
   const st = String(statusFilter || '').trim().toLowerCase();
   if (!st || st === 'all') return null;
   if (st === 'pending') return { 'returnInfo.rtoStatus': { $in: [null, 'pending'] } };
+  if (st === 'closed') return { 'returnInfo.rtoStatus': { $in: ['closed', 'resolved'] } };
   return { 'returnInfo.rtoStatus': st };
 }
 
@@ -227,7 +247,7 @@ function mapRtoOrderRow(order) {
   const providerStatus = o.shipmentInfo?.providerStatus || null;
   const reasonCategory = classifyRtoReasonCategory(providerStatus);
   const rtoStage = mapShiprocketRtoStage(providerStatus);
-  const rtoStatus = ri.rtoStatus || 'pending';
+  const rtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus || 'pending');
   const refundTrack = deriveRefundTrackStatus(o);
   const warehouseDelivered = isRtoDeliveredToWarehouse(providerStatus);
   const paymentType = classifyRtoPaymentType(o);
@@ -282,9 +302,14 @@ function mapRtoOrderRow(order) {
       !ri.rtoRejectedAt &&
       !hasRtoRefundBeenInitiated(o),
     canReject:
+      paymentType.refundAllowed &&
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
-      !['refunded', 'refund_rejected', 'refund_failed', 'resolved'].includes(rtoStatus),
+      !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
+    canClose:
+      ['pending', null].includes(rtoStatus) &&
+      !hasRtoRefundBeenInitiated(o) &&
+      !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
     refundBlockedReason:
       calc.eligible && !warehouseDelivered
         ? 'Waiting for Shiprocket RTO Delivered to warehouse'
@@ -407,14 +432,14 @@ exports.getRtoOrders = async (req, res) => {
       total,
       pending: 0,
       refunded: 0,
-      resolved: 0,
+      closed: 0,
       refund_failed: 0,
       refund_rejected: 0
     };
     for (const row of statusAgg) {
-      const key = String(row._id || 'pending').toLowerCase();
+      const key = normalizeRtoTerminalStatus(row._id || 'pending');
       if (key === 'refunded') summaryCounts.refunded = row.count;
-      else if (key === 'resolved') summaryCounts.resolved = row.count;
+      else if (key === 'closed') summaryCounts.closed += row.count;
       else if (key === 'refund_failed') summaryCounts.refund_failed = row.count;
       else if (key === 'refund_rejected') summaryCounts.refund_rejected = row.count;
       else summaryCounts.pending += row.count;
@@ -465,13 +490,14 @@ exports.processRtoRefund = async (req, res) => {
     const order = await findRtoOrderOrThrow(orderId, scopeMatch);
     const ri = order.returnInfo || {};
 
-    if (ri.rtoStatus === 'refund_rejected') {
+    const currentRtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus);
+    if (currentRtoStatus === 'refund_rejected') {
       throw createHttpError(400, 'RTO_ALREADY_REJECTED', 'RTO refund already rejected');
     }
-    if (ri.rtoStatus === 'resolved') {
+    if (currentRtoStatus === 'closed') {
       throw createHttpError(400, 'RTO_ALREADY_RESOLVED', 'RTO is already closed');
     }
-    if (ri.rtoStatus === 'refunded') {
+    if (currentRtoStatus === 'refunded') {
       throw createHttpError(400, 'RTO_ALREADY_REFUNDED', 'RTO refund already completed');
     }
     if (hasRtoRefundBeenInitiated(order)) {
@@ -484,9 +510,9 @@ exports.processRtoRefund = async (req, res) => {
         400,
         'RTO_REFUND_NOT_ELIGIBLE',
         calc.reason === 'cod_no_refund'
-          ? 'COD orders are not eligible for refund. Mark as resolved instead.'
+          ? 'COD orders are not eligible for refund. Close the case instead.'
           : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
-            ? 'Partial payment orders are not eligible for refund. Mark as resolved instead.'
+            ? 'Partial payment orders are not eligible for refund. Close the case instead.'
             : calc.reason === 'order_below_min_value'
               ? `Order total is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
               : calc.reason === 'refund_below_min_threshold'
@@ -562,7 +588,7 @@ exports.processRtoRefund = async (req, res) => {
  */
 exports.rejectRtoRefund = async (req, res) => {
   try {
-    const { orderId, note } = req.body || {};
+    const { orderId, note, action } = req.body || {};
     if (!orderId) {
       throw createHttpError(400, 'ORDER_ID_REQUIRED', 'orderId is required');
     }
@@ -570,11 +596,18 @@ exports.rejectRtoRefund = async (req, res) => {
     const scopeMatch = req.adminScope?.orderMatch || {};
     const order = await findRtoOrderOrThrow(orderId, scopeMatch);
     const ri = order.returnInfo || {};
+    const paymentType = classifyRtoPaymentType(order);
+    const requestedAction = normalizeRtoAdminAction(action, { paymentType });
+    const nextStatus = requestedAction === 'close' ? 'closed' : 'refund_rejected';
+    const currentRtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus);
 
-    if (ri.rtoStatus === 'refund_rejected') {
+    if (currentRtoStatus === 'refund_rejected') {
       throw createHttpError(400, 'RTO_ALREADY_REJECTED', 'RTO refund already rejected');
     }
-    if (ri.rtoStatus === 'refunded') {
+    if (currentRtoStatus === 'closed') {
+      throw createHttpError(400, 'RTO_ALREADY_RESOLVED', 'RTO case already closed');
+    }
+    if (currentRtoStatus === 'refunded') {
       throw createHttpError(400, 'RTO_ALREADY_REFUNDED', 'Order already refunded — cannot reject');
     }
     if (hasRtoRefundBeenInitiated(order)) {
@@ -584,17 +617,17 @@ exports.rejectRtoRefund = async (req, res) => {
     const providerStatus = order.shipmentInfo?.providerStatus || null;
     const reasonCategory = classifyRtoReasonCategory(providerStatus);
     const adminId = req.user?.id || req.user?._id || null;
-
-    const paymentType = classifyRtoPaymentType(order);
-    const isNoRefundCase = !paymentType.refundAllowed;
+    const isNoRefundCase = requestedAction === 'close' || !paymentType.refundAllowed;
 
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
-      rtoStatus: 'refund_rejected',
-      rtoRejectedAt: new Date(),
-      rtoRejectedBy: adminId,
+      rtoStatus: nextStatus,
+      rtoRejectedAt: requestedAction === 'reject' ? new Date() : ri.rtoRejectedAt || null,
+      rtoRejectedBy: requestedAction === 'reject' ? adminId : ri.rtoRejectedBy || null,
       rtoRejectionNote:
         note ||
-        (isNoRefundCase
+        (requestedAction === 'close'
+          ? 'RTO case closed by admin'
+          : isNoRefundCase
           ? 'RTO case closed — partial/COD, no Razorpay refund'
           : 'Refund denied by admin — no refund due'),
       rtoShiprocketReason: providerStatus,
@@ -602,10 +635,16 @@ exports.rejectRtoRefund = async (req, res) => {
     });
 
     appendRtoHistory(order, {
-      action: isNoRefundCase ? 'rto_case_closed' : 'refund_rejected',
-      note: note || (isNoRefundCase ? 'Case closed (no refund eligible)' : 'Admin denied refund'),
+      action: requestedAction === 'close' ? 'rto_case_closed' : 'refund_rejected',
+      note:
+        note ||
+        (requestedAction === 'close'
+          ? 'Case closed by admin'
+          : isNoRefundCase
+            ? 'Case closed (no refund eligible)'
+            : 'Admin denied refund'),
       performedBy: adminId,
-      metadata: { shiprocketReason: providerStatus, reasonCategory, noRazorpay: true }
+      metadata: { shiprocketReason: providerStatus, reasonCategory, noRazorpay: true, action: requestedAction }
     });
 
     order.markModified('returnInfo');
@@ -622,8 +661,10 @@ exports.rejectRtoRefund = async (req, res) => {
 
     return res.json({
       success: true,
-      message: isNoRefundCase
-        ? 'RTO case closed — no Razorpay refund (not eligible)'
+      message: requestedAction === 'close'
+        ? 'RTO case closed successfully'
+        : isNoRefundCase
+          ? 'RTO case closed — no Razorpay refund (not eligible)'
         : 'Refund denied — no money will be returned via Razorpay',
       data: { order: mapRtoOrderRow(order) }
     });
@@ -645,11 +686,12 @@ exports.bulkRtoAction = async (req, res) => {
     if (!Array.isArray(orderIds) || !orderIds.length) {
       throw createHttpError(400, 'ORDER_IDS_REQUIRED', 'orderIds array is required');
     }
-    if (!['refund', 'reject', 'resolve'].includes(act)) {
-      throw createHttpError(400, 'INVALID_BULK_ACTION', 'action must be refund or reject');
+    if (!['refund', 'reject', 'resolve', 'close'].includes(act)) {
+      throw createHttpError(400, 'INVALID_BULK_ACTION', 'action must be refund, reject, or close');
     }
 
-    const bulkReject = act === 'reject' || act === 'resolve';
+    const bulkReject = act === 'reject' || act === 'resolve' || act === 'close';
+    const bulkClose = act === 'close' || act === 'resolve';
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const results = [];
@@ -662,35 +704,45 @@ exports.bulkRtoAction = async (req, res) => {
         if (bulkReject) {
           const order = await findRtoOrderOrThrow(orderId, scopeMatch);
           const ri = order.returnInfo || {};
-          if (ri.rtoStatus === 'refund_rejected') {
+          const currentRtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus);
+          if (currentRtoStatus === 'refund_rejected') {
             results.push({ orderId, success: false, code: 'RTO_ALREADY_REJECTED', message: 'Already rejected' });
             continue;
           }
-          if (ri.rtoStatus === 'refunded' || hasRtoRefundBeenInitiated(order)) {
+          if (currentRtoStatus === 'closed') {
+            results.push({ orderId, success: false, code: 'RTO_ALREADY_RESOLVED', message: 'Already closed' });
+            continue;
+          }
+          if (currentRtoStatus === 'refunded' || hasRtoRefundBeenInitiated(order)) {
             results.push({ orderId, success: false, code: 'RTO_NOT_REJECTABLE', message: 'Already refunded or refund in progress' });
             continue;
           }
           const providerStatus = order.shipmentInfo?.providerStatus || null;
           const reasonCategory = classifyRtoReasonCategory(providerStatus);
+          const paymentType = classifyRtoPaymentType(order);
+          const requestedAction = bulkClose ? 'close' : normalizeRtoAdminAction(act, { paymentType });
+          const nextStatus = requestedAction === 'close' ? 'closed' : 'refund_rejected';
+          const isNoRefundCase = requestedAction === 'close' || !paymentType.refundAllowed;
           order.returnInfo = mergeReturnInfo(order.returnInfo, {
-            rtoStatus: 'refund_rejected',
-            rtoRejectedAt: new Date(),
-            rtoRejectedBy: adminId,
-            rtoRejectionNote: note || 'Bulk reject — no refund',
+            rtoStatus: nextStatus,
+            rtoRejectedAt: requestedAction === 'reject' ? new Date() : ri.rtoRejectedAt || null,
+            rtoRejectedBy: requestedAction === 'reject' ? adminId : ri.rtoRejectedBy || null,
+            rtoRejectionNote:
+              note ||
+              (requestedAction === 'close' ? 'Bulk close — no refund' : 'Bulk reject — no refund'),
             rtoShiprocketReason: providerStatus,
             rtoReasonCategory: reasonCategory
           });
           appendRtoHistory(order, {
-            action: 'bulk_refund_rejected',
-            note: note || 'Bulk reject',
+            action: requestedAction === 'close' ? 'bulk_rto_case_closed' : 'bulk_refund_rejected',
+            note: note || (requestedAction === 'close' ? 'Bulk close' : 'Bulk reject'),
             performedBy: adminId,
-            metadata: { shiprocketReason: providerStatus, reasonCategory }
+            metadata: { shiprocketReason: providerStatus, reasonCategory, action: requestedAction }
           });
           order.markModified('returnInfo');
           await order.save();
           try {
-            const payType = classifyRtoPaymentType(order);
-            await notifyRefundRejectedByAdmin(order, { isNoRefundCase: !payType.refundAllowed });
+            await notifyRefundRejectedByAdmin(order, { isNoRefundCase });
           } catch (notifyErr) {
             logger.warn('[rtoNotification] bulk reject notify failed', {
               orderId: order.orderId,
@@ -701,7 +753,8 @@ exports.bulkRtoAction = async (req, res) => {
         } else {
           const order = await findRtoOrderOrThrow(orderId, scopeMatch);
           const ri = order.returnInfo || {};
-          if (ri.rtoStatus === 'refunded' || ri.rtoStatus === 'resolved') {
+          const currentRtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus);
+          if (currentRtoStatus === 'refunded' || currentRtoStatus === 'closed') {
             results.push({ orderId, success: false, code: 'RTO_NOT_REFUNDABLE', message: 'Already refunded or resolved' });
             continue;
           }
@@ -810,7 +863,7 @@ exports.getRtoAnalytics = async (req, res) => {
 
     let pending = 0;
     let refunded = 0;
-    let resolved = 0;
+    let closed = 0;
     let refundFailed = 0;
     let customerRelated = 0;
     let courierRelated = 0;
@@ -820,9 +873,9 @@ exports.getRtoAnalytics = async (req, res) => {
 
     for (const o of orders) {
       syncRtoRefundStatusFromOrder(o);
-      const st = o.returnInfo?.rtoStatus || 'pending';
+      const st = normalizeRtoTerminalStatus(o.returnInfo?.rtoStatus || 'pending');
       if (st === 'refunded') refunded += 1;
-      else if (st === 'resolved') resolved += 1;
+      else if (st === 'closed') closed += 1;
       else if (st === 'refund_failed') refundFailed += 1;
       else pending += 1;
 
@@ -856,7 +909,7 @@ exports.getRtoAnalytics = async (req, res) => {
           totalRto: orders.length,
           pending,
           refunded,
-          resolved,
+          closed,
           refundFailed,
           customerRelated,
           courierRelated,

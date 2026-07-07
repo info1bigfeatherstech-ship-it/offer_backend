@@ -136,6 +136,7 @@ async function buildSearchFilter(search) {
   const or = [
     { orderId: { $regex: safe, $options: 'i' } },
     { 'shipmentInfo.shiprocketOrderId': { $regex: safe, $options: 'i' } },
+    { 'shipmentInfo.shiprocketPickupId': { $regex: safe, $options: 'i' } },
     { 'shipmentInfo.awbCode': { $regex: safe, $options: 'i' } },
     { 'shipmentInfo.trackingNumber': { $regex: safe, $options: 'i' } },
     { 'addressSnapshot.fullName': { $regex: safe, $options: 'i' } },
