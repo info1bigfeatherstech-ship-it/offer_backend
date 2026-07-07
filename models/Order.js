@@ -184,7 +184,7 @@ const orderSchema = new mongoose.Schema(
       /** RTO management (admin RTO tab — does not affect product-return flow) */
       rtoStatus: {
         type: String,
-        enum: ['pending', 'refunded', 'refund_failed', 'refund_rejected', 'resolved', null],
+        enum: ['pending', 'refunded', 'refund_failed', 'refund_rejected', 'closed', 'resolved', null],
         default: null
       },
       rtoRefundAmount: { type: Number, default: null },

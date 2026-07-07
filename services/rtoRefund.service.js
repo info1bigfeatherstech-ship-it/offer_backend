@@ -394,7 +394,7 @@ function syncRtoRefundStatusFromOrder(order) {
     order.returnInfo = {};
   }
   const ri = order.returnInfo;
-  if (ri.rtoStatus === 'resolved') return false;
+  if (['resolved', 'closed', 'refund_rejected'].includes(String(ri.rtoStatus || '').toLowerCase())) return false;
 
   let changed = false;
   if (!ri.rtoStatus) {

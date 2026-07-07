@@ -10,6 +10,7 @@ const logger = require('../utils/logger');
 const { releaseReservedInventoryForOrder } = require('./orderInventory.service');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { ensureShipmentForOrderExport } = require('../controllers/order.controller');
+const { mergeReturnInfo } = require('./rtoRefund.service');
 
 const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping' };
 
@@ -33,20 +34,33 @@ function normalizeTerminalUnpaidFinancials(order) {
 }
 
 /**
+ * @param {import('mongoose').Document|object} order
+ * @returns {number}
+ */
+function getCancelledOrderRefundAmount(order) {
+  const paymentStatus = String(order?.paymentStatus || '').toLowerCase();
+  if (paymentStatus === 'partially_paid') {
+    return Math.max(0, Number(order?.amountPaidInr) || 0);
+  }
+  if (paymentStatus === 'paid') {
+    return Math.max(0, Number(order?.totalAmount) || 0);
+  }
+  return 0;
+}
+
+/**
  * @param {import('mongoose').Document} order
  * @param {{ reason?: string }} [opts]
  */
 async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
-  const wasPaid = order.paymentStatus === 'paid' || order.paymentStatus === 'partially_paid';
+  const paymentStatus = String(order.paymentStatus || '').toLowerCase();
+  const wasPaid = paymentStatus === 'paid' || paymentStatus === 'partially_paid';
   const paymentId = order.paymentInfo?.razorpayPaymentId;
   if (!wasPaid || !paymentId || !razorpay) {
     return { refundAttempted: false, refundWarning: null };
   }
 
-  const refundAmountInr =
-    order.paymentStatus === 'partially_paid'
-      ? Math.max(0, Number(order.amountPaidInr) || 0)
-      : Number(order.totalAmount) || 0;
+  const refundAmountInr = getCancelledOrderRefundAmount(order);
   const refundPaise = Math.round(refundAmountInr * 100);
   if (refundPaise < 1) {
     return { refundAttempted: false, refundWarning: null };
@@ -63,22 +77,20 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
 
     order.paymentStatus =
       refundPaise >= Math.round((Number(order.totalAmount) || 0) * 100) ? 'refunded' : 'partially_refunded';
-    order.returnInfo = {
-      ...(order.returnInfo || {}),
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
       refundAmount: refundAmountInr,
       refundId: refund.id,
       status: 'refunded',
       approvedAt: new Date()
-    };
+    });
     await order.save();
     return { refundAttempted: true, refundWarning: null };
   } catch (refundError) {
-    order.returnInfo = {
-      ...(order.returnInfo || {}),
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
       status: 'refund_failed'
-    };
+    });
     order.paymentInfo = {
       ...(order.paymentInfo || {}),
       refundFailureReason: refundError?.message || 'Refund API failed'
@@ -258,31 +270,31 @@ async function runAdminCancelOrderSingle(orderId) {
       };
     }
 
-    const wasPaid = order.paymentStatus === 'paid';
+    const paymentStatus = String(order.paymentStatus || '').toLowerCase();
+    const wasFullyPaid = paymentStatus === 'paid';
+    const wasPartiallyPaid = paymentStatus === 'partially_paid';
+    const hadCapturedPayment = wasFullyPaid || wasPartiallyPaid;
     const canInitiateRefund =
-      (order.paymentStatus === 'paid' || order.paymentStatus === 'partially_paid') &&
+      hadCapturedPayment &&
       Boolean(order.paymentInfo?.razorpayPaymentId);
+    const refundAmountInr = canInitiateRefund ? getCancelledOrderRefundAmount(order) : 0;
 
     order.orderStatus = 'cancelled';
-    if (!wasPaid && String(order.paymentInfo?.method || '').toLowerCase() === 'online') {
+    if (!hadCapturedPayment && String(order.paymentInfo?.method || '').toLowerCase() === 'online') {
       order.paymentStatus = 'failed';
     }
     normalizeTerminalUnpaidFinancials(order);
     order.paymentInfo = order.paymentInfo || {};
     order.paymentInfo.cancellationReason = 'admin_cancelled';
     order.paymentInfo.cancelledAt = new Date();
-    order.returnInfo = {
-      ...(order.returnInfo || {}),
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
-      status: canInitiateRefund ? 'refund_pending' : wasPaid ? 'refund_unavailable' : 'not_required',
+      status: canInitiateRefund ? 'refund_pending' : hadCapturedPayment ? 'refund_unavailable' : 'not_required',
       requestedAt: new Date(),
-      refundAmount: canInitiateRefund
-        ? order.paymentStatus === 'partially_paid'
-          ? Number(order.amountPaidInr) || 0
-          : order.totalAmount
-        : order.returnInfo?.refundAmount || 0
-    };
+      refundAmount: canInitiateRefund ? refundAmountInr : order.returnInfo?.refundAmount || 0
+    });
     order.markModified('paymentInfo');
+    order.markModified('returnInfo');
 
     await order.save({ session });
     await releaseReservedInventoryForOrder(order, session);
