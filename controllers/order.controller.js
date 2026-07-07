@@ -476,6 +476,12 @@ async function upsertShipmentInfo({
     if (shipmentPayload.estimatedDelivery) {
         nextShipmentInfo.estimatedDelivery = shipmentPayload.estimatedDelivery;
     }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'manifestDownloaded')) {
+        nextShipmentInfo.manifestDownloaded = Boolean(shipmentPayload.manifestDownloaded);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'labelDownloaded')) {
+        nextShipmentInfo.labelDownloaded = Boolean(shipmentPayload.labelDownloaded);
+    }
 
     const providerStatus = shipmentPayload.providerStatus || shipmentPayload.currentStatus || null;
     if (providerStatus) {
@@ -1878,7 +1884,34 @@ exports.razorpayWebhook = async (req, res) => {
             case 'refund.processed': {
                 const refund = payload.refund.entity;
                 const refundOrder = await Order.findOne({ 'paymentInfo.razorpayPaymentId': refund.payment_id });
-                await applyRefundEntryToOrder(refundOrder, refund);
+                if (refundOrder) {
+                    await applyRefundEntryToOrder(refundOrder, refund);
+                    try {
+                        const { handleRazorpayRefundForRtoNotifications } = require('../services/rtoNotification.service');
+                        await handleRazorpayRefundForRtoNotifications(refundOrder, refund, event);
+                    } catch (notifyErr) {
+                        logger.warn('[rtoNotification] Razorpay refund notify failed', {
+                            message: notifyErr.message,
+                            event
+                        });
+                    }
+                }
+                break;
+            }
+
+            case 'refund.failed': {
+                const refund = payload.refund.entity;
+                const refundOrder = await Order.findOne({ 'paymentInfo.razorpayPaymentId': refund.payment_id });
+                if (refundOrder) {
+                    try {
+                        const { handleRazorpayRefundForRtoNotifications } = require('../services/rtoNotification.service');
+                        await handleRazorpayRefundForRtoNotifications(refundOrder, refund, event);
+                    } catch (notifyErr) {
+                        logger.warn('[rtoNotification] Razorpay refund failed notify error', {
+                            message: notifyErr.message
+                        });
+                    }
+                }
                 break;
             }
 
@@ -1912,6 +1945,9 @@ exports.shiprocketWebhook = async (req, res) => {
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found for webhook payload');
         }
+
+        const previousProviderStatus = order.shipmentInfo?.providerStatus || null;
+        const previousOrderStatus = order.orderStatus;
 
         const providerStatus =
             payload.current_status ||
@@ -1995,6 +2031,20 @@ exports.shiprocketWebhook = async (req, res) => {
             }
             order.markModified('returnInfo');
             await order.save();
+        }
+
+        try {
+            const { handleShiprocketWebhookForRtoNotifications } = require('../services/rtoNotification.service');
+            await handleShiprocketWebhookForRtoNotifications({
+                orderId: order.orderId,
+                previousProviderStatus,
+                previousOrderStatus
+            });
+        } catch (notifyErr) {
+            logger.warn('[rtoNotification] Shiprocket webhook notify failed', {
+                orderId: order.orderId,
+                message: notifyErr.message
+            });
         }
 
         return res.json({ success: true });

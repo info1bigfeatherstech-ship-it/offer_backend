@@ -232,6 +232,15 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.retryPickup = false;
   }
 
+  const manifestDownloaded = Boolean(si.manifestDownloaded);
+  const labelDownloaded = Boolean(si.labelDownloaded);
+
+  if (caps.downloadManifest && !terminal && !inTransit && (st === 'processing' || st === 'confirmed')) {
+    if (!manifestDownloaded) {
+      caps.downloadLabel = false;
+    }
+  }
+
   const primaryAction = resolvePrimaryActionKey(caps);
   const nextStepMessage = buildNextStepMessage(opsState, blockReasons, primaryAction);
 

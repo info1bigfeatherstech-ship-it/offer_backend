@@ -46,10 +46,10 @@ const orderSchema = new mongoose.Schema(
     /** Checkout channel at order place (for ID prefix + admin scope) */
     storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
     
-    orderStatus: { 
-      type: String, 
-      enum: ['pending', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed', 'rto'], 
-      default: 'pending' 
+    orderStatus: {
+      type: String,
+      enum: ['pending', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed', 'rto', 'pickup_exception'],
+      default: 'pending'
     },
     
     paymentStatus: { 
@@ -102,6 +102,8 @@ const orderSchema = new mongoose.Schema(
       labelUrl: String,
       /** Shiprocket handover manifest PDF URL */
       manifestUrl: { type: String, default: null },
+      manifestDownloaded: { type: Boolean, default: false },
+      labelDownloaded: { type: Boolean, default: false },
       manifestGeneratedAt: Date,
       fulfillmentArtifactAwb: { type: String, default: null },
       fulfillmentLabelAwb: { type: String, default: null },
@@ -177,7 +179,51 @@ const orderSchema = new mongoose.Schema(
         default: []
       },
       userLastRead: { type: Date, default: null },
-      adminLastRead: { type: Date, default: null }
+      adminLastRead: { type: Date, default: null },
+
+      /** RTO management (admin RTO tab — does not affect product-return flow) */
+      rtoStatus: {
+        type: String,
+        enum: ['pending', 'refunded', 'refund_failed', 'refund_rejected', 'resolved', null],
+        default: null
+      },
+      rtoRefundAmount: { type: Number, default: null },
+      rtoRefundId: { type: String, default: null },
+      rtoRefundedAt: { type: Date, default: null },
+      rtoResolvedAt: { type: Date, default: null },
+      rtoResolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rtoRejectedAt: { type: Date, default: null },
+      rtoRejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rtoRejectionNote: { type: String, default: null },
+      /** Exact Shiprocket carrier label at classification time */
+      rtoShiprocketReason: { type: String, default: null },
+      rtoReasonCategory: {
+        type: String,
+        enum: ['customer', 'courier', 'unknown', null],
+        default: null
+      },
+      rtoRefundError: { type: String, default: null },
+      rtoDeductions: {
+        forwardShipping: { type: Number, default: 0 },
+        rtoShipping: { type: Number, default: 0 },
+        platformFee: { type: Number, default: 0 },
+        platformFeePercent: { type: Number, default: 0 },
+        orderTotal: { type: Number, default: 0 },
+        cartValue: { type: Number, default: 0 }
+      },
+      rtoShippingCharges: { type: Number, default: null },
+      rtoHistory: {
+        type: [
+          {
+            action: { type: String, required: true },
+            note: { type: String, default: null },
+            performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+            createdAt: { type: Date, default: Date.now },
+            metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+          }
+        ],
+        default: []
+      }
     },
     appliedCoupon: {
         code: { type: String },

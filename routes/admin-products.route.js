@@ -55,6 +55,7 @@ router.post('/import-csv', uploadCSVFile, productController.importProductsFromCS
 router.get('/download-error-report/:fileName', productController.downloadErrorReport);
 router.post('/bulk-new-products', uploadBulkNewProductFiles, productController.bulkUploadNewProductsWithImages);
 router.patch('/bulk-status', productController.bulkUpdateProductStatus);
+router.get('/bulk-upload-template', productController.downloadBulkUploadTemplate);
 
 // =============================================
 // LIST & FILTER ROUTES (Specific paths)
@@ -65,6 +66,7 @@ router.patch('/bulk-restore', productController.bulkRestore);
 router.get('/low-stock', productController.getLowStockProducts);
 router.get('/drafts', productController.getDraftProducts);
 router.get('/all', productController.getAllProductsAdmin);
+router.get('/export-csv', productController.exportProductsCSV);
 router.delete('/bulk-hard-delete', productController.bulkHardDelete);
 router.get('/active', productController.getAllActiveProducts);
             

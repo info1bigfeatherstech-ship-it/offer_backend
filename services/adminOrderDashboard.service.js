@@ -112,14 +112,50 @@ function resolveDateRange(q) {
  * @param {string | undefined} search
  * @returns {object | null}
  */
-function buildSearchFilter(search) {
+async function buildSearchFilter(search) {
   const raw = String(search || '').trim();
   if (!raw) return null;
   const safe = escapeRegex(raw);
   const digits = raw.replace(/\D/g, '');
-  const or = [{ orderId: { $regex: safe, $options: 'i' } }];
+
+  let matchedProductIds = [];
+  try {
+    const Product = require('../models/Product');
+    const matchedProducts = await Product.find(
+      { 'variants.sku': { $regex: safe, $options: 'i' } },
+      '_id'
+    ).lean();
+    if (matchedProducts && matchedProducts.length > 0) {
+      matchedProductIds = matchedProducts.map((p) => p._id);
+    }
+  } catch (err) {
+    const logger = require('../utils/logger');
+    logger.error('Failed to search product SKUs for search filter', err);
+  }
+
+  const or = [
+    { orderId: { $regex: safe, $options: 'i' } },
+    { 'shipmentInfo.shiprocketOrderId': { $regex: safe, $options: 'i' } },
+    { 'shipmentInfo.awbCode': { $regex: safe, $options: 'i' } },
+    { 'shipmentInfo.trackingNumber': { $regex: safe, $options: 'i' } },
+    { 'addressSnapshot.fullName': { $regex: safe, $options: 'i' } },
+    { 'addressSnapshot.name': { $regex: safe, $options: 'i' } },
+    { 'addressSnapshot.firstName': { $regex: safe, $options: 'i' } },
+    { 'addressSnapshot.lastName': { $regex: safe, $options: 'i' } },
+    { 'shippingWeightSnapshot.lines.sku': { $regex: safe, $options: 'i' } }
+  ];
+
+  if (matchedProductIds.length > 0) {
+    or.push({ 'items.productId': { $in: matchedProductIds } });
+  }
+
   if (digits.length >= 4) {
-    or.push({ 'addressSnapshot.phone': { $regex: escapeRegex(digits), $options: 'i' } });
+    const digitsSafe = escapeRegex(digits);
+    or.push(
+      { 'addressSnapshot.phone': { $regex: digitsSafe, $options: 'i' } },
+      { 'addressSnapshot.mobile': { $regex: digitsSafe, $options: 'i' } },
+      { 'addressSnapshot.phoneNumber': { $regex: digitsSafe, $options: 'i' } }
+    );
   }
   return { $or: or };
 }
@@ -134,6 +170,32 @@ function buildBucketMatch(bucket) {
   }
   if (b === 'rto') {
     return buildRtoBucketMatch();
+  }
+  if (b === 'ready_to_pick') {
+    const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
+    const match = {
+      orderStatus: 'processing',
+      'shipmentInfo.manifestDownloaded': true,
+      'shipmentInfo.labelDownloaded': true
+    };
+    if (rtoExclude) {
+      return { $and: [match, rtoExclude] };
+    }
+    return match;
+  }
+  if (b === 'ready_to_ship') {
+    const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
+    const match = {
+      orderStatus: 'processing',
+      $or: [
+        { 'shipmentInfo.manifestDownloaded': { $ne: true } },
+        { 'shipmentInfo.labelDownloaded': { $ne: true } }
+      ]
+    };
+    if (rtoExclude) {
+      return { $and: [match, rtoExclude] };
+    }
+    return match;
   }
   const statuses = BUCKET_TO_ORDER_STATUSES[/** @type {keyof typeof BUCKET_TO_ORDER_STATUSES} */ (b)];
   if (!statuses) {
@@ -228,13 +290,35 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
   const { RTO_PROVIDER_STATUS_REGEX } = require('../constants/rtoOrderQuery');
   const rtoProviderMatch = { $regex: RTO_PROVIDER_STATUS_REGEX, $options: 'i' };
 
-  const [rtoCount, legacyRtoInCancelled, legacyRtoInDelivered] = await Promise.all([
+  const [rtoCount, legacyRtoInCancelled, legacyRtoInDelivered, readyToPickCount, readyToShipCount] = await Promise.all([
     Order.countDocuments({ $and: [baseMatch, buildRtoBucketMatch()] }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'cancelled', 'shipmentInfo.providerStatus': rtoProviderMatch }]
     }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': rtoProviderMatch }]
+    }),
+    Order.countDocuments({
+      $and: [
+        baseMatch,
+        {
+          orderStatus: 'processing',
+          'shipmentInfo.manifestDownloaded': true,
+          'shipmentInfo.labelDownloaded': true
+        }
+      ]
+    }),
+    Order.countDocuments({
+      $and: [
+        baseMatch,
+        {
+          orderStatus: 'processing',
+          $or: [
+            { 'shipmentInfo.manifestDownloaded': { $ne: true } },
+            { 'shipmentInfo.labelDownloaded': { $ne: true } }
+          ]
+        }
+      ]
     })
   ]);
 
@@ -242,7 +326,8 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     all: t.totalOrders || 0,
     new: byStatus.pending || 0,
     bill_sent: byStatus.confirmed || 0,
-    ready_to_pick: byStatus.processing || 0,
+    ready_to_ship: readyToShipCount,
+    ready_to_pick: readyToPickCount,
     in_transit: (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0),
     completed:
       Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered) + (byStatus.return_requested || 0),
@@ -295,10 +380,19 @@ function mapOrderRow(order) {
     '';
   const itemCount = Array.isArray(o.items) ? o.items.length : 0;
   const si = o.shipmentInfo || {};
-  const bucketKey =
+  let bucketKey =
     isRtoProviderStatus(si.providerStatus) || o.orderStatus === 'rto'
       ? 'rto'
       : fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
+  if (bucketKey === 'ready_to_pick' || bucketKey === 'ready_to_ship') {
+    const manifestDownloaded = Boolean(si.manifestDownloaded);
+    const labelDownloaded = Boolean(si.labelDownloaded);
+    if (manifestDownloaded && labelDownloaded) {
+      bucketKey = 'ready_to_pick';
+    } else {
+      bucketKey = 'ready_to_ship';
+    }
+  }
   const financials = normalizeFinancialView(o);
   const hasAwb = Boolean(si.awbCode || si.trackingNumber);
   const hasShipmentId = Boolean(si.shipmentId);
@@ -364,6 +458,8 @@ function mapOrderRow(order) {
     courier: si.courier || null,
     providerStatus: si.providerStatus || null,
     awbCode: si.awbCode || si.trackingNumber || null,
+    manifestDownloaded: Boolean(si.manifestDownloaded),
+    labelDownloaded: Boolean(si.labelDownloaded),
     canConfirmForFulfillment,
     courierOpsLine1: fulfillmentUi.courierOpsLine1,
     courierOpsLine2: fulfillmentUi.courierOpsLine2,

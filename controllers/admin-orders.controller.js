@@ -106,7 +106,7 @@ exports.getOrdersList = async (req, res) => {
 
     const dateMatch = { createdAt: { $gte: range.from, $lte: range.to } };
     const scopeMatch = req.adminScope?.orderMatch || {};
-    const search = buildSearchFilter(req.query.search);
+    const search = await buildSearchFilter(req.query.search);
     /** Global search: skip status bucket so order ID / phone matches any tab (incl. cancelled). */
     const bucket = search ? {} : buildBucketMatch(req.query.bucket);
     const filter = mergeFilters(
