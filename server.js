@@ -49,6 +49,7 @@ const wishlistRoutes = require('./routes/wishlist.route');
 const cartRoutes = require('./routes/cart.route');
 const addressRoutes = require('./routes/address.route');
 const adminAnalyticsRoutes = require('./routes/admin-analytics.route');
+const seoAnalyticsRoutes = require('./routes/seo-analytics.route');
 const adminOrdersRoutes = require('./routes/admin-orders.route');
 const adminRtoRoutes = require('./routes/admin-rto.route');
 const userNotificationRoutes = require('./routes/user-notification.route');
@@ -712,6 +713,7 @@ app.get('/api', (req, res) => {
       addresses: '/api/addresses',
       adminProducts: '/api/admin/products',
       adminAnalytics: '/api/admin/analytics',
+      adminSeoAnalytics: '/api/admin/seo-analytics',
       adminOrders: '/api/admin/orders',
       publicRazorpayKey: '/api/public/razorpay-key',
       orders: '/api/orders',
@@ -735,6 +737,7 @@ app.use('/api/wishlist', wishlistRoutes);
 app.use('/api/cart', cartRoutes);
 app.use('/api/addresses', addressRoutes);
 app.use('/api/admin/analytics', adminAnalyticsRoutes);
+app.use('/api/admin/seo-analytics', seoAnalyticsRoutes);
 app.use('/api/admin/orders', adminOrdersRoutes);
 app.use('/api/admin/rto', adminRtoRoutes);
 app.use('/api/admin/staff', staffRoutes);

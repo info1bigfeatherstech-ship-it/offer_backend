@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 
 const DATE_RANGE_MAP = {
@@ -16,7 +18,7 @@ const KNOWN_SOURCE_GROUPS = [
   'youtube',
   'linkedin',
   'tiktok'
-]; 
+];
 
 const isBlankValue = (value) => {
   return value === undefined || value === null || value === '' || value === '(not set)';
@@ -30,6 +32,19 @@ const parseNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+/** GA4 may return bounce as 0–1 ratio or already as 0–100. Normalize to 0–100. */
+const normalizeBounceRate = (value) => {
+  const n = parseNumber(value);
+  if (n <= 0) return 0;
+  return n <= 1 ? n * 100 : n;
+};
+
+const createConfigError = (message) => {
+  const error = new Error(message);
+  error.statusCode = 503;
+  return error;
+};
+
 class seoAnalyticsService {
   constructor() {
     this.initializeConfig();
@@ -38,15 +53,21 @@ class seoAnalyticsService {
 
   initializeConfig() {
     if (!process.env.GA_PROPERTY_ID) {
-      const error = new Error('GA_PROPERTY_ID environment variable must be set');
-      error.statusCode = 500;
-      throw error;
+      throw createConfigError('GA_PROPERTY_ID environment variable must be set');
     }
 
     if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      const error = new Error('GOOGLE_APPLICATION_CREDENTIALS environment variable must be set');
-      error.statusCode = 500;
-      throw error;
+      throw createConfigError('GOOGLE_APPLICATION_CREDENTIALS environment variable must be set');
+    }
+
+    const credentialsPath = path.isAbsolute(process.env.GOOGLE_APPLICATION_CREDENTIALS)
+      ? process.env.GOOGLE_APPLICATION_CREDENTIALS
+      : path.resolve(process.cwd(), process.env.GOOGLE_APPLICATION_CREDENTIALS);
+
+    if (!fs.existsSync(credentialsPath)) {
+      throw createConfigError(
+        `GA credentials file not found at ${credentialsPath}. Place ga-credentials.json and restart is not required — fix the file path.`
+      );
     }
 
     this.propertyId = process.env.GA_PROPERTY_ID;
@@ -71,13 +92,18 @@ class seoAnalyticsService {
   }
 
   async runReport(reportOptions) {
-    const request = {
-      property: this.getPropertyName(),
-      ...reportOptions
-    };
-
-    const response = await this.client.runReport(request);
-    return response;
+    try {
+      const [response] = await this.client.runReport({
+        property: this.getPropertyName(),
+        ...reportOptions
+      });
+      return response;
+    } catch (error) {
+      if (error.statusCode) throw error;
+      const wrapped = new Error(error.message || 'Google Analytics request failed');
+      wrapped.statusCode = 503;
+      throw wrapped;
+    }
   }
 
   async getOverview() {
@@ -99,7 +125,7 @@ class seoAnalyticsService {
       totalUsers: parseNumber(metricValues[0]?.value),
       newUsers: parseNumber(metricValues[1]?.value),
       activeUsers: parseNumber(metricValues[2]?.value),
-      bounceRate: parseNumber(metricValues[3]?.value),
+      bounceRate: normalizeBounceRate(metricValues[3]?.value),
       averageSessionDuration: parseNumber(metricValues[4]?.value)
     };
   }
@@ -112,7 +138,8 @@ class seoAnalyticsService {
         { name: 'activeUsers' },
         { name: 'sessions' },
         { name: 'newUsers' }
-      ]
+      ],
+      orderBys: [{ dimension: { dimensionName: 'date' } }]
     });
 
     return (response.rows || []).map((row) => {
@@ -224,4 +251,4 @@ class seoAnalyticsService {
   }
 }
 
-module.exports =seoAnalyticsService;
+module.exports = seoAnalyticsService;
