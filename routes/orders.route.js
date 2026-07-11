@@ -28,6 +28,7 @@ const {
   getReturnChat
 } = require('../controllers/order.controller');
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
+const adminPendingOrderEdit = require('../controllers/admin-pending-order-edit.controller');
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
 
@@ -114,6 +115,18 @@ router.post(
   adminFulfillment.adminReturnReversePickupRetry
 );
 
+router.post(
+  '/admin/items/:orderId/edit-pending/preview',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminPendingOrderEdit.previewPendingOrderEdit
+);
+router.post(
+  '/admin/items/:orderId/edit-pending',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminPendingOrderEdit.applyPendingOrderEdit
+);
 router.post(
   '/admin/items/bulk-approval/confirm',
   verifyToken,

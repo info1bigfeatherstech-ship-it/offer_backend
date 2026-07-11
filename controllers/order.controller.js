@@ -2486,7 +2486,12 @@ exports.getOrder = async (req, res) => {
         const transformedOrder = order.toObject();
         normalizeTerminalUnpaidFinancials(transformedOrder);
 
-        transformedOrder.items = transformedOrder.items.map((item) => {
+        const isCancelledUnavailable =
+            String(transformedOrder.orderStatus || '').toLowerCase() === 'cancelled' &&
+            (Boolean(transformedOrder.paymentInfo?.itemsUnavailableCancel) ||
+                String(transformedOrder.paymentInfo?.cancellationReason || '') === 'admin_amended_empty');
+
+        transformedOrder.items = (transformedOrder.items || []).map((item) => {
             const product = item.productId;
             const variant = product?.variants?.find((v) => String(v._id) === String(item.variantId));
             const firstImg = Array.isArray(variant?.images) ? variant.images[0] : null;
@@ -2502,6 +2507,8 @@ exports.getOrder = async (req, res) => {
                 sku: variant?.sku || null,
                 thumbnailUrl,
                 lineTotal: Number(item.priceSnapshot?.total) || 0,
+                unavailable: isCancelledUnavailable,
+                lineStatus: isCancelledUnavailable ? 'cancelled_unavailable' : 'active',
                 productId: {
                     _id: product?._id,
                     name: product?.name,
@@ -2510,6 +2517,74 @@ exports.getOrder = async (req, res) => {
                 }
             };
         });
+
+        // Heal legacy empty-cancel rows that wiped items — rebuild display from edit history / notes.
+        if (
+            (!transformedOrder.items || transformedOrder.items.length === 0) &&
+            String(transformedOrder.orderStatus || '').toLowerCase() === 'cancelled'
+        ) {
+            const historyChanges =
+                (transformedOrder.adminEditHistory || [])
+                    .filter((h) => h?.action === 'cancel_empty_after_edit')
+                    .flatMap((h) => (Array.isArray(h?.metadata?.changes) ? h.metadata.changes : [])) || [];
+            const noteChanges =
+                (transformedOrder.customerFacingNotes || [])
+                    .filter((n) => n?.kind === 'order_cancelled_empty')
+                    .flatMap((n) => (Array.isArray(n?.metadata?.changes) ? n.metadata.changes : [])) || [];
+            const changes = historyChanges.length ? historyChanges : noteChanges;
+            if (changes.length) {
+                transformedOrder.items = changes.map((c) => ({
+                    productId: {
+                        _id: c.productId || null,
+                        name: c.productName || 'Product',
+                        slug: null,
+                        images: []
+                    },
+                    variantId: c.variantId || null,
+                    quantity: Number(c.oldQuantity) || 1,
+                    priceSnapshot: {
+                        base: null,
+                        sale: null,
+                        total: Number(c.amountRemovedInr) || 0
+                    },
+                    sku: null,
+                    thumbnailUrl: null,
+                    lineTotal: Number(c.amountRemovedInr) || 0,
+                    unavailable: true,
+                    lineStatus: 'cancelled_unavailable'
+                }));
+                // Restore money display from history `before` when totals were zeroed.
+                const beforeSnap =
+                    (transformedOrder.adminEditHistory || []).find((h) => h?.action === 'cancel_empty_after_edit')
+                        ?.before || null;
+                if (
+                    beforeSnap &&
+                    Number(transformedOrder.totalAmount) === 0 &&
+                    Number(beforeSnap.totalAmount) > 0
+                ) {
+                    transformedOrder.subtotal = beforeSnap.subtotal;
+                    transformedOrder.deliveryCharges = beforeSnap.deliveryCharges;
+                    transformedOrder.tax = beforeSnap.tax;
+                    transformedOrder.discount = beforeSnap.discount;
+                    transformedOrder.totalAmount = beforeSnap.totalAmount;
+                    transformedOrder._displayTotalsRestored = true;
+                }
+            }
+        }
+
+        transformedOrder.removedItemsArchive = Array.isArray(transformedOrder.removedItemsArchive)
+            ? transformedOrder.removedItemsArchive.map((row) => ({
+                  ...row,
+                  lineTotal: Number(row?.priceSnapshot?.total) || 0,
+                  unavailable: true,
+                  lineStatus: 'removed'
+              }))
+            : [];
+
+        // Hide internal admin audit from customer responses.
+        if (!isOrderStaff) {
+            delete transformedOrder.adminEditHistory;
+        }
 
         if (isOrderStaff && transformedOrder.userId && typeof transformedOrder.userId === 'object') {
             transformedOrder.customer = {
@@ -2566,7 +2641,7 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();
