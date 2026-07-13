@@ -267,6 +267,70 @@ const orderSchema = new mongoose.Schema(
       },
       /** checkout | catalog_fallback (legacy display only) */
       source: { type: String, default: 'checkout' }
+    },
+
+    /**
+     * Lines removed by admin before accept (OOS / qty cut).
+     * Kept for customer order history even after they leave `items`.
+     */
+    removedItemsArchive: {
+      type: [
+        {
+          productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null },
+          variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          productName: { type: String, default: 'Product' },
+          sku: { type: String, default: null },
+          quantity: { type: Number, default: 0 },
+          priceSnapshot: {
+            base: { type: Number, default: null },
+            sale: { type: Number, default: null },
+            total: { type: Number, default: null }
+          },
+          reason: {
+            type: String,
+            enum: ['unavailable', 'qty_reduced', 'order_cancelled_empty'],
+            default: 'unavailable'
+          },
+          removedAt: { type: Date, default: Date.now }
+        }
+      ],
+      default: []
+    },
+
+    /**
+     * Permanent English customer-facing notes (admin pending-order edits, refunds, etc.).
+     * Never auto-removed — shown on user order detail.
+     */
+    customerFacingNotes: {
+      type: [
+        {
+          message: { type: String, required: true, trim: true },
+          kind: {
+            type: String,
+            enum: ['order_amended', 'item_unavailable_refund', 'order_cancelled_empty', 'info'],
+            default: 'info'
+          },
+          createdAt: { type: Date, default: Date.now },
+          metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+        }
+      ],
+      default: []
+    },
+
+    /** Admin audit trail for pending-order line edits (internal) */
+    adminEditHistory: {
+      type: [
+        {
+          action: { type: String, required: true },
+          note: { type: String, default: null },
+          performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+          createdAt: { type: Date, default: Date.now },
+          before: { type: mongoose.Schema.Types.Mixed, default: null },
+          after: { type: mongoose.Schema.Types.Mixed, default: null },
+          metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+        }
+      ],
+      default: []
     }
   },
   { timestamps: true }

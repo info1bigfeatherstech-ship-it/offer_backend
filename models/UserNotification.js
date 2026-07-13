@@ -17,7 +17,8 @@ const userNotificationSchema = new mongoose.Schema(
         'refund_processed',
         'refund_rejected',
         'refund_not_applicable',
-        'refund_failed'
+        'refund_failed',
+        'order_amended'
       ],
       required: true
     },

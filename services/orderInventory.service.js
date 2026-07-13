@@ -33,11 +33,15 @@ function didCheckoutReserveStock(variant) {
  * @param {import('mongoose').ClientSession | null} [session]
  * @returns {Promise<void>}
  */
-async function releaseReservedInventoryForOrder(order, session = null) {
-  const items = order?.items;
-  if (!Array.isArray(items) || items.length === 0) return;
+/**
+ * Release reserved stock for specific lines (qty = units to return to catalog).
+ * @param {Array<{ productId: unknown, variantId: unknown, quantity: number }>} lines
+ * @param {import('mongoose').ClientSession | null} [session]
+ */
+async function releaseReservedInventoryForLines(lines, session = null) {
+  if (!Array.isArray(lines) || lines.length === 0) return;
 
-  for (const item of items) {
+  for (const item of lines) {
     const pid = toObjectId(item.productId?._id || item.productId);
     const vid = toObjectId(item.variantId?._id || item.variantId);
     if (!pid || !vid) {
@@ -101,4 +105,15 @@ async function releaseReservedInventoryForOrder(order, session = null) {
   }
 }
 
-module.exports = { releaseReservedInventoryForOrder };
+/**
+ * @param {import('mongoose').Document | object} order — must have `items` with productId, variantId, quantity
+ * @param {import('mongoose').ClientSession | null} [session]
+ * @returns {Promise<void>}
+ */
+async function releaseReservedInventoryForOrder(order, session = null) {
+  const items = order?.items;
+  if (!Array.isArray(items) || items.length === 0) return;
+  await releaseReservedInventoryForLines(items, session);
+}
+
+module.exports = { releaseReservedInventoryForOrder, releaseReservedInventoryForLines };

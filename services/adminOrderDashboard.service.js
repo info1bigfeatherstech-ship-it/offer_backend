@@ -8,7 +8,7 @@ const {
   PIPELINE_ORDER_STATUSES,
   GMV_EXCLUDED_ORDER_STATUSES,
   fulfillmentBucketKeyFromOrderStatus,
-  fulfillmentLabelFromOrderStatus,
+  fulfillmentLabelForAdminListRow,
   paymentLabelForUi
 } = require('../constants/adminOrderFulfillmentBuckets');
 const {
@@ -17,6 +17,11 @@ const {
   repairOrderStatusForShiprocketRto,
   isRtoProviderStatus
 } = require('../constants/rtoOrderQuery');
+const {
+  buildPickupExceptionBucketMatch,
+  buildPickupExceptionExclusionForNonExceptionBucket,
+  isPickupExceptionAdminBucketOrder
+} = require('../constants/pickupExceptionOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmentUi');
 
@@ -162,6 +167,18 @@ async function buildSearchFilter(search) {
 }
 
 /**
+ * Compose Mongo `$and` from non-null filter parts.
+ * @param {...(import('mongoose').FilterQuery<any>|null|undefined)} parts
+ * @returns {import('mongoose').FilterQuery<any>}
+ */
+function andFilters(...parts) {
+  const filtered = parts.filter((p) => p && typeof p === 'object' && Object.keys(p).length > 0);
+  if (filtered.length === 0) return {};
+  if (filtered.length === 1) return filtered[0];
+  return { $and: filtered };
+}
+
+/**
  * @param {string | undefined} bucket
  */
 function buildBucketMatch(bucket) {
@@ -172,20 +189,22 @@ function buildBucketMatch(bucket) {
   if (b === 'rto') {
     return buildRtoBucketMatch();
   }
+  if (b === 'pickup_exception') {
+    return buildPickupExceptionBucketMatch();
+  }
   if (b === 'ready_to_pick') {
-    const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
     const match = {
       orderStatus: 'processing',
       'shipmentInfo.manifestDownloaded': true,
       'shipmentInfo.labelDownloaded': true
     };
-    if (rtoExclude) {
-      return { $and: [match, rtoExclude] };
-    }
-    return match;
+    return andFilters(
+      match,
+      buildRtoExclusionForNonRtoBucket(b),
+      buildPickupExceptionExclusionForNonExceptionBucket(b)
+    );
   }
   if (b === 'ready_to_ship') {
-    const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
     const match = {
       orderStatus: 'processing',
       $or: [
@@ -193,10 +212,11 @@ function buildBucketMatch(bucket) {
         { 'shipmentInfo.labelDownloaded': { $ne: true } }
       ]
     };
-    if (rtoExclude) {
-      return { $and: [match, rtoExclude] };
-    }
-    return match;
+    return andFilters(
+      match,
+      buildRtoExclusionForNonRtoBucket(b),
+      buildPickupExceptionExclusionForNonExceptionBucket(b)
+    );
   }
   const statuses = BUCKET_TO_ORDER_STATUSES[/** @type {keyof typeof BUCKET_TO_ORDER_STATUSES} */ (b)];
   if (!statuses) {
@@ -205,12 +225,12 @@ function buildBucketMatch(bucket) {
     err.code = 'INVALID_BUCKET';
     throw err;
   }
-  const rtoExclude = buildRtoExclusionForNonRtoBucket(b);
   const statusMatch = { orderStatus: { $in: statuses } };
-  if (rtoExclude) {
-    return { $and: [statusMatch, rtoExclude] };
-  }
-  return statusMatch;
+  return andFilters(
+    statusMatch,
+    buildRtoExclusionForNonRtoBucket(b),
+    buildPickupExceptionExclusionForNonExceptionBucket(b)
+  );
 }
 
 /**
@@ -291,48 +311,59 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
   const { RTO_PROVIDER_STATUS_REGEX } = require('../constants/rtoOrderQuery');
   const rtoProviderMatch = { $regex: RTO_PROVIDER_STATUS_REGEX, $options: 'i' };
 
-  const [rtoCount, legacyRtoInCancelled, legacyRtoInDelivered, readyToPickCount, readyToShipCount] = await Promise.all([
+  const pickupExceptionExclude = buildPickupExceptionExclusionForNonExceptionBucket('ready_to_ship');
+  const confirmedPickupExceptionExclude =
+    buildPickupExceptionExclusionForNonExceptionBucket('bill_sent');
+
+  const [
+    rtoCount,
+    pickupExceptionCount,
+    legacyRtoInCancelled,
+    legacyRtoInDelivered,
+    readyToPickCount,
+    readyToShipCount,
+    confirmedWithoutPickupExceptionCount
+  ] = await Promise.all([
     Order.countDocuments({ $and: [baseMatch, buildRtoBucketMatch()] }),
+    Order.countDocuments({ $and: [baseMatch, buildPickupExceptionBucketMatch()] }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'cancelled', 'shipmentInfo.providerStatus': rtoProviderMatch }]
     }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': rtoProviderMatch }]
     }),
-    Order.countDocuments({
-      $and: [
-        baseMatch,
-        {
-          orderStatus: 'processing',
-          'shipmentInfo.manifestDownloaded': true,
-          'shipmentInfo.labelDownloaded': true
-        }
-      ]
-    }),
-    Order.countDocuments({
-      $and: [
-        baseMatch,
-        {
-          orderStatus: 'processing',
-          $or: [
-            { 'shipmentInfo.manifestDownloaded': { $ne: true } },
-            { 'shipmentInfo.labelDownloaded': { $ne: true } }
-          ]
-        }
-      ]
-    })
+    Order.countDocuments(
+      andFilters(baseMatch, {
+        orderStatus: 'processing',
+        'shipmentInfo.manifestDownloaded': true,
+        'shipmentInfo.labelDownloaded': true
+      }, pickupExceptionExclude)
+    ),
+    Order.countDocuments(
+      andFilters(baseMatch, {
+        orderStatus: 'processing',
+        $or: [
+          { 'shipmentInfo.manifestDownloaded': { $ne: true } },
+          { 'shipmentInfo.labelDownloaded': { $ne: true } }
+        ]
+      }, pickupExceptionExclude)
+    ),
+    Order.countDocuments(
+      andFilters(baseMatch, { orderStatus: 'confirmed' }, confirmedPickupExceptionExclude)
+    )
   ]);
 
   const countsByBucket = {
     all: t.totalOrders || 0,
     new: byStatus.pending || 0,
-    bill_sent: byStatus.confirmed || 0,
+    bill_sent: confirmedWithoutPickupExceptionCount,
     ready_to_ship: readyToShipCount,
     ready_to_pick: readyToPickCount,
     in_transit: (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0),
     completed:
       Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered) + (byStatus.return_requested || 0),
     rto: rtoCount,
+    pickup_exception: pickupExceptionCount,
     others:
       Math.max(0, (byStatus.cancelled || 0) - legacyRtoInCancelled) + (byStatus.payment_failed || 0)
   };
@@ -384,7 +415,9 @@ function mapOrderRow(order) {
   let bucketKey =
     isRtoProviderStatus(si.providerStatus) || o.orderStatus === 'rto'
       ? 'rto'
-      : fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
+      : isPickupExceptionAdminBucketOrder(o)
+        ? 'pickup_exception'
+        : fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
   if (bucketKey === 'ready_to_pick' || bucketKey === 'ready_to_ship') {
     const manifestDownloaded = Boolean(si.manifestDownloaded);
     const labelDownloaded = Boolean(si.labelDownloaded);
@@ -439,7 +472,7 @@ function mapOrderRow(order) {
     amountInr: roundMoney(Number(o.totalAmount) || 0),
     currency: 'INR',
     orderStatus: o.orderStatus,
-    fulfillmentLabel: fulfillmentLabelFromOrderStatus(o.orderStatus, si.providerStatus),
+    fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey),
     fulfillmentBucket: bucketKey,
     itemCount,
     paymentStatus: o.paymentStatus,
