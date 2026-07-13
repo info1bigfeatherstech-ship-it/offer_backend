@@ -959,5 +959,9 @@ async function previewOrApplyPendingOrderEdit(opts) {
 module.exports = {
   previewOrApplyPendingOrderEdit,
   assertEditablePendingOrder,
-  createEditError
+  createEditError,
+  repriceShippingForItems,
+  settleFinancials,
+  attemptAmendmentRefund,
+  snapshotMoney
 };

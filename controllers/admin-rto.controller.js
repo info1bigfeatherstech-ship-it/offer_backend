@@ -30,6 +30,7 @@ const {
   notifyRefundInitiated,
   notifyRefundRejectedByAdmin
 } = require('../services/rtoNotification.service');
+const { autoSyncStaleRtoOrdersInRange } = require('../services/adminRtoAutoSync.service');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -1000,6 +1001,68 @@ exports.exportRtoReport = async (req, res) => {
     return res.send(csv);
   } catch (err) {
     return sendError(res, err, 'Could not export RTO report');
+  }
+};
+
+/**
+ * POST /api/admin/rto/auto-sync-statuses
+ * Hydrate stale RTO providerStatus from Shiprocket for the active date range.
+ * Isolated from Orders-tab forward auto-sync.
+ */
+exports.autoSyncRtoStatuses = async (req, res) => {
+  try {
+    let presetDays = req.query.presetDays;
+    if (presetDays == null && String(req.query.preset || '').toLowerCase() === '30d') {
+      presetDays = 30;
+    }
+    const rangePreset = req.query.rangePreset || req.query.range;
+
+    const range = resolveDateRange({
+      from: req.query.from,
+      to: req.query.to,
+      presetDays,
+      rangePreset
+    });
+
+    const scopeMatch = req.adminScope?.orderMatch || {};
+    const staleMinutes = Math.min(
+      180,
+      Math.max(1, parseInt(String(req.query.staleMinutes || '15'), 10) || 15)
+    );
+    const concurrency = Math.min(
+      6,
+      Math.max(1, parseInt(String(req.query.concurrency || '3'), 10) || 3)
+    );
+    const maxRunMs = Math.min(
+      180_000,
+      Math.max(10_000, parseInt(String(req.query.maxRunMs || '90000'), 10) || 90_000)
+    );
+
+    const syncResult = await autoSyncStaleRtoOrdersInRange({
+      from: range.from,
+      to: range.to,
+      scopeMatch,
+      staleMs: staleMinutes * 60 * 1000,
+      concurrency,
+      maxRunMs,
+      source: 'admin_rto_auto_sync'
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        dateRange: {
+          from: range.from.toISOString(),
+          to: range.to.toISOString(),
+          preset: range.presetLabel
+        },
+        scope: req.adminScope?.storefront || 'ecomm',
+        summary: syncResult.summary,
+        results: syncResult.results
+      }
+    });
+  } catch (err) {
+    return sendError(res, err, 'Could not auto-sync RTO statuses');
   }
 };
 

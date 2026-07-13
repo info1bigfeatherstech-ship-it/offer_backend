@@ -18,7 +18,8 @@ const userNotificationSchema = new mongoose.Schema(
         'refund_rejected',
         'refund_not_applicable',
         'refund_failed',
-        'order_amended'
+        'order_amended',
+        'back_in_stock'
       ],
       required: true
     },
@@ -30,7 +31,10 @@ const userNotificationSchema = new mongoose.Schema(
       reason: { type: String, default: null },
       refundAmount: { type: Number, default: null },
       orderTotal: { type: Number, default: null },
-      policyUrl: { type: String, default: null }
+      policyUrl: { type: String, default: null },
+      productSlug: { type: String, default: null },
+      productId: { type: String, default: null },
+      inquiryId: { type: String, default: null }
     }
   },
   { timestamps: true }

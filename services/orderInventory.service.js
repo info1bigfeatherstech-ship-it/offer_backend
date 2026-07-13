@@ -78,6 +78,9 @@ async function releaseReservedInventoryForLines(lines, session = null) {
         continue;
       }
 
+      const prevQty = Number(variant.inventory?.quantity || 0);
+      const trackInventory = variant.inventory?.trackInventory !== false;
+
       /**
        * arrayFilters avoids brittle positional `$` matching when _id types differ (string vs ObjectId).
        * createOrder uses: { _id, 'variants._id': variant._id } — we align with explicit arrayFilters.
@@ -93,6 +96,28 @@ async function releaseReservedInventoryForLines(lines, session = null) {
           productId: String(pid),
           variantId: String(vid)
         });
+      } else {
+        try {
+          const {
+            isRestockTransition,
+            scheduleRestockNotifications
+          } = require('./oosRestockNotify.service');
+          if (isRestockTransition(prevQty, prevQty + qty, trackInventory)) {
+            scheduleRestockNotifications({
+              productId: pid,
+              variantId: vid,
+              productSlug: product.slug,
+              productName: product.name,
+              variantSku: variant.sku || null
+            });
+          }
+        } catch (notifyErr) {
+          logger.warn('[orderInventory] restock notify schedule failed', {
+            message: notifyErr.message,
+            productId: String(pid),
+            variantId: String(vid)
+          });
+        }
       }
     } catch (err) {
       logger.error('[orderInventory] release failed', {

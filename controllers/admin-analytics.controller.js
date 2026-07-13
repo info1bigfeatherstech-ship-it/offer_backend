@@ -161,6 +161,111 @@ const getAllUsers = async (req, res) => {
   }
 };
 
+/**
+ * Export all customer/wholesaler users to Excel (Leads → Customers).
+ * Excludes admin/staff accounts and secrets (password, tokens, OTPs).
+ * GET /api/admin/analytics/users/export
+ */
+const exportUsersExcel = async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+
+    const users = await User.find({
+      userType: { $ne: 'admin' },
+      role: {
+        $nin: ['admin', 'product_manager', 'order_manager', 'marketing_manager']
+      }
+    })
+      .select(
+        'name email phone userType role status isEmailVerified isPhoneVerified registrationMethod isProfileComplete lastLoginMethod createdAt updatedAt'
+      )
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!users.length) {
+      return res.status(200).json({
+        success: true,
+        message: 'No customers found to export.'
+      });
+    }
+
+    const HEADERS = [
+      'Name',
+      'Email',
+      'Phone',
+      'User Type',
+      'Role',
+      'Status',
+      'Email Verified',
+      'Phone Verified',
+      'Registration Method',
+      'Profile Complete',
+      'Last Login Method',
+      'Created At',
+      'Updated At'
+    ];
+
+    const toYesNo = (v) => (v ? 'Yes' : 'No');
+    const toIso = (v) => {
+      if (!v) return '';
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? '' : d.toISOString();
+    };
+
+    const dataRows = users.map((u) => [
+      u.name || '',
+      u.email || '',
+      u.phone || '',
+      u.userType || '',
+      u.role || '',
+      u.status || '',
+      toYesNo(u.isEmailVerified),
+      toYesNo(u.isPhoneVerified),
+      u.registrationMethod || '',
+      toYesNo(u.isProfileComplete),
+      u.lastLoginMethod || '',
+      toIso(u.createdAt),
+      toIso(u.updatedAt)
+    ]);
+
+    const wb = XLSX.utils.book_new();
+    const sheetData = [HEADERS, ...dataRows];
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+
+    const colWidths = HEADERS.map((h, ci) => {
+      let max = h.length;
+      for (let ri = 1; ri < Math.min(sheetData.length, 200); ri++) {
+        const val = sheetData[ri][ci];
+        if (val != null) max = Math.max(max, String(val).length);
+      }
+      return { wch: Math.min(max + 2, 48) };
+    });
+    ws['!cols'] = colWidths;
+    ws['!freeze'] = { xSplit: 0, ySplit: 1, topLeftCell: 'A2', activePane: 'bottomLeft' };
+
+    XLSX.utils.book_append_sheet(wb, ws, 'Customers');
+
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    const today = new Date().toISOString().slice(0, 10);
+    const filename = `customers_export_${today}.xlsx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', xlsxBuffer.length);
+    return res.send(xlsxBuffer);
+  } catch (error) {
+    console.error('Export users error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error exporting customers',
+      error: error.message
+    });
+  }
+};
+
 // =============================================
 // 2. GET USER DETAILS BY ID (READ ONLY)
 // =============================================
@@ -954,6 +1059,7 @@ const bulkCartReminderEmail = async (req, res) => {
 
 module.exports = {
   getAllUsers,
+  exportUsersExcel,
   getUserById,
   getLeadsPushSettings,
   updateLeadsPushSettings,

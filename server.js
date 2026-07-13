@@ -29,6 +29,7 @@ const gracefulShutdown = require('./services/shutdown.service');
 const cleanupService = require('./services/cleanup.service');
 const paymentHoldExpiryService = require('./services/paymentHoldExpiry.service');
 const cartReminderPushScheduler = require('./services/cartReminderPushScheduler.service');
+const rtoStatusSyncScheduler = require('./services/rtoStatusSyncScheduler.service');
 const logger = require('./utils/logger');
 const { CORS_STOREFRONT_ALLOWED_HEADERS } = require('./constants/storefrontHeaders');
 const Coupon = require('./models/Coupon');
@@ -52,6 +53,8 @@ const adminAnalyticsRoutes = require('./routes/admin-analytics.route');
 const seoAnalyticsRoutes = require('./routes/seo-analytics.route');
 const adminOrdersRoutes = require('./routes/admin-orders.route');
 const adminRtoRoutes = require('./routes/admin-rto.route');
+const adminOosInquiryRoutes = require('./routes/admin-out-of-stock-inquiry.route');
+const oosInquiryPublicRoutes = require('./routes/out-of-stock-inquiry.public.route');
 const userNotificationRoutes = require('./routes/user-notification.route');
 const staffRoutes = require('./routes/staff.route');
 const orderRoutes = require('./routes/orders.route');
@@ -509,6 +512,7 @@ app.use('/api/wholesaler/request', limiters.sensitive);
 app.use('/api/wholesaler/activate/send-otp', limiters.sensitive);
 app.use('/api/wholesaler/activate/verify', limiters.sensitive);
 app.use('/api/wholesaler/owner-review', limiters.sensitive);
+app.use('/api/oos-inquiries', limiters.sensitive);
 
 // Orders: dedicated bucket (the `sensitive` cap blocked normal My Orders flow).
 app.use('/api/orders', limiters.orders);
@@ -740,6 +744,7 @@ app.use('/api/admin/analytics', adminAnalyticsRoutes);
 app.use('/api/admin/seo-analytics', seoAnalyticsRoutes);
 app.use('/api/admin/orders', adminOrdersRoutes);
 app.use('/api/admin/rto', adminRtoRoutes);
+app.use('/api/admin/oos-inquiries', adminOosInquiryRoutes);
 app.use('/api/admin/staff', staffRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/checkout', checkoutRoutes);
@@ -752,6 +757,7 @@ app.use('/api/product-reviews/public', limiters.products, productReviewPublicRou
 app.use('/api/product-reviews', limiters.write, productReviewUserRoutes);
 app.use('/api/admin/product-reviews', limiters.admin, adminProductReviewRoutes);
 app.use('/api/wholesaler', wholesalerRoutes);
+app.use('/api/oos-inquiries', oosInquiryPublicRoutes);
 
 // ============================================================================
 // Error Handling Middleware
@@ -835,9 +841,12 @@ async function startApplication() {
       cleanupService.start();
       paymentHoldExpiryService.start();
       cartReminderPushScheduler.start();
-      logger.info('[Schedulers] cleanup + paymentHold + cartReminderPush started on primary instance');
+      rtoStatusSyncScheduler.start();
+      logger.info(
+        '[Schedulers] cleanup + paymentHold + cartReminderPush + rtoStatusSync started on primary instance'
+      );
     } else {
-      logger.info('[Schedulers] Skipping cleanup/paymentHold on secondary worker', {
+      logger.info('[Schedulers] Skipping cleanup/paymentHold/rtoStatusSync on secondary worker', {
         instance: process.env.NODE_APP_INSTANCE
       });
     }
@@ -877,6 +886,10 @@ async function startApplication() {
 
       gracefulShutdown.registerConnection('CartReminderPushScheduler', async () => {
         cartReminderPushScheduler.stop();
+      });
+
+      gracefulShutdown.registerConnection('RtoStatusSyncScheduler', async () => {
+        rtoStatusSyncScheduler.stop();
       });
     }
 

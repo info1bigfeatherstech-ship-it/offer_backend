@@ -3774,6 +3774,8 @@ const updateProduct = async (req, res) => {
     delete updates.slug;
     delete updates.sku;
     delete updates.variants;
+    /** @type {Array<{ productId: unknown, variantId: unknown, productSlug?: string, productName?: string, variantSku?: string }>} */
+    const restockNotifyEvents = [];
 
     const parseIfString = (value, fallback) => {
       if (typeof value === "string") {
@@ -4118,7 +4120,26 @@ const updateProduct = async (req, res) => {
       if (updates.inventory !== undefined) {
         const parsedInventory = parseIfString(updates.inventory, {});
         if (parsedInventory.quantity !== undefined) {
-          variant.inventory.quantity = Number(parsedInventory.quantity);
+          const prevQty = Number(variant.inventory?.quantity || 0);
+          const nextQty = Number(parsedInventory.quantity);
+          const trackInventory = parsedInventory.trackInventory !== undefined
+            ? parsedInventory.trackInventory
+            : variant.inventory?.trackInventory;
+          try {
+            const { isRestockTransition } = require('../services/oosRestockNotify.service');
+            if (isRestockTransition(prevQty, nextQty, trackInventory !== false)) {
+              restockNotifyEvents.push({
+                productId: doc._id,
+                variantId: variant._id,
+                productSlug: doc.slug,
+                productName: doc.name,
+                variantSku: variant.sku || null,
+              });
+            }
+          } catch (_) {
+            /* notify helper optional at boot */
+          }
+          variant.inventory.quantity = nextQty;
         }
         if (parsedInventory.lowStockThreshold !== undefined) {
           variant.inventory.lowStockThreshold = Number(parsedInventory.lowStockThreshold);
@@ -4249,6 +4270,15 @@ const updateProduct = async (req, res) => {
 
     await invalidateProductCaches(doc.slug);
     const warnings = collectWholesaleInventoryWarnings(doc.variants);
+
+    if (restockNotifyEvents.length) {
+      try {
+        const { scheduleRestockNotifications } = require('../services/oosRestockNotify.service');
+        scheduleRestockNotifications(restockNotifyEvents);
+      } catch (notifyErr) {
+        console.warn('[updateProduct] restock notify schedule failed', notifyErr?.message);
+      }
+    }
 
     return res.status(200).json({
       success: true,

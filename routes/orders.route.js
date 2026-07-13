@@ -29,6 +29,7 @@ const {
 } = require('../controllers/order.controller');
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
 const adminPendingOrderEdit = require('../controllers/admin-pending-order-edit.controller');
+const adminPendingOrderAddress = require('../controllers/admin-pending-order-address.controller');
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
 
@@ -127,6 +128,28 @@ router.post(
   authorizeRoles('admin', 'order_manager'),
   adminPendingOrderEdit.applyPendingOrderEdit
 );
+
+router.get(
+  '/admin/items/:orderId/address-intelligence',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminPendingOrderAddress.getAddressIntelligence
+);
+
+router.post(
+  '/admin/items/:orderId/edit-pending-address/preview',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminPendingOrderAddress.previewPendingAddressEdit
+);
+
+router.post(
+  '/admin/items/:orderId/edit-pending-address',
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  adminPendingOrderAddress.applyPendingAddressEdit
+);
+
 router.post(
   '/admin/items/bulk-approval/confirm',
   verifyToken,

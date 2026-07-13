@@ -121,7 +121,13 @@ const orderSchema = new mongoose.Schema(
       lastError: String,
       lastPickupError: { type: String, default: null },
       createAttemptCount: { type: Number, default: 0 },
-      rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] }
+      rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] },
+      /** Shiprocket orders/show address intelligence (0–1 ratio) */
+      addressScore: { type: Number, default: null },
+      addressCategory: { type: String, default: null },
+      addressRisk: { type: String, default: null },
+      rtoRisk: { type: String, default: null },
+      addressScoreSyncedAt: { type: Date, default: null }
     },
 
     /** Cached shipment ops view (list/detail actions + provider state classification) */

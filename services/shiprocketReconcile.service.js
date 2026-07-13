@@ -185,6 +185,13 @@ function buildPayloadFromSnapshot(snapshot, order) {
   if (snapshot.shiprocketPickupId) {
     payload.shiprocketPickupId = snapshot.shiprocketPickupId;
   }
+  if (snapshot.addressScore != null && Number.isFinite(Number(snapshot.addressScore))) {
+    payload.addressScore = Number(snapshot.addressScore);
+    payload.addressScoreSyncedAt = new Date();
+  }
+  if (snapshot.addressCategory) payload.addressCategory = String(snapshot.addressCategory);
+  if (snapshot.addressRisk) payload.addressRisk = String(snapshot.addressRisk);
+  if (snapshot.rtoRisk) payload.rtoRisk = String(snapshot.rtoRisk);
   if (snapshot.pickupScheduled === true && snapshot.pickupDate) {
     payload.pickupDate = snapshot.pickupDate;
   } else if (snapshot.pickupScheduled === false) {
