@@ -2,6 +2,10 @@
  * Normalize Shiprocket provider status + timeline into operational classifications.
  */
 
+const {
+  PICKUP_EXCEPTION_PROVIDER_STATUS_REGEX
+} = require('../../constants/pickupExceptionSignals');
+
 const CLASSIFICATION = Object.freeze({
   PICKUP_EXCEPTION: 'PICKUP_EXCEPTION',
   PROVIDER_RESET: 'PROVIDER_RESET',
@@ -13,6 +17,8 @@ const CLASSIFICATION = Object.freeze({
   AWB_ASSIGNED: 'AWB_ASSIGNED',
   UNKNOWN: 'UNKNOWN',
 });
+
+const PICKUP_EXCEPTION_SIGNAL_RE = new RegExp(PICKUP_EXCEPTION_PROVIDER_STATUS_REGEX, 'i');
 
 /**
  * @param {string} text
@@ -74,11 +80,7 @@ function isOutForPickupStatus(text) {
 function classifySignalTexts(texts) {
   const combined = texts.join(' ');
 
-  if (
-    /pickup\s*exception|pickup\s*failed|pickup\s*error|pickup\s*not\s*completed|wrong\s*courier/.test(
-      combined
-    )
-  ) {
+  if (PICKUP_EXCEPTION_SIGNAL_RE.test(combined)) {
     return CLASSIFICATION.PICKUP_EXCEPTION;
   }
 

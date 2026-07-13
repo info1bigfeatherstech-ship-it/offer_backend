@@ -464,6 +464,15 @@ function testRtoFulfillmentLabel() {
   const { fulfillmentLabelFromOrderStatus } = require('../constants/adminOrderFulfillmentBuckets');
   assert.strictEqual(fulfillmentLabelFromOrderStatus('rto', 'RTO Delivered'), 'RTO Delivered');
   assert.strictEqual(fulfillmentLabelFromOrderStatus('cancelled', 'RTO Delivered'), 'RTO Delivered');
+  assert.strictEqual(
+    fulfillmentLabelFromOrderStatus('processing', 'Pickup Exception'),
+    'Pickup Exception'
+  );
+  const { fulfillmentLabelForAdminListRow } = require('../constants/adminOrderFulfillmentBuckets');
+  assert.strictEqual(
+    fulfillmentLabelForAdminListRow('processing', 'PICKUP SCHEDULED', 'ready_to_ship'),
+    'Ready to Ship'
+  );
 }
 
 function run() {
