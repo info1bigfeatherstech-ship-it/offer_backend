@@ -33,6 +33,7 @@ const {
   ensureShiprocketPickupId
 } = require('../services/shiprocketReconcile.service');
 const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
+const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const {
   isCourierInactive,
   pickCheapestActiveCourier,
@@ -2232,18 +2233,16 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
     }
     const reverse = await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
     if (!reverse?.success) {
-      order.returnInfo = {
-        ...(order.returnInfo || {}),
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
         reverseLastError: String(reverse?.error || 'Could not initiate reverse pickup')
-      };
+      });
       order.markModified('returnInfo');
       await order.save();
       return jsonError(res, 502, 'REVERSE_PICKUP_CREATE_FAILED', 'Reverse pickup initiation failed', {
         details: reverse?.error || null
       });
     }
-    order.returnInfo = {
-      ...(order.returnInfo || {}),
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
       status: 'approved',
       reverseShipmentId: reverse.reverseShipmentId || order.returnInfo?.reverseShipmentId || null,
       reverseAwbCode: reverse.reverseAwbCode || order.returnInfo?.reverseAwbCode || null,
@@ -2252,7 +2251,7 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
       reverseProviderStatus: reverse.providerStatus || 'reverse_pickup_created',
       reverseLastSyncAt: new Date(),
       reverseLastError: null
-    };
+    });
     order.markModified('returnInfo');
     await order.save();
     return res.json({ success: true, message: 'Reverse pickup re-initiated', orderId: order.orderId });

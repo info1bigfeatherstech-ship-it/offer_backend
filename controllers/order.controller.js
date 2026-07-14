@@ -32,6 +32,7 @@ const {
     assertStorePolicyAllowsCheckout
 } = require('../utils/checkoutPaymentPolicy');
 const { generateOrderId } = require('../utils/orderId');
+const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
@@ -206,12 +207,14 @@ async function applyRefundEntryToOrder(order, refundEntity) {
     } else if (totalRefundedInr > 0) {
         order.paymentStatus = 'partially_refunded';
     }
-    order.returnInfo = {
-        ...(order.returnInfo || {}),
+    // Use mergeReturnInfo — naive spread can write undefined nested paths
+    // (e.g. rtoDeductions) and crash Mongoose cast on save.
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
         refundAmount: totalRefundedInr,
         refundId: entry.refundId,
         status: entry.status
-    };
+    });
+    order.markModified('returnInfo');
     await order.save();
 }
 
@@ -2053,14 +2056,13 @@ exports.shiprocketWebhook = async (req, res) => {
 
         if (mappedReturnStatus && order.returnInfo && String(order.returnInfo.status || '').trim()) {
             const previousReturnStatus = String(order.returnInfo.status || '').toLowerCase();
-            order.returnInfo = {
-                ...(order.returnInfo || {}),
+            order.returnInfo = mergeReturnInfo(order.returnInfo, {
                 reverseProviderStatus: providerStatus || order.returnInfo?.reverseProviderStatus || null,
                 reverseLastSyncAt: new Date(),
                 reverseLastError: null,
                 status: mappedReturnStatus,
                 reverseEvents: nextEvents.slice(-50)
-            };
+            });
             if (
                 mappedReturnStatus === 'received' &&
                 ['approved', 'reverse_pickup_created', 'pickup_in_progress', 'in_transit_to_warehouse'].includes(previousReturnStatus)
@@ -2756,14 +2758,14 @@ exports.cancelOrder = async (req, res) => {
         order.paymentInfo = order.paymentInfo || {};
         order.paymentInfo.cancellationReason = 'user_cancelled';
         order.paymentInfo.cancelledAt = new Date();
-        order.returnInfo = {
-            ...(order.returnInfo || {}),
+        order.returnInfo = mergeReturnInfo(order.returnInfo, {
             refundContext: 'cancellation',
             status: canInitiateRefund ? 'refund_pending' : (wasPaid ? 'refund_unavailable' : 'not_required'),
             requestedAt: new Date(),
             refundAmount: canInitiateRefund ? order.totalAmount : (order.returnInfo?.refundAmount || 0)
-        };
+        });
         order.markModified('paymentInfo');
+        order.markModified('returnInfo');
 
         await order.save({ session });
         await releaseReservedInventoryForOrder(order, session);
@@ -2783,26 +2785,26 @@ exports.cancelOrder = async (req, res) => {
                 });
 
                 order.paymentStatus = 'refunded';
-                order.returnInfo = {
-                    ...(order.returnInfo || {}),
+                order.returnInfo = mergeReturnInfo(order.returnInfo, {
                     refundContext: 'cancellation',
                     refundAmount: order.totalAmount,
                     refundId: refund.id,
                     status: 'refunded',
                     approvedAt: new Date()
-                };
+                });
+                order.markModified('returnInfo');
                 await order.save();
             } catch (refundError) {
-                order.returnInfo = {
-                    ...(order.returnInfo || {}),
+                order.returnInfo = mergeReturnInfo(order.returnInfo, {
                     refundContext: 'cancellation',
                     status: 'refund_failed'
-                };
+                });
                 order.paymentInfo = {
                     ...(order.paymentInfo || {}),
                     refundFailureReason: refundError?.message || 'Refund API failed'
                 };
                 order.markModified('paymentInfo');
+                order.markModified('returnInfo');
                 await order.save();
                 refundWarning = 'Order cancelled, but refund failed. Support team action required.';
                 logger.error('Refund initiation failed after cancellation', {
@@ -3317,8 +3319,7 @@ exports.createReturnRequest = async (req, res) => {
         ];
         const proofs = await Promise.all(uploads);
 
-        order.returnInfo = {
-            ...(order.returnInfo || {}),
+        order.returnInfo = mergeReturnInfo(order.returnInfo, {
             refundContext: 'product_return',
             reasonType,
             reasonMessage,
@@ -3339,7 +3340,7 @@ exports.createReturnRequest = async (req, res) => {
             reverseLastSyncAt: null,
             reverseLastError: null,
             refundInitiatedAt: null
-        };
+        });
         order.orderStatus = 'return_requested';
         order.markModified('returnInfo');
         await order.save();
@@ -3468,13 +3469,12 @@ exports.adminDecideReturnRequest = async (req, res) => {
             if (!decisionReason) {
                 return respondOrderError(res, 400, 'RETURN_REJECT_REASON_REQUIRED', 'Please provide rejection reason');
             }
-            order.returnInfo = {
-                ...(order.returnInfo || {}),
+            order.returnInfo = mergeReturnInfo(order.returnInfo, {
                 status: 'rejected',
                 rejectedAt: new Date(),
                 rejectedBy: req.userId || null,
                 decisionReason
-            };
+            });
             if (String(order.orderStatus || '').toLowerCase() === 'return_requested') {
                 order.orderStatus = 'delivered';
             }
@@ -3485,11 +3485,10 @@ exports.adminDecideReturnRequest = async (req, res) => {
 
         const reverse = await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
         if (!reverse?.success) {
-            order.returnInfo = {
-                ...(order.returnInfo || {}),
+            order.returnInfo = mergeReturnInfo(order.returnInfo, {
                 status: 'approval_failed',
                 reverseLastError: String(reverse?.error || 'Could not initiate reverse pickup')
-            };
+            });
             order.markModified('returnInfo');
             await order.save();
             return respondOrderError(
@@ -3501,8 +3500,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
             );
         }
 
-        order.returnInfo = {
-            ...(order.returnInfo || {}),
+        order.returnInfo = mergeReturnInfo(order.returnInfo, {
             status: 'approved',
             approvedAt: new Date(),
             approvedBy: req.userId || null,
@@ -3514,7 +3512,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
             reverseProviderStatus: reverse.providerStatus || 'reverse_pickup_created',
             reverseLastSyncAt: new Date(),
             reverseLastError: null
-        };
+        });
         order.markModified('returnInfo');
         await order.save();
 
@@ -3580,13 +3578,12 @@ exports.adminInitiateReturnRefund = async (req, res) => {
         });
 
         await applyRefundEntryToOrder(order, refund);
-        order.returnInfo = {
-            ...(order.returnInfo || {}),
+        order.returnInfo = mergeReturnInfo(order.returnInfo, {
             status: 'refunded',
             refundInitiatedAt: new Date(),
             refundAmount: remainingInr,
             refundId: refund.id
-        };
+        });
         order.markModified('returnInfo');
         await order.save();
 
