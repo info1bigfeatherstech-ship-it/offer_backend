@@ -186,6 +186,22 @@ const uploadReturnProofs = returnProofUpload.fields([
   { name: 'proofImages', maxCount: 3 }
 ]);
 
+// ===============================
+// PRODUCT REVIEW IMAGES
+// ===============================
+const reviewImageUpload = multer({
+  storage: multer.memoryStorage(),
+  fileFilter: imageFileFilter,
+  limits: {
+    files: 5,
+    fileSize: MAX_IMAGE_BYTES
+  }
+});
+
+const uploadReviewImages = reviewImageUpload.fields([
+  { name: 'reviewImages', maxCount: 5 }
+]);
+
 
 module.exports = {
   uploadProductImages,
@@ -193,5 +209,6 @@ module.exports = {
   uploadCSVFile,
   uploadBulkNewProductFiles,
   uploadWholesalerProofs,
-  uploadReturnProofs
+  uploadReturnProofs,
+  uploadReviewImages
 };

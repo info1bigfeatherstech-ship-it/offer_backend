@@ -5,6 +5,7 @@ const Order = require('../models/Order');
 const logger = require('../utils/logger');
 const {
   resolveDateRange,
+  buildScopedDateMatch,
   buildSearchFilter,
   buildBucketMatch,
   mergeFilters,
@@ -29,7 +30,8 @@ function sendError(res, err, fallbackMessage) {
 
 /**
  * GET /api/admin/orders/summary
- * Query: from, to (ISO), presetDays (default 30 if no from/to), preset=30d alias
+ * Query: from, to (ISO), rangePreset (all|today|last7|last30), presetDays, preset=30d alias
+ * Admin Orders cards use rangePreset=all so totals stay filter-independent.
  */
 exports.getDashboardSummary = async (req, res) => {
   try {
@@ -54,14 +56,14 @@ exports.getDashboardSummary = async (req, res) => {
       success: true,
       data: {
         dateRange: {
-          from: range.from.toISOString(),
-          to: range.to.toISOString(),
+          from: range.from ? range.from.toISOString() : null,
+          to: range.to ? range.to.toISOString() : null,
           preset: range.presetLabel
         },
         scope: req.adminScope?.storefront || 'ecomm',
         totals: {
           totalOrders: summary.totalOrders,
-          /** Gross merchandise value in period (excludes cancelled & payment_failed). */
+          /** Gross merchandise value (excludes cancelled & payment_failed). */
           totalRevenueInr: summary.totalRevenueInr,
           totalPendingOrders: summary.totalPendingOrders,
           totalCompletedOrders: summary.totalCompletedOrders
@@ -104,16 +106,12 @@ exports.getOrdersList = async (req, res) => {
     const sortOrder = String(req.query.sortOrder || 'desc').toLowerCase() === 'asc' ? 1 : -1;
     const sort = { [sortBy]: sortOrder };
 
-    const dateMatch = { createdAt: { $gte: range.from, $lte: range.to } };
     const scopeMatch = req.adminScope?.orderMatch || {};
+    const dateScopeMatch = buildScopedDateMatch(range.from, range.to, scopeMatch);
     const search = await buildSearchFilter(req.query.search);
     /** Global search: skip status bucket so order ID / phone matches any tab (incl. cancelled). */
     const bucket = search ? {} : buildBucketMatch(req.query.bucket);
-    const filter = mergeFilters(
-      Object.keys(scopeMatch).length ? { $and: [dateMatch, scopeMatch] } : dateMatch,
-      search,
-      bucket
-    );
+    const filter = mergeFilters(dateScopeMatch, search, bucket);
 
     const [orders, total] = await Promise.all([
       Order.find(filter).sort(sort).skip(skip).limit(limit).lean(),
@@ -155,8 +153,8 @@ exports.getOrdersList = async (req, res) => {
       success: true,
       data: {
         dateRange: {
-          from: range.from.toISOString(),
-          to: range.to.toISOString(),
+          from: range.from ? range.from.toISOString() : null,
+          to: range.to ? range.to.toISOString() : null,
           preset: range.presetLabel
         },
         scope: req.adminScope?.storefront || 'ecomm',
@@ -200,6 +198,13 @@ exports.autoSyncOrderStatuses = async (req, res) => {
       presetDays,
       rangePreset
     });
+
+    if (!(range.from instanceof Date) || !(range.to instanceof Date)) {
+      const err = new Error('Auto-sync requires a finite date range (not all-time)');
+      err.statusCode = 400;
+      err.code = 'INVALID_DATE_RANGE';
+      throw err;
+    }
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const staleMinutes = Math.min(
