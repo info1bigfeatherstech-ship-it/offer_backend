@@ -190,6 +190,8 @@ const getReviewEligibilityForProduct = async (req, res) => {
         canUpdate: Boolean(eligibility.canUpdate),
         hasReview: Boolean(eligibility.hasReview),
         qualifyingOrderId: eligibility.qualifyingOrderId || null,
+        verifiedPurchaseEligible: Boolean(eligibility.verifiedPurchaseEligible),
+        canAttachImages: Boolean(eligibility.canAttachImages),
         review: eligibility.review
           ? {
               _id: eligibility.review._id,
@@ -367,6 +369,15 @@ const createCustomerReview = async (req, res) => {
       : null;
     const verifiedPurchase = Boolean(linkedOrderId);
 
+    if (incomingFiles.length && !verifiedPurchase) {
+      return jsonError(
+        res,
+        403,
+        'PHOTOS_REQUIRE_PURCHASE',
+        'Photos can only be added after you purchase and receive this product. Use My Orders to review with photos.'
+      );
+    }
+
     if (incomingFiles.length) {
       uploadedImages = await uploadReviewImages(incomingFiles, {
         productId: String(productId),
@@ -489,6 +500,15 @@ const updateCustomerReview = async (req, res) => {
         400,
         'TOO_MANY_IMAGES',
         `You can have at most ${MAX_REVIEW_IMAGES} images per review`
+      );
+    }
+
+    if (incomingFiles.length && !Boolean(review.verifiedPurchase)) {
+      return jsonError(
+        res,
+        403,
+        'PHOTOS_REQUIRE_PURCHASE',
+        'Photos can only be added on verified purchase reviews. Manage photos from My Orders after delivery.'
       );
     }
 
