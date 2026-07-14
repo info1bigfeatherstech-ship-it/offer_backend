@@ -79,6 +79,8 @@ async function getProductReviewEligibility(userId, productId) {
       hasReview: false,
       review: null,
       qualifyingOrderId: null,
+      verifiedPurchaseEligible: false,
+      canAttachImages: false,
       code: 'INVALID_IDS',
       message: 'Invalid user or product id',
     };
@@ -99,20 +101,24 @@ async function getProductReviewEligibility(userId, productId) {
       hasReview: true,
       review: existing,
       qualifyingOrderId: existing.orderId || null,
+      verifiedPurchaseEligible: Boolean(existing.verifiedPurchase),
+      canAttachImages: Boolean(existing.verifiedPurchase),
       code: 'ALREADY_REVIEWED',
       message: 'You have already reviewed this product. You can update your review.',
     };
   }
 
   const purchase = await findDeliveredPurchaseForProduct(uid, pid);
-  // Any logged-in customer can write a review; delivered order only adds Verified purchase.
+  const verifiedPurchaseEligible = Boolean(purchase.eligible);
+  // Any logged-in customer can write a review; delivered order only adds Verified purchase + photos.
   return {
     canCreate: true,
     canUpdate: false,
     hasReview: false,
     review: null,
-    qualifyingOrderId: purchase.eligible ? purchase.order?.orderId || null : null,
-    verifiedPurchaseEligible: Boolean(purchase.eligible),
+    qualifyingOrderId: verifiedPurchaseEligible ? purchase.order?.orderId || null : null,
+    verifiedPurchaseEligible,
+    canAttachImages: verifiedPurchaseEligible,
     code: 'ELIGIBLE',
     message: 'You can write a review for this product.',
   };
