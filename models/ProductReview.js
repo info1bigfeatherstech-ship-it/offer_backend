@@ -22,6 +22,24 @@ const productReviewSchema = new mongoose.Schema(
       default: null,
       index: true
     },
+    /**
+     * Delivered order that verified this purchase (customer reviews only).
+     */
+    orderId: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true
+    },
+    variantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null
+    },
+    verifiedPurchase: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
     rating: {
       type: Number,
       required: true,
@@ -32,6 +50,15 @@ const productReviewSchema = new mongoose.Schema(
       type: String,
       maxlength: 2000,
       default: ''
+    },
+    images: {
+      type: [
+        {
+          url: { type: String, required: true },
+          publicId: { type: String, default: null }
+        }
+      ],
+      default: []
     },
     /**
      * Shown on storefront for source === 'admin'. Ignored for customer reviews.
@@ -73,6 +100,10 @@ productReviewSchema.pre('validate', function normalizeProductReview() {
     this.displayName = '';
   } else if (this.source === 'admin') {
     this.userId = null;
+    this.orderId = null;
+    this.variantId = null;
+    this.verifiedPurchase = false;
+    this.images = [];
   }
 });
 

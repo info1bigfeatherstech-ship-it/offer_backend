@@ -1129,6 +1129,17 @@ class ShiprocketService {
       syncedAt: new Date().toISOString()
     };
 
+    const { extractAddressIntelligenceFromShowRoot, normalizeScorePercent, normalizeCategory } =
+      require('./addressIntelligenceNormalize');
+    const addrIntelRaw = extractAddressIntelligenceFromShowRoot(root) || {};
+    const addressScoreRatio = (() => {
+      const pct = normalizeScorePercent(addrIntelRaw.address_score);
+      return pct == null ? null : Number((pct / 100).toFixed(4));
+    })();
+    const addressCategory = addrIntelRaw.address_category
+      ? normalizeCategory(addrIntelRaw.address_category, normalizeScorePercent(addrIntelRaw.address_score))
+      : null;
+
     return {
       shiprocketOrderId:
         shiprocketOrderIdRaw != null && String(shiprocketOrderIdRaw).trim()
@@ -1154,6 +1165,10 @@ class ShiprocketService {
       resetDetected,
       resetReason,
       providerSnapshot,
+      addressScore: addressScoreRatio,
+      addressCategory,
+      addressRisk: addrIntelRaw.address_risk != null ? String(addrIntelRaw.address_risk).toLowerCase() : null,
+      rtoRisk: addrIntelRaw.rto_risk != null ? String(addrIntelRaw.rto_risk).toLowerCase() : null,
       raw: root
     };
   }

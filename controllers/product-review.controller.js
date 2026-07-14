@@ -2,6 +2,18 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const ProductReview = require('../models/ProductReview');
 const { syncProductRatingFromReviews } = require('../services/productReviewSync.service');
+const {
+  findDeliveredPurchaseForProduct,
+  getProductReviewEligibility,
+  getOrderReviewableItems
+} = require('../services/reviewEligibility.service');
+const {
+  MAX_REVIEW_IMAGES,
+  uploadReviewImages,
+  deleteReviewImagesFromCloudinary,
+  normalizeStoredImages,
+  parseRemoveImagePublicIds
+} = require('../services/reviewImageUpload.service');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(String(id));
 
@@ -14,6 +26,44 @@ function jsonError(res, status, code, message, details) {
   });
 }
 
+function mapPublicImages(images) {
+  return normalizeStoredImages(images);
+}
+
+function serializeCustomerReview(review) {
+  if (!review) return null;
+  return {
+    _id: review._id,
+    rating: review.rating,
+    comment: review.comment || '',
+    isActive: review.isActive,
+    verifiedPurchase: Boolean(review.verifiedPurchase),
+    orderId: review.orderId || null,
+    images: mapPublicImages(review.images),
+    createdAt: review.createdAt,
+    updatedAt: review.updatedAt
+  };
+}
+
+function parseReviewRequestBody(req) {
+  const body = req.body || {};
+  return {
+    productId: body.productId,
+    rating: body.rating,
+    comment: body.comment,
+    orderId: body.orderId,
+    variantId: body.variantId,
+    removeImagePublicIds: parseRemoveImagePublicIds(body.removeImagePublicIds)
+  };
+}
+
+function getIncomingReviewImageFiles(req) {
+  const fromFields = req.files?.reviewImages;
+  if (Array.isArray(fromFields) && fromFields.length) return fromFields;
+  if (req.file?.buffer) return [req.file];
+  return [];
+}
+
 function publicAuthorLabel(doc) {
   if (doc.source === 'admin') {
     const n = String(doc.displayName || '').trim();
@@ -23,6 +73,21 @@ function publicAuthorLabel(doc) {
   if (!raw) return 'Verified buyer';
   const first = raw.split(/\s+/)[0];
   return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
+function resolveVariantIdFromOrder(order, productId, preferredVariantId) {
+  const pid = String(productId);
+  const items = Array.isArray(order?.items) ? order.items : [];
+  const matching = items.filter((it) => String(it.productId) === pid);
+  if (!matching.length) return null;
+
+  if (preferredVariantId && isValidObjectId(preferredVariantId)) {
+    const pref = String(preferredVariantId);
+    const hit = matching.find((it) => it.variantId && String(it.variantId) === pref);
+    if (hit?.variantId) return hit.variantId;
+  }
+
+  return matching.find((it) => it.variantId)?.variantId || null;
 }
 
 // ─── Public ───────────────────────────────────────────────────────────────
@@ -74,7 +139,7 @@ const listPublicReviews = async (req, res) => {
       productId,
       isActive: true
     })
-      .sort({ rating: -1, createdAt: -1 })
+      .sort({ createdAt: -1, rating: -1 })
       .skip(skip)
       .limit(limit)
       .populate('userId', 'name')
@@ -85,7 +150,10 @@ const listPublicReviews = async (req, res) => {
       rating: r.rating,
       comment: r.comment || '',
       createdAt: r.createdAt,
-      author: publicAuthorLabel(r)
+      author: publicAuthorLabel(r),
+      verifiedPurchase: Boolean(r.verifiedPurchase),
+      source: r.source,
+      images: mapPublicImages(r.images)
     }));
 
     return res.json({ success: true, reviews });
@@ -96,6 +164,86 @@ const listPublicReviews = async (req, res) => {
 };
 
 // ─── User (customer) ────────────────────────────────────────────────────────
+
+const getReviewEligibilityForProduct = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
+    }
+
+    const { productId } = req.params;
+    if (!isValidObjectId(productId)) {
+      return jsonError(res, 400, 'INVALID_PRODUCT_ID', 'Invalid product id');
+    }
+
+    const product = await Product.findById(productId).select('_id').lean();
+    if (!product) {
+      return jsonError(res, 404, 'PRODUCT_NOT_FOUND', 'Product not found');
+    }
+
+    const eligibility = await getProductReviewEligibility(userId, productId);
+    return res.json({
+      success: true,
+      eligibility: {
+        canCreate: Boolean(eligibility.canCreate),
+        canUpdate: Boolean(eligibility.canUpdate),
+        hasReview: Boolean(eligibility.hasReview),
+        qualifyingOrderId: eligibility.qualifyingOrderId || null,
+        review: eligibility.review
+          ? {
+              _id: eligibility.review._id,
+              rating: eligibility.review.rating,
+              comment: eligibility.review.comment || '',
+              isActive: eligibility.review.isActive,
+              verifiedPurchase: Boolean(eligibility.review.verifiedPurchase),
+              orderId: eligibility.review.orderId || null,
+              images: mapPublicImages(eligibility.review.images),
+              createdAt: eligibility.review.createdAt,
+              updatedAt: eligibility.review.updatedAt
+            }
+          : null,
+        code: eligibility.code,
+        message: eligibility.message
+      }
+    });
+  } catch (err) {
+    console.error('[getReviewEligibilityForProduct]', err);
+    return jsonError(res, 500, 'REVIEW_ELIGIBILITY_ERROR', 'Could not check review eligibility');
+  }
+};
+
+const getReviewableItemsForOrder = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
+    }
+
+    const orderId = String(req.params.orderId || '').trim();
+    if (!orderId) {
+      return jsonError(res, 400, 'INVALID_ORDER_ID', 'Invalid order id');
+    }
+
+    const result = await getOrderReviewableItems(userId, orderId);
+    if (result.code === 'ORDER_NOT_FOUND') {
+      return jsonError(res, 404, 'ORDER_NOT_FOUND', result.message);
+    }
+
+    return res.json({
+      success: true,
+      eligible: Boolean(result.eligible),
+      orderId: result.orderId || orderId,
+      orderStatus: result.orderStatus,
+      code: result.code,
+      message: result.message,
+      items: result.items || []
+    });
+  } catch (err) {
+    console.error('[getReviewableItemsForOrder]', err);
+    return jsonError(res, 500, 'ORDER_REVIEW_ITEMS_ERROR', 'Could not load reviewable items');
+  }
+};
 
 const getMyReviewForProduct = async (req, res) => {
   try {
@@ -120,14 +268,7 @@ const getMyReviewForProduct = async (req, res) => {
 
     return res.json({
       success: true,
-      review: {
-        _id: review._id,
-        rating: review.rating,
-        comment: review.comment || '',
-        isActive: review.isActive,
-        createdAt: review.createdAt,
-        updatedAt: review.updatedAt
-      }
+      review: serializeCustomerReview(review)
     });
   } catch (err) {
     console.error('[getMyReviewForProduct]', err);
@@ -136,13 +277,20 @@ const getMyReviewForProduct = async (req, res) => {
 };
 
 const createCustomerReview = async (req, res) => {
+  let uploadedImages = [];
   try {
     const userId = req.user?.id;
     if (!userId) {
       return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
     }
 
-    const { productId, rating: ratingRaw, comment: commentRaw } = req.body || {};
+    const {
+      productId,
+      rating: ratingRaw,
+      comment: commentRaw,
+      orderId: orderIdRaw,
+      variantId: variantIdRaw
+    } = parseReviewRequestBody(req);
     if (!isValidObjectId(productId)) {
       return jsonError(res, 400, 'INVALID_PRODUCT_ID', 'Invalid product id');
     }
@@ -153,6 +301,19 @@ const createCustomerReview = async (req, res) => {
     }
 
     const comment = String(commentRaw || '').trim().slice(0, 2000);
+    const orderIdHint = String(orderIdRaw || '').trim() || null;
+    const variantIdHint =
+      variantIdRaw && isValidObjectId(variantIdRaw) ? String(variantIdRaw) : null;
+
+    const incomingFiles = getIncomingReviewImageFiles(req);
+    if (incomingFiles.length > MAX_REVIEW_IMAGES) {
+      return jsonError(
+        res,
+        400,
+        'TOO_MANY_IMAGES',
+        `You can upload up to ${MAX_REVIEW_IMAGES} images per review`
+      );
+    }
 
     const product = await Product.findById(productId).select('_id').lean();
     if (!product) {
@@ -169,6 +330,51 @@ const createCustomerReview = async (req, res) => {
       );
     }
 
+    const existing = await ProductReview.findOne({
+      productId,
+      userId,
+      source: 'customer'
+    })
+      .select('_id')
+      .lean();
+    if (existing) {
+      return jsonError(
+        res,
+        409,
+        'REVIEW_ALREADY_EXISTS',
+        'You have already reviewed this product. You can update your existing review.'
+      );
+    }
+
+    const purchase = await findDeliveredPurchaseForProduct(userId, productId, {
+      orderId: orderIdHint
+    });
+
+    // If client sent a specific orderId, it must be a valid delivered purchase.
+    if (orderIdHint && (!purchase.eligible || !purchase.order)) {
+      return jsonError(
+        res,
+        403,
+        purchase.code || 'ORDER_NOT_ELIGIBLE',
+        purchase.message ||
+          'This order is not eligible for a verified review.'
+      );
+    }
+
+    const linkedOrderId = purchase.eligible ? purchase.order.orderId : null;
+    const linkedVariantId = purchase.eligible
+      ? resolveVariantIdFromOrder(purchase.order, productId, variantIdHint)
+      : null;
+    const verifiedPurchase = Boolean(linkedOrderId);
+
+    if (incomingFiles.length) {
+      uploadedImages = await uploadReviewImages(incomingFiles, {
+        productId: String(productId),
+        userId: String(userId),
+        orderId: linkedOrderId
+      });
+    }
+
     try {
       const review = await ProductReview.create({
         productId,
@@ -176,6 +382,10 @@ const createCustomerReview = async (req, res) => {
         source: 'customer',
         rating,
         comment,
+        images: uploadedImages,
+        orderId: linkedOrderId || undefined,
+        variantId: linkedVariantId || undefined,
+        verifiedPurchase,
         isActive: false
       });
 
@@ -185,15 +395,13 @@ const createCustomerReview = async (req, res) => {
         success: true,
         message:
           'Thank you. Your review was submitted and will appear after moderation.',
-        review: {
-          _id: review._id,
-          rating: review.rating,
-          comment: review.comment,
-          isActive: review.isActive,
-          createdAt: review.createdAt
-        }
+        review: serializeCustomerReview(review)
       });
     } catch (e) {
+      if (uploadedImages.length) {
+        await deleteReviewImagesFromCloudinary(uploadedImages);
+        uploadedImages = [];
+      }
       if (e && e.code === 11000) {
         return jsonError(
           res,
@@ -205,12 +413,16 @@ const createCustomerReview = async (req, res) => {
       throw e;
     }
   } catch (err) {
+    if (uploadedImages.length) {
+      await deleteReviewImagesFromCloudinary(uploadedImages);
+    }
     console.error('[createCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_CREATE_ERROR', 'Could not submit review');
   }
 };
 
 const updateCustomerReview = async (req, res) => {
+  let uploadedImages = [];
   try {
     const userId = req.user?.id;
     if (!userId) {
@@ -222,10 +434,12 @@ const updateCustomerReview = async (req, res) => {
       return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
     }
 
-    const { rating: ratingRaw, comment: commentRaw } = req.body || {};
+    const { rating: ratingRaw, comment: commentRaw, removeImagePublicIds } =
+      parseReviewRequestBody(req);
     const patch = {};
+    const incomingFiles = getIncomingReviewImageFiles(req);
 
-    if (ratingRaw !== undefined) {
+    if (ratingRaw !== undefined && ratingRaw !== null && String(ratingRaw).trim() !== '') {
       const rating = Number(ratingRaw);
       if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
         return jsonError(res, 400, 'INVALID_RATING', 'Rating must be an integer from 1 to 5');
@@ -235,10 +449,6 @@ const updateCustomerReview = async (req, res) => {
 
     if (commentRaw !== undefined) {
       patch.comment = String(commentRaw || '').trim().slice(0, 2000);
-    }
-
-    if (Object.keys(patch).length === 0) {
-      return jsonError(res, 400, 'NO_CHANGES', 'No valid fields to update');
     }
 
     const review = await ProductReview.findOne({
@@ -251,22 +461,76 @@ const updateCustomerReview = async (req, res) => {
       return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
     }
 
+    const existingImages = normalizeStoredImages(review.images);
+    const removeSet = new Set(removeImagePublicIds || []);
+    const keptImages = existingImages.filter((img) => {
+      if (img.publicId && removeSet.has(img.publicId)) return false;
+      if (img.url && removeSet.has(img.url)) return false;
+      return true;
+    });
+    const removedImages = existingImages.filter((img) => {
+      if (img.publicId && removeSet.has(img.publicId)) return true;
+      if (img.url && removeSet.has(img.url)) return true;
+      return false;
+    });
+
+    if (incomingFiles.length > MAX_REVIEW_IMAGES) {
+      return jsonError(
+        res,
+        400,
+        'TOO_MANY_IMAGES',
+        `You can upload up to ${MAX_REVIEW_IMAGES} images per review`
+      );
+    }
+
+    if (keptImages.length + incomingFiles.length > MAX_REVIEW_IMAGES) {
+      return jsonError(
+        res,
+        400,
+        'TOO_MANY_IMAGES',
+        `You can have at most ${MAX_REVIEW_IMAGES} images per review`
+      );
+    }
+
+    if (incomingFiles.length) {
+      uploadedImages = await uploadReviewImages(incomingFiles, {
+        productId: String(review.productId),
+        userId: String(userId),
+        orderId: review.orderId
+      });
+    }
+
+    const nextImages = [...keptImages, ...uploadedImages];
+    const hasImageChanges =
+      incomingFiles.length > 0 || removedImages.length > 0;
+
+    if (
+      Object.keys(patch).length === 0 &&
+      !hasImageChanges
+    ) {
+      return jsonError(res, 400, 'NO_CHANGES', 'No valid fields to update');
+    }
+
     Object.assign(review, patch);
+    if (hasImageChanges) {
+      review.images = nextImages;
+    }
+
     await review.save();
+    if (removedImages.length) {
+      await deleteReviewImagesFromCloudinary(removedImages);
+    }
     await syncProductRatingFromReviews(review.productId);
 
     return res.json({
       success: true,
       message: 'Review updated',
-      review: {
-        _id: review._id,
-        rating: review.rating,
-        comment: review.comment,
-        isActive: review.isActive,
-        updatedAt: review.updatedAt
-      }
+      review: serializeCustomerReview(review)
     });
   } catch (err) {
+    if (uploadedImages.length) {
+      await deleteReviewImagesFromCloudinary(uploadedImages);
+    }
     console.error('[updateCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_UPDATE_ERROR', 'Could not update review');
   }
@@ -313,6 +577,9 @@ const listAdminReviews = async (req, res) => {
         rating: r.rating,
         comment: r.comment || '',
         isActive: r.isActive,
+        verifiedPurchase: Boolean(r.verifiedPurchase),
+        orderId: r.orderId || null,
+        images: mapPublicImages(r.images),
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         displayName: r.displayName || '',
@@ -488,7 +755,11 @@ const deleteAdminGeneratedReview = async (req, res) => {
     }
 
     const productId = review.productId;
+    const images = normalizeStoredImages(review.images);
     await review.deleteOne();
+    if (images.length) {
+      await deleteReviewImagesFromCloudinary(images);
+    }
     await syncProductRatingFromReviews(productId);
 
     return res.json({ success: true, message: 'Review deleted' });
@@ -498,12 +769,55 @@ const deleteAdminGeneratedReview = async (req, res) => {
   }
 };
 
+const deleteCustomerReview = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
+    }
+
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
+    }
+
+    const review = await ProductReview.findOne({
+      _id: id,
+      userId,
+      source: 'customer'
+    });
+
+    if (!review) {
+      return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
+    }
+
+    const productId = review.productId;
+    const images = normalizeStoredImages(review.images);
+    await review.deleteOne();
+    if (images.length) {
+      await deleteReviewImagesFromCloudinary(images);
+    }
+    await syncProductRatingFromReviews(productId);
+
+    return res.json({
+      success: true,
+      message: 'Your review was deleted'
+    });
+  } catch (err) {
+    console.error('[deleteCustomerReview]', err);
+    return jsonError(res, 500, 'REVIEW_DELETE_ERROR', 'Could not delete review');
+  }
+};
+
 module.exports = {
   getPublicSummary,
   listPublicReviews,
+  getReviewEligibilityForProduct,
+  getReviewableItemsForOrder,
   getMyReviewForProduct,
   createCustomerReview,
   updateCustomerReview,
+  deleteCustomerReview,
   listAdminReviews,
   patchReviewStatus,
   createAdminGeneratedReview,

@@ -15,6 +15,7 @@ router.use(requireStrictAdminStorefrontScope);
 router.get('/orders', adminRtoController.getRtoOrders);
 router.get('/analytics', adminRtoController.getRtoAnalytics);
 router.get('/report', adminRtoController.exportRtoReport);
+router.post('/auto-sync-statuses', adminRtoController.autoSyncRtoStatuses);
 router.post('/refund', adminRtoController.processRtoRefund);
 router.post('/reject', adminRtoController.rejectRtoRefund);
 router.post('/resolve', adminRtoController.rejectRtoRefund);

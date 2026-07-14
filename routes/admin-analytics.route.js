@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const {
   getAllUsers,
+  exportUsersExcel,
   getUserById,
   bulkCartReminderEmail,
   bulkCartReminderPush,
@@ -33,6 +34,7 @@ router.use(requireStrictAdminStorefrontScope);
 
 // User analytics
 router.get('/users', getAllUsers);
+router.get('/users/export', exportUsersExcel);
 router.get('/push-settings', getLeadsPushSettings);
 router.put('/push-settings', updateLeadsPushSettings);
 router.post('/users/bulk-cart-reminder-email', bulkCartReminderEmail);

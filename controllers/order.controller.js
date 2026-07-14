@@ -1936,12 +1936,50 @@ exports.shiprocketWebhook = async (req, res) => {
         }
 
         const payload = req.body || {};
-        const sourceOrderId = payload.order_id || payload.orderId || payload.order_reference_id || payload.reference_id;
-        if (!sourceOrderId) {
-            return respondOrderError(res, 400, 'SHIPROCKET_WEBHOOK_ORDER_ID_REQUIRED', 'order_id is required in webhook payload');
+        const channelOrderId = String(
+            payload.order_id || payload.orderId || payload.order_reference_id || payload.reference_id || ''
+        ).trim();
+        const awbCode = String(payload.awb_code || payload.awb || '').trim();
+        const shipmentIdRaw = payload.shipment_id ?? payload.shipmentId;
+        const shipmentId =
+            shipmentIdRaw != null && String(shipmentIdRaw).trim() !== ''
+                ? String(shipmentIdRaw).trim()
+                : '';
+        const shiprocketOrderIdRaw =
+            payload.sr_order_id ?? payload.shiprocket_order_id ?? payload.sr_orderId;
+        const shiprocketOrderId =
+            shiprocketOrderIdRaw != null && String(shiprocketOrderIdRaw).trim() !== ''
+                ? String(shiprocketOrderIdRaw).trim()
+                : '';
+
+        if (!channelOrderId && !awbCode && !shipmentId && !shiprocketOrderId) {
+            return respondOrderError(
+                res,
+                400,
+                'SHIPROCKET_WEBHOOK_ORDER_ID_REQUIRED',
+                'order_id (or AWB / shipment_id / shiprocket order id) is required in webhook payload'
+            );
         }
 
-        const order = await Order.findOne({ orderId: String(sourceOrderId).trim() });
+        let order = null;
+        if (channelOrderId) {
+            order = await Order.findOne({ orderId: channelOrderId });
+        }
+        // Fallback when channel order_id is missing or is Shiprocket's numeric id.
+        if (!order && shiprocketOrderId) {
+            order = await Order.findOne({ 'shipmentInfo.shiprocketOrderId': shiprocketOrderId });
+        }
+        if (!order && shipmentId) {
+            order = await Order.findOne({ 'shipmentInfo.shipmentId': shipmentId });
+        }
+        if (!order && awbCode) {
+            order = await Order.findOne({
+                $or: [
+                    { 'shipmentInfo.awbCode': awbCode },
+                    { 'shipmentInfo.trackingNumber': awbCode }
+                ]
+            });
+        }
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found for webhook payload');
         }

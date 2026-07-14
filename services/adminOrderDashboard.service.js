@@ -40,13 +40,14 @@ function escapeRegex(s) {
 
 /**
  * @param {{ from?: string, to?: string, presetDays?: string | number, rangePreset?: string }} q
- * @returns {{ from: Date, to: Date, presetLabel: string }}
+ * @returns {{ from: Date | null, to: Date | null, presetLabel: string }}
  *
  * Precedence: (1) both `from` & `to` ISO → custom window
- * (2) `rangePreset`: today | last7 | last30
+ * (2) `rangePreset`: all | today | last7 | last30
  * (3) `presetDays` rolling window (legacy)
  * (4) default last 30 days rolling
  *
+ * `all` = no createdAt window (dashboard cards / lifetime totals).
  * `today` = start→end of **server local** calendar day (set TZ=Asia/Kolkata in production if needed).
  */
 function resolveDateRange(q) {
@@ -87,6 +88,10 @@ function resolveDateRange(q) {
 
   const rp = String(q.rangePreset || '').toLowerCase();
 
+  if (rp === 'all' || rp === 'alltime' || rp === 'lifetime') {
+    return { from: null, to: null, presetLabel: 'all' };
+  }
+
   if (rp === 'today') {
     const from = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
     const to = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
@@ -111,6 +116,24 @@ function resolveDateRange(q) {
 
   const from = new Date(now.getTime() - DEFAULT_RANGE_DAYS * 24 * 60 * 60 * 1000);
   return { from, to: now, presetLabel: `${DEFAULT_RANGE_DAYS}d` };
+}
+
+/**
+ * @param {Date | null | undefined} from
+ * @param {Date | null | undefined} to
+ * @param {import('mongoose').FilterQuery<any>} [scopeMatch]
+ */
+function buildScopedDateMatch(from, to, scopeMatch = {}) {
+  const clauses = [];
+  if (from instanceof Date && to instanceof Date && !Number.isNaN(from.getTime()) && !Number.isNaN(to.getTime())) {
+    clauses.push({ createdAt: { $gte: from, $lte: to } });
+  }
+  if (scopeMatch && Object.keys(scopeMatch).length) {
+    clauses.push(scopeMatch);
+  }
+  if (clauses.length === 0) return {};
+  if (clauses.length === 1) return clauses[0];
+  return { $and: clauses };
 }
 
 /**
@@ -247,16 +270,12 @@ function mergeFilters(base, search, bucket) {
 }
 
 /**
- * @param {Date} from
- * @param {Date} to
+ * @param {Date | null} from
+ * @param {Date | null} to
  * @param {import('mongoose').FilterQuery<any>} [scopeMatch]
  */
 async function aggregateSummary(from, to, scopeMatch = {}) {
-  const dateMatch = { createdAt: { $gte: from, $lte: to } };
-  const baseMatch =
-    scopeMatch && Object.keys(scopeMatch).length
-      ? { $and: [dateMatch, scopeMatch] }
-      : dateMatch;
+  const baseMatch = buildScopedDateMatch(from, to, scopeMatch);
 
   const [row] = await Order.aggregate([
     { $match: baseMatch },
@@ -513,6 +532,7 @@ function mapOrderRow(order) {
 
 module.exports = {
   resolveDateRange,
+  buildScopedDateMatch,
   buildSearchFilter,
   buildBucketMatch,
   mergeFilters,
