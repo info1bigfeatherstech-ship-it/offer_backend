@@ -10,6 +10,7 @@ const {
   isProviderStatusInTransit,
   isRtoProviderStatus
 } = require('./shiprocketStatusMap');
+const { isMoneyCapturedPaymentStatus } = require('../../utils/orderPaymentState');
 
 /**
  * @param {object|null|undefined} shipmentInfo
@@ -154,7 +155,13 @@ function computeOpsState(order) {
   const shiprocketRto = orderStatus === 'rto' || isRtoProviderStatus(si.providerStatus);
 
   if (orderStatus === 'cancelled' && !shiprocketRto) return OPS_STATES.CANCELLED;
-  if (orderStatus === 'payment_failed') return OPS_STATES.PAYMENT_FAILED;
+  // Intermediate Razorpay failures used to leave paid orders stuck as payment_failed.
+  if (orderStatus === 'payment_failed') {
+    if (isMoneyCapturedPaymentStatus(order.paymentStatus) && Number(order.amountPaidInr || 0) > 0.01) {
+      return OPS_STATES.AWAITING_APPROVAL;
+    }
+    return OPS_STATES.PAYMENT_FAILED;
+  }
   if (shiprocketRto) return OPS_STATES.RTO;
   if (orderStatus === 'delivered' || effectiveClass === CLASSIFICATION.DELIVERED) {
     return OPS_STATES.DELIVERED;

@@ -15,6 +15,7 @@ const {
   evaluateOrderPaymentForShiprocketFulfillment,
   fulfillmentPaymentBlockHttpStatus
 } = require('../utils/orderFulfillmentPaymentGate');
+const { isUnpaidTerminalOrder } = require('../utils/orderPaymentState');
 const {
   runAdminApproveOrderSingle,
   runAdminCancelOrderSingle
@@ -1991,7 +1992,11 @@ exports.adminFulfillmentListCouriers = async (req, res) => {
   }
 };
 
-const BULK_DOC_SKIP_STATUSES = new Set(['cancelled', 'payment_failed', 'rto']);
+function shouldSkipBulkDocForOrder(order) {
+  const st = String(order?.orderStatus || '').toLowerCase();
+  if (st === 'rto') return true;
+  return isUnpaidTerminalOrder(order);
+}
 
 /** POST /orders/admin/items/bulk-documents/tax-invoices-zip — ZIP of GST invoice HTML + manifest.json */
 exports.adminBulkTaxInvoicesZip = async (req, res) => {
@@ -2010,8 +2015,7 @@ exports.adminBulkTaxInvoicesZip = async (req, res) => {
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
-        const st = String(order.orderStatus || '').toLowerCase();
-        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+        if (shouldSkipBulkDocForOrder(order)) {
           return {
             orderId: oid,
             success: false,
@@ -2085,8 +2089,7 @@ exports.adminBulkManifestsZip = async (req, res) => {
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
-        const st = String(order.orderStatus || '').toLowerCase();
-        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+        if (shouldSkipBulkDocForOrder(order)) {
           return {
             orderId: oid,
             success: false,
@@ -2157,8 +2160,7 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
-        const st = String(order.orderStatus || '').toLowerCase();
-        if (BULK_DOC_SKIP_STATUSES.has(st)) {
+        if (shouldSkipBulkDocForOrder(order)) {
           return {
             orderId: oid,
             success: false,
