@@ -6,6 +6,7 @@ const { uploadReturnProofs } = require('../middlewares/upload.middleware');
 const {
   requireWholesaleUserForWholesaleStorefront
 } = require('../middlewares/storefront.middleware');
+const { requireAdminStorefrontScope } = require('../middlewares/admin-storefront-scope.middleware');
 const {
   createOrder,
   verifyPayment,
@@ -53,247 +54,188 @@ router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholes
 // Intentionally commented: customer order cancellation disabled by product policy (uncomment with exports.cancelOrder in order.controller.js to restore).
 // router.put('/items/:orderId/cancel', verifyToken, requireWholesaleUserForWholesaleStorefront, cancelOrder);
 
-router.post(
-  '/admin/items/:orderId/refund',
-  verifyToken,
-  authorizeRoles('admin'),
-  refundOrderPayment
-);
+/**
+ * Admin order ops under /admin/* — storefront-scoped (non-strict):
+ * missing header → ecomm default, or single allowedStorefronts entry (wholesale-only staff).
+ * Does not break live ecomm admin if x-storefront is omitted on these paths.
+ */
+const adminOrderStaff = [verifyToken, authorizeRoles('admin', 'order_manager'), requireAdminStorefrontScope];
+const adminOrderRefund = [verifyToken, authorizeRoles('admin'), requireAdminStorefrontScope];
 
-router.put(
-  '/admin/items/:orderId/status',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  updateOrderStatus
-);
+router.post('/admin/items/:orderId/refund', ...adminOrderRefund, refundOrderPayment);
 
-router.get(
-  '/admin/returns/requests',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  listAdminReturnRequests
-);
+router.put('/admin/items/:orderId/status', ...adminOrderStaff, updateOrderStatus);
 
-router.get(
-  '/admin/returns/requests/:orderId',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  getAdminReturnRequest
-);
+router.get('/admin/returns/requests', ...adminOrderStaff, listAdminReturnRequests);
 
-router.post(
-  '/admin/returns/requests/:orderId/decision',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  adminDecideReturnRequest
-);
+router.get('/admin/returns/requests/:orderId', ...adminOrderStaff, getAdminReturnRequest);
 
-router.post(
-  '/admin/returns/requests/:orderId/refund',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  adminInitiateReturnRefund
-);
+router.post('/admin/returns/requests/:orderId/decision', ...adminOrderStaff, adminDecideReturnRequest);
 
-router.post(
-  '/admin/returns/requests/:orderId/chat',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  sendReturnChatMessage
-);
+router.post('/admin/returns/requests/:orderId/refund', ...adminOrderStaff, adminInitiateReturnRefund);
 
-router.get(
-  '/admin/returns/requests/:orderId/chat',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
-  getReturnChat
-);
+router.post('/admin/returns/requests/:orderId/chat', ...adminOrderStaff, sendReturnChatMessage);
+
+router.get('/admin/returns/requests/:orderId/chat', ...adminOrderStaff, getReturnChat);
 
 router.post(
   '/admin/returns/requests/:orderId/reverse-pickup/retry',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminReturnReversePickupRetry
 );
 
 router.post(
   '/admin/items/:orderId/edit-pending/preview',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminPendingOrderEdit.previewPendingOrderEdit
 );
 router.post(
   '/admin/items/:orderId/edit-pending',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminPendingOrderEdit.applyPendingOrderEdit
 );
 
 router.get(
   '/admin/items/:orderId/address-intelligence',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminPendingOrderAddress.getAddressIntelligence
 );
 
 router.post(
   '/admin/items/:orderId/edit-pending-address/preview',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminPendingOrderAddress.previewPendingAddressEdit
 );
 
 router.post(
   '/admin/items/:orderId/edit-pending-address',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminPendingOrderAddress.applyPendingAddressEdit
 );
 
 router.post(
   '/admin/items/bulk-approval/confirm',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkApprovalConfirm
 );
 
 router.post(
   '/admin/items/bulk-approval/cancel',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkApprovalCancel
 );
 
 router.post(
   '/admin/items/bulk-fulfillment/ship-now',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkFulfillmentShipNow
 );
 
 router.post(
   '/admin/items/bulk-fulfillment/schedule-pickup',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkFulfillmentSchedulePickup
 );
 
 router.post(
   '/admin/items/bulk-fulfillment/sync-shiprocket',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkFulfillmentSyncShiprocket
 );
 
 router.get(
   '/admin/fulfillment/pickup-calendar',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentPickupCalendar
 );
 
 router.post(
   '/admin/items/bulk-documents/tax-invoices-zip',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkTaxInvoicesZip
 );
 
 router.post(
   '/admin/items/bulk-documents/shipping-labels-zip',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkShippingLabelsZip
 );
 
 router.post(
   '/admin/items/bulk-documents/manifests-zip',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminBulkManifestsZip
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/ensure-shipment',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentEnsureShipment
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/assign-ship',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentAssignShip
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/sync-shiprocket',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentSyncShiprocket
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/schedule-pickup',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentSchedulePickup
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/shipping-label',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentShippingLabel
 );
 
 router.get(
   '/admin/items/:orderId/fulfillment/shipping-label-file',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentShippingLabelFile
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/manifest',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentManifest
 );
 
 router.get(
   '/admin/items/:orderId/fulfillment/manifest-file',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentManifestFile
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/cancel-shipment',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentCancelShipment
 );
 
 router.post(
   '/admin/items/:orderId/fulfillment/retry-pickup',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentRetryPickup
 );
 
 router.get(
   '/admin/items/:orderId/fulfillment/couriers',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminFulfillmentListCouriers
 );
 
 router.get(
   '/admin/items/:orderId/invoice-html',
-  verifyToken,
-  authorizeRoles('admin', 'order_manager'),
+  ...adminOrderStaff,
   adminFulfillment.adminInvoiceHtml
 );
 

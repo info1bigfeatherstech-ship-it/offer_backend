@@ -34,6 +34,9 @@ const {
 const { generateOrderId } = require('../utils/orderId');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const {
+    mergeAdminOrderFilter
+} = require('../utils/adminOrderScope');
+const {
     normalizePaymentMethod,
     normalizePaymentPlan,
     normalizeBalanceCollection,
@@ -2863,7 +2866,7 @@ exports.updateOrderStatus = async (req, res) => {
             );
         }
 
-        const order = await Order.findOne({ orderId: orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3369,21 +3372,23 @@ exports.listAdminReturnRequests = async (req, res) => {
         const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
         const skip = (page - 1) * limit;
 
-        const filter = {
-            'returnInfo.requestedAt': { $ne: null }
-        };
-        if (statusFilter) {
-            filter['returnInfo.status'] = statusFilter;
-        }
+        const listFilter = statusFilter
+            ? mergeAdminOrderFilter(req, {
+                'returnInfo.requestedAt': { $ne: null },
+                'returnInfo.status': statusFilter
+              })
+            : mergeAdminOrderFilter(req, {
+                'returnInfo.requestedAt': { $ne: null }
+              });
 
         const [rows, total] = await Promise.all([
-            Order.find(filter)
+            Order.find(listFilter)
                 .sort({ 'returnInfo.requestedAt': -1 })
                 .skip(skip)
                 .limit(limit)
-                .select('orderId totalAmount paymentStatus orderStatus returnInfo addressSnapshot createdAt updatedAt')
+                .select('orderId totalAmount paymentStatus orderStatus returnInfo addressSnapshot createdAt updatedAt storefront userType')
                 .lean(),
-            Order.countDocuments(filter)
+            Order.countDocuments(listFilter)
         ]);
 
         const data = rows.map((o) => ({
@@ -3426,7 +3431,7 @@ exports.listAdminReturnRequests = async (req, res) => {
 exports.getAdminReturnRequest = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const order = await Order.findOne({ orderId })
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }))
             .populate('items.productId', 'name slug')
             .lean();
         if (!order) {
@@ -3457,7 +3462,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
             return respondOrderError(res, 400, 'RETURN_DECISION_INVALID', 'Decision must be approve or reject');
         }
 
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3530,7 +3535,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
 exports.adminInitiateReturnRefund = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3614,7 +3619,7 @@ exports.refundOrderPayment = async (req, res) => {
         const { orderId } = req.params;
         const { amount } = req.body || {};
 
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3697,7 +3702,9 @@ exports.sendReturnChatMessage = async (req, res) => {
             return respondOrderError(res, 400, 'MESSAGE_REQUIRED', 'Message content is required');
         }
 
-        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const query = isAdmin
+            ? mergeAdminOrderFilter(req, { orderId })
+            : { orderId, userId: req.userId };
         const order = await Order.findOne(query);
 
         if (!order) {
@@ -3757,7 +3764,9 @@ exports.getReturnChat = async (req, res) => {
         const { orderId } = req.params;
         const isAdmin = req.userRole === 'admin' || req.userRole === 'order_manager';
 
-        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const query = isAdmin
+            ? mergeAdminOrderFilter(req, { orderId })
+            : { orderId, userId: req.userId };
         const order = await Order.findOne(query);
 
         if (!order) {

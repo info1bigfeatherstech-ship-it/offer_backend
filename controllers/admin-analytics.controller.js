@@ -170,12 +170,13 @@ const exportUsersExcel = async (req, res) => {
   try {
     const XLSX = require('xlsx');
 
-    const users = await User.find({
-      userType: { $ne: 'admin' },
-      role: {
-        $nin: ['admin', 'product_manager', 'order_manager', 'marketing_manager']
-      }
-    })
+    const users = await User.find(
+      mergeAnd(scopedUserQueryFromReq(req), {
+        role: {
+          $nin: ['admin', 'product_manager', 'order_manager', 'marketing_manager']
+        }
+      })
+    )
       .select(
         'name email phone userType role status isEmailVerified isPhoneVerified registrationMethod isProfileComplete lastLoginMethod createdAt updatedAt'
       )

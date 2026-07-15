@@ -35,6 +35,10 @@ const {
 const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const {
+  getAdminOrderMatch,
+  mergeOrderScopeFilter
+} = require('../utils/adminOrderScope');
+const {
   isCourierInactive,
   pickCheapestActiveCourier,
   filterActiveCouriers,
@@ -184,7 +188,9 @@ async function loadStaffOrder(req, res, orderId) {
     jsonError(res, 400, 'ORDER_ID_REQUIRED', 'orderId is required');
     return null;
   }
-  const order = await Order.findOne({ orderId: id }).populate('items.productId', 'name slug shipping variants');
+  const order = await Order.findOne(
+    mergeOrderScopeFilter({ orderId: id }, getAdminOrderMatch(req))
+  ).populate('items.productId', 'name slug shipping variants');
   if (!order) {
     jsonError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
     return null;
@@ -221,10 +227,11 @@ const MAX_BULK_ORDER_IDS = 50;
 const DEFAULT_BULK_CONCURRENCY = 4;
 const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping variants' };
 
-async function loadOrderDocByOrderId(orderId) {
+async function loadOrderDocByOrderId(orderId, scopeMatch = null) {
   const id = String(orderId || '').trim();
   if (!id) return null;
-  return Order.findOne({ orderId: id }).populate(FULFILLMENT_ITEM_POPULATE);
+  const filter = mergeOrderScopeFilter({ orderId: id }, scopeMatch);
+  return Order.findOne(filter).populate(FULFILLMENT_ITEM_POPULATE);
 }
 
 function parseBulkConcurrency(value) {
@@ -1056,7 +1063,7 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
 /**
  * Single-order ship-now pipeline for bulk (ensure + assign when needed). Caller does not hold a DB session.
  * @param {string} orderId
- * @param {{ courierId?: number|null }} [opts]
+ * @param {{ courierId?: number|null, scopeMatch?: object|null }} [opts]
  */
 async function runBulkShipNowSingle(orderId, opts = {}) {
   try {
@@ -1065,7 +1072,8 @@ async function runBulkShipNowSingle(orderId, opts = {}) {
       return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
     }
 
-    const order = await loadOrderDocByOrderId(id);
+    const scopeMatch = opts.scopeMatch || null;
+    const order = await loadOrderDocByOrderId(id, scopeMatch);
   if (!order) {
     return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
   }
@@ -1115,7 +1123,7 @@ async function runBulkShipNowSingle(orderId, opts = {}) {
     };
   }
 
-  let working = await loadOrderDocByOrderId(id);
+  let working = await loadOrderDocByOrderId(id, scopeMatch);
   if (!working) {
     return { orderId: id, success: false, skipped: false, code: 'ORDER_RELOAD_FAILED', message: 'Could not reload order after ensure.' };
   }
@@ -1170,8 +1178,9 @@ async function runBulkShipNowSingle(orderId, opts = {}) {
 /**
  * @param {string} orderId
  * @param {string} pickupDateYmd
+ * @param {object|null} [scopeMatch]
  */
-async function runBulkSchedulePickupSingle(orderId, pickupDateYmd) {
+async function runBulkSchedulePickupSingle(orderId, pickupDateYmd, scopeMatch = null) {
   try {
   const id = String(orderId || '').trim();
   const pickupDate = String(pickupDateYmd || '').trim();
@@ -1179,7 +1188,7 @@ async function runBulkSchedulePickupSingle(orderId, pickupDateYmd) {
     return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
   }
 
-  const order = await loadOrderDocByOrderId(id);
+  const order = await loadOrderDocByOrderId(id, scopeMatch);
   if (!order) {
     return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
   }
@@ -1296,8 +1305,11 @@ exports.adminBulkFulfillmentShipNow = async (req, res) => {
 
     const parallel = parseBulkConcurrency(req.body?.concurrency);
     const courierId = req.body?.courierId != null ? Number(req.body.courierId) : null;
+    const scopeMatch = getAdminOrderMatch(req);
     const courierOpt =
-      courierId != null && Number.isFinite(courierId) && courierId > 0 ? { courierId } : {};
+      courierId != null && Number.isFinite(courierId) && courierId > 0
+        ? { courierId, scopeMatch }
+        : { scopeMatch };
 
     const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runBulkShipNowSingle(oid, courierOpt));
 
@@ -1338,7 +1350,10 @@ exports.adminBulkFulfillmentSchedulePickup = async (req, res) => {
     }
 
     const parallel = parseBulkConcurrency(req.body?.concurrency);
-    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runBulkSchedulePickupSingle(oid, pickupDate));
+    const scopeMatch = getAdminOrderMatch(req);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) =>
+      runBulkSchedulePickupSingle(oid, pickupDate, scopeMatch)
+    );
 
     const succeeded = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
@@ -1365,15 +1380,16 @@ exports.adminBulkFulfillmentSchedulePickup = async (req, res) => {
 /**
  * Single-order Shiprocket sync for bulk refresh (reconcile + SRPID backfill).
  * @param {string} orderId
+ * @param {object|null} [scopeMatch]
  */
-async function runBulkSyncShiprocketSingle(orderId) {
+async function runBulkSyncShiprocketSingle(orderId, scopeMatch = null) {
   try {
     const id = String(orderId || '').trim();
     if (!id) {
       return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
     }
 
-    const order = await loadOrderDocByOrderId(id);
+    const order = await loadOrderDocByOrderId(id, scopeMatch);
     if (!order) {
       return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
     }
@@ -1456,7 +1472,10 @@ exports.adminBulkFulfillmentSyncShiprocket = async (req, res) => {
     }
 
     const parallel = parseBulkConcurrency(req.body?.concurrency);
-    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runBulkSyncShiprocketSingle(oid));
+    const scopeMatch = getAdminOrderMatch(req);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) =>
+      runBulkSyncShiprocketSingle(oid, scopeMatch)
+    );
 
     const succeeded = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
@@ -1983,10 +2002,11 @@ exports.adminBulkTaxInvoicesZip = async (req, res) => {
       return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
     }
     const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const scopeMatch = getAdminOrderMatch(req);
 
     const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
       try {
-        const order = await loadOrderDocByOrderId(oid);
+        const order = await loadOrderDocByOrderId(oid, scopeMatch);
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
@@ -2057,10 +2077,11 @@ exports.adminBulkManifestsZip = async (req, res) => {
       return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
     }
     const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const scopeMatch = getAdminOrderMatch(req);
 
     const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
       try {
-        const order = await loadOrderDocByOrderId(oid);
+        const order = await loadOrderDocByOrderId(oid, scopeMatch);
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
@@ -2128,10 +2149,11 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
       return jsonError(res, 400, 'ORDER_IDS_REQUIRED', `Provide orderIds (non-empty array, max ${MAX_BULK_ORDER_IDS}).`);
     }
     const parallel = parseBulkConcurrency(req.body?.concurrency);
+    const scopeMatch = getAdminOrderMatch(req);
 
     const results = await mapInConcurrentWindows(orderIds, parallel, async (oid) => {
       try {
-        const order = await loadOrderDocByOrderId(oid);
+        const order = await loadOrderDocByOrderId(oid, scopeMatch);
         if (!order) {
           return { orderId: oid, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
         }
@@ -2392,7 +2414,10 @@ exports.adminBulkApprovalConfirm = async (req, res) => {
     }
 
     const parallel = parseBulkConcurrency(req.body?.concurrency);
-    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runAdminApproveOrderSingle(oid));
+    const scopeMatch = getAdminOrderMatch(req);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) =>
+      runAdminApproveOrderSingle(oid, { scopeMatch })
+    );
 
     const succeeded = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
@@ -2427,7 +2452,10 @@ exports.adminBulkApprovalCancel = async (req, res) => {
     }
 
     const parallel = parseBulkConcurrency(req.body?.concurrency);
-    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) => runAdminCancelOrderSingle(oid));
+    const scopeMatch = getAdminOrderMatch(req);
+    const results = await mapInConcurrentWindows(orderIds, parallel, (oid) =>
+      runAdminCancelOrderSingle(oid, { scopeMatch })
+    );
 
     const succeeded = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);

@@ -4,6 +4,7 @@
  */
 
 const { STOREFRONT_HEADER_ALIASES } = require('../constants/storefrontHeaders');
+const { buildOrderMatchForStorefront } = require('../utils/adminOrderScope');
 
 const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
 
@@ -50,7 +51,8 @@ function _enforceAdminStorefrontScope(req, res, next, options = {}) {
     storefront: requestedStorefront,
     explicitStorefront: hasExplicitHeader ? requestedStorefront : null,
     allowedStorefronts,
-    orderMatch: requestedStorefront === 'wholesale' ? { userType: 'wholesaler' } : { userType: 'normal' },
+    /** Orders: userType + storefront (ecomm includes legacy missing storefront). */
+    orderMatch: buildOrderMatchForStorefront(requestedStorefront),
     userMatch: requestedStorefront === 'wholesale' ? { userType: 'wholesaler' } : { userType: 'user' }
   };
 

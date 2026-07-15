@@ -7,6 +7,8 @@ const {
   EDITABLE_ADDRESS_FIELDS
 } = require('../services/adminPendingOrderAddressEdit.service');
 const { createEditError } = require('../services/adminPendingOrderEdit.service');
+const { getAdminOrderMatch, mergeOrderScopeFilter } = require('../utils/adminOrderScope');
+const Order = require('../models/Order');
 const logger = require('../utils/logger');
 
 function sendError(res, err, fallbackMessage) {
@@ -31,6 +33,17 @@ function sendError(res, err, fallbackMessage) {
 exports.getAddressIntelligence = async (req, res) => {
   try {
     const orderId = req.params.orderId;
+    const scopeMatch = getAdminOrderMatch(req);
+    const scoped = await Order.findOne(mergeOrderScopeFilter({ orderId }, scopeMatch))
+      .select('_id orderId')
+      .lean();
+    if (!scoped) {
+      return sendError(
+        res,
+        createEditError(404, 'ORDER_NOT_FOUND', 'Order not found'),
+        'Order not found'
+      );
+    }
     const refresh = String(req.query.refresh || '') === '1' || String(req.query.refresh || '').toLowerCase() === 'true';
     const data = await getAddressIntelligenceForOrder(orderId, { refreshFromShiprocket: refresh });
     return res.json({ success: true, data });
@@ -53,7 +66,8 @@ exports.previewPendingAddressEdit = async (req, res) => {
       addressPatch: req.body?.addressPatch || req.body || {},
       alsoUpdateSavedAddress: Boolean(req.body?.alsoUpdateSavedAddress),
       commit: false,
-      adminUserId: req.user?.id || req.user?._id || null
+      adminUserId: req.user?.id || req.user?._id || null,
+      scopeMatch: getAdminOrderMatch(req)
     });
     return res.json({
       success: true,
@@ -82,7 +96,8 @@ exports.applyPendingAddressEdit = async (req, res) => {
       addressPatch: req.body?.addressPatch || {},
       alsoUpdateSavedAddress: Boolean(req.body?.alsoUpdateSavedAddress),
       commit: true,
-      adminUserId: req.user?.id || req.user?._id || null
+      adminUserId: req.user?.id || req.user?._id || null,
+      scopeMatch: getAdminOrderMatch(req)
     });
     return res.json({
       success: true,
