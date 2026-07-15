@@ -135,14 +135,14 @@ async function getProductReviewEligibility(userId, productId, opts = {}) {
   if (existing) {
     return {
       canCreate: false,
-      canUpdate: true,
+      canUpdate: false,
       hasReview: true,
       review: existing,
       qualifyingOrderId: existing.orderId || null,
       verifiedPurchaseEligible: Boolean(existing.verifiedPurchase),
-      canAttachImages: Boolean(existing.verifiedPurchase),
+      canAttachImages: false,
       code: 'ALREADY_REVIEWED',
-      message: 'You have already reviewed this product. You can update your review.',
+      message: 'You have already submitted a review for this product.',
     };
   }
 

@@ -469,130 +469,19 @@ const createCustomerReview = async (req, res) => {
 };
 
 const updateCustomerReview = async (req, res) => {
-  let uploadedImages = [];
   try {
     const userId = req.user?.id;
     if (!userId) {
       return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
     }
 
-    const { id } = req.params;
-    if (!isValidObjectId(id)) {
-      return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
-    }
-
-    const { rating: ratingRaw, comment: commentRaw, removeImagePublicIds } =
-      parseReviewRequestBody(req);
-    const patch = {};
-    const incomingFiles = getIncomingReviewImageFiles(req);
-
-    if (ratingRaw !== undefined && ratingRaw !== null && String(ratingRaw).trim() !== '') {
-      const rating = Number(ratingRaw);
-      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-        return jsonError(res, 400, 'INVALID_RATING', 'Rating must be an integer from 1 to 5');
-      }
-      patch.rating = rating;
-    }
-
-    if (commentRaw !== undefined) {
-      patch.comment = String(commentRaw || '').trim().slice(0, 2000);
-    }
-
-    const storefront = resolveReviewStorefrontFromReq(req);
-    const review = await ProductReview.findOne(
-      mergeReviewStorefrontFilter(
-        {
-          _id: id,
-          userId,
-          source: 'customer'
-        },
-        storefront
-      )
+    return jsonError(
+      res,
+      403,
+      'REVIEW_LOCKED',
+      'Reviews cannot be edited after submission.'
     );
-
-    if (!review) {
-      return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
-    }
-
-    const existingImages = normalizeStoredImages(review.images);
-    const removeSet = new Set(removeImagePublicIds || []);
-    const keptImages = existingImages.filter((img) => {
-      if (img.publicId && removeSet.has(img.publicId)) return false;
-      if (img.url && removeSet.has(img.url)) return false;
-      return true;
-    });
-    const removedImages = existingImages.filter((img) => {
-      if (img.publicId && removeSet.has(img.publicId)) return true;
-      if (img.url && removeSet.has(img.url)) return true;
-      return false;
-    });
-
-    if (incomingFiles.length > MAX_REVIEW_IMAGES) {
-      return jsonError(
-        res,
-        400,
-        'TOO_MANY_IMAGES',
-        `You can upload up to ${MAX_REVIEW_IMAGES} images per review`
-      );
-    }
-
-    if (keptImages.length + incomingFiles.length > MAX_REVIEW_IMAGES) {
-      return jsonError(
-        res,
-        400,
-        'TOO_MANY_IMAGES',
-        `You can have at most ${MAX_REVIEW_IMAGES} images per review`
-      );
-    }
-
-    if (incomingFiles.length && !Boolean(review.verifiedPurchase)) {
-      return jsonError(
-        res,
-        403,
-        'PHOTOS_REQUIRE_PURCHASE',
-        'Photos can only be added on verified purchase reviews. Manage photos from My Orders after delivery.'
-      );
-    }
-
-    if (incomingFiles.length) {
-      uploadedImages = await uploadReviewImages(incomingFiles, {
-        productId: String(review.productId),
-        userId: String(userId),
-        orderId: review.orderId
-      });
-    }
-
-    const nextImages = [...keptImages, ...uploadedImages];
-    const hasImageChanges =
-      incomingFiles.length > 0 || removedImages.length > 0;
-
-    if (
-      Object.keys(patch).length === 0 &&
-      !hasImageChanges
-    ) {
-      return jsonError(res, 400, 'NO_CHANGES', 'No valid fields to update');
-    }
-
-    Object.assign(review, patch);
-    if (hasImageChanges) {
-      review.images = nextImages;
-    }
-
-    await review.save();
-    if (removedImages.length) {
-      await deleteReviewImagesFromCloudinary(removedImages);
-    }
-    await syncProductRatingFromReviews(review.productId);
-
-    return res.json({
-      success: true,
-      message: 'Review updated',
-      review: serializeCustomerReview(review)
-    });
   } catch (err) {
-    if (uploadedImages.length) {
-      await deleteReviewImagesFromCloudinary(uploadedImages);
-    }
     console.error('[updateCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_UPDATE_ERROR', 'Could not update review');
   }
@@ -860,38 +749,12 @@ const deleteCustomerReview = async (req, res) => {
       return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
     }
 
-    const { id } = req.params;
-    if (!isValidObjectId(id)) {
-      return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
-    }
-
-    const review = await ProductReview.findOne(
-      mergeReviewStorefrontFilter(
-        {
-          _id: id,
-          userId,
-          source: 'customer'
-        },
-        resolveReviewStorefrontFromReq(req)
-      )
+    return jsonError(
+      res,
+      403,
+      'REVIEW_LOCKED',
+      'Reviews cannot be deleted after submission.'
     );
-
-    if (!review) {
-      return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
-    }
-
-    const productId = review.productId;
-    const images = normalizeStoredImages(review.images);
-    await review.deleteOne();
-    if (images.length) {
-      await deleteReviewImagesFromCloudinary(images);
-    }
-    await syncProductRatingFromReviews(productId);
-
-    return res.json({
-      success: true,
-      message: 'Your review was deleted'
-    });
   } catch (err) {
     console.error('[deleteCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_DELETE_ERROR', 'Could not delete review');
