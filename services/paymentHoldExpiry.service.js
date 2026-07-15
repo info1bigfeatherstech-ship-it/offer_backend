@@ -123,7 +123,7 @@ class PaymentHoldExpiryService {
           await order.save({ session });
 
           await releaseReservedInventoryForOrder(order, session);
-          await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session);
+          await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
 
           await session.commitTransaction();
           session.endSession();

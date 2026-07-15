@@ -1,10 +1,11 @@
 /**
  * After an unpaid checkout order is voided (e.g. payment hold timeout), merge its
- * line items back into the user's cart. Cart was cleared at order creation.
+ * line items back into the user's cart for the same storefront. Cart was cleared at order creation.
  */
 const mongoose = require('mongoose');
-const Cart = require('../models/cart');
 const logger = require('../utils/logger');
+const { findOrCreateCartForStorefront } = require('./cartStorefront.service');
+const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
 function toObjectId(v) {
   if (v == null) return null;
@@ -20,14 +21,13 @@ function toObjectId(v) {
  * @param {mongoose.Types.ObjectId} userId
  * @param {Array<{ productId?: unknown, variantId?: unknown, quantity?: unknown, priceSnapshot?: object, variantAttributesSnapshot?: unknown[] }>} orderItems
  * @param {import('mongoose').ClientSession | null} [session]
+ * @param {'ecomm'|'wholesale'|string|null} [storefront]
  */
-async function mergeOrderLineItemsIntoUserCart(userId, orderItems, session = null) {
+async function mergeOrderLineItemsIntoUserCart(userId, orderItems, session = null, storefront = 'ecomm') {
   if (!userId || !Array.isArray(orderItems) || orderItems.length === 0) return;
 
-  let cart = await Cart.findOne({ userId }).session(session);
-  if (!cart) {
-    cart = new Cart({ userId, items: [] });
-  }
+  const sf = normalizeCustomerStorefront(storefront);
+  let cart = await findOrCreateCartForStorefront(userId, sf, { session });
 
   let mergedLines = 0;
 
@@ -83,13 +83,12 @@ async function mergeOrderLineItemsIntoUserCart(userId, orderItems, session = nul
 
   if (mergedLines === 0) return;
 
+  if (typeof cart.calculateTotal === 'function') {
+    cart.calculateTotal();
+  }
   cart.markModified('items');
-  cart.calculateTotal();
-  await cart.save({ session });
-  logger.info('[restoreCartFromOrder] Merged timed-out order lines into cart', {
-    userId: String(userId),
-    lines: mergedLines
-  });
+  if (session) await cart.save({ session });
+  else await cart.save();
 }
 
 module.exports = { mergeOrderLineItemsIntoUserCart };

@@ -10,6 +10,8 @@ const {
   DEFAULT_UNIT_WEIGHT_KG
 } = require('../utils/variantCatalogFields');
 const logger = require('../utils/logger');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
+const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
 function uniqueProductIds(cartItems) {
   const ids = [];
@@ -88,7 +90,7 @@ exports.checkDeliveryAvailability = async (req, res) => {
     const cartDoc = cartId
       ? await Cart.findById(cartId)
       : userId
-        ? await Cart.findOne({ userId })
+        ? await findCartForStorefront(userId, normalizeCustomerStorefront(req.storefront))
         : null;
 
     if (cartDoc?.items?.length) {

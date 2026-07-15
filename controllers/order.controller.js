@@ -1,7 +1,6 @@
 // controllers/order.controller.js
 const Order = require('../models/Order');
 const Address = require('../models/Address');
-const Cart = require('../models/cart');
 const CheckoutQuote = require('../models/CheckoutQuote');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
@@ -19,6 +18,8 @@ const {
 } = require('../services/checkoutComputation.service');
 const { releaseReservedInventoryForOrder } = require('../services/orderInventory.service');
 const { mergeOrderLineItemsIntoUserCart } = require('../services/restoreCartFromOrder.service');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
+const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
@@ -1009,8 +1010,20 @@ exports.createOrder = async (req, res) => {
             });
         }
 
-        // 2. Get user's cart
-        const cartDoc = await Cart.findOne({ userId }).session(session);
+        if (!addressBelongsToStorefront(address, storefront)) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(403).json({
+                success: false,
+                code: 'ADDRESS_STOREFRONT_MISMATCH',
+                message: 'Address does not belong to this storefront'
+            });
+        }
+
+        // 2. Get user's cart (same storefront)
+        const cartDoc = await findCartForStorefront(userId, storefront).session(session);
         if (!cartDoc || !cartDoc.items || cartDoc.items.length === 0) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
@@ -2445,7 +2458,7 @@ exports.abandonOnlineCheckout = async (req, res) => {
 
             await order.save({ session });
             await releaseReservedInventoryForOrder(order, session);
-            await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session);
+            await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
 
             await session.commitTransaction();
             session.endSession();

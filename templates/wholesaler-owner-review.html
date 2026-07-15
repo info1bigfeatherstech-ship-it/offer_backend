@@ -10,15 +10,15 @@
   <main class="wrap">
     <header class="page-head">
       <h1>Wholesaler application</h1>
-      <p class="lede">Verify details and documents, then choose an action.</p>
+      <p class="lede">{{LEDE}}</p>
     </header>
 
     <section class="at-a-glance" aria-label="Summary">
       <p class="summary">{{SUMMARY_LINE}}</p>
     </section>
 
-    <details class="fold">
-      <summary>Full application details</summary>
+    <details class="fold" open>
+      <summary>{{DETAILS_SUMMARY_LABEL}}</summary>
       <div class="table-wrap">
         <table>
           <tbody>
@@ -28,17 +28,14 @@
       </div>
     </details>
 
-    <section class="docs" aria-label="Documents">
-      <h2 class="h2">Documents</h2>
-      {{DOCS_SECTION}}
-    </section>
+    {{DOCS_SECTION}}
 
     <section class="actions" aria-label="Decision">
       <form class="action-card" method="post" action="{{DECISION_URL}}">
         <input type="hidden" name="token" value="{{TOKEN}}" />
         <input type="hidden" name="decision" value="approve" />
         <h2>Approve</h2>
-        <p>Applicant can complete activation after approval.</p>
+        <p>{{APPROVE_HINT}}</p>
         <button type="submit" class="dec approve">Approve</button>
       </form>
       <form class="action-card" method="post" action="{{DECISION_URL}}">

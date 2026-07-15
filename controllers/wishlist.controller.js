@@ -1,12 +1,12 @@
 const Wishlist = require('../models/Wishlist');
 const Product = require('../models/Product');
-const Cart = require('../models/cart');
 const {
   mongoCatalogAnd,
   mongoCatalogListFilter,
   isProductListedOnStorefront,
   isVariantListedOnStorefront
 } = require('../utils/storefrontCatalog');
+const { findOrCreateCartForStorefront } = require('../services/cartStorefront.service');
 
 const WISHLIST_PRODUCT_SELECT =
   'name slug variants images brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt';
@@ -426,8 +426,7 @@ const moveToCart = async (req, res) => {
       }
     });
 
-    let cartDoc = await Cart.findOne({ userId });
-    if (!cartDoc) cartDoc = new Cart({ userId, items: [] });
+    let cartDoc = await findOrCreateCartForStorefront(userId, storefront);
 
     for (const item of itemsToMove) {
       const product = productMap.get(String(item.productId));

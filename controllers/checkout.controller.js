@@ -1,5 +1,4 @@
 const Address = require('../models/Address');
-const Cart = require('../models/cart');
 const CheckoutQuote = require('../models/CheckoutQuote');
 const mongoose = require('mongoose');
 const {
@@ -27,8 +26,10 @@ const {
   validateCarrierCodForCheckout,
   buildClientCodAvailability
 } = require('../utils/checkoutPaymentPolicy');
-const logger = require('../utils/logger');
 const { sanitizeCartItems } = require('../services/cartSanitize.service');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
+const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
+const logger = require('../utils/logger');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 
@@ -247,7 +248,11 @@ exports.quoteCheckout = async (req, res) => {
     }
 
     const address = await Address.findById(addressId).lean();
-    if (!address || String(address.userId) !== String(userId)) {
+    if (
+      !address ||
+      String(address.userId) !== String(userId) ||
+      !addressBelongsToStorefront(address, storefront)
+    ) {
       return respondCheckoutInputError(res, 404, 'ADDRESS_NOT_FOUND', 'Address not found');
     }
 
@@ -256,7 +261,7 @@ exports.quoteCheckout = async (req, res) => {
       return respondCheckoutInputError(res, 400, 'INVALID_POSTAL_CODE', 'Address must have a valid 6-digit postal code');
     }
 
-    const cartDoc = await Cart.findOne({ userId });
+    const cartDoc = await findCartForStorefront(userId, storefront);
     if (!cartDoc?.items?.length) {
       return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'cart is empty');
     }
@@ -521,7 +526,11 @@ exports.confirmCheckout = async (req, res) => {
     }
 
     const address = await Address.findById(quote.addressId).lean();
-    if (!address || String(address.userId) !== String(userId)) {
+    if (
+      !address ||
+      String(address.userId) !== String(userId) ||
+      !addressBelongsToStorefront(address, storefront)
+    ) {
       return respondCheckoutInputError(res, 400, 'QUOTE_ADDRESS_INVALID', 'Address is no longer valid for this quote');
     }
 
@@ -530,7 +539,7 @@ exports.confirmCheckout = async (req, res) => {
       return respondCheckoutInputError(res, 400, 'QUOTE_POSTAL_CODE_CHANGED', 'Address pincode changed. Regenerate quote.');
     }
 
-    const cartDoc = await Cart.findOne({ userId });
+    const cartDoc = await findCartForStorefront(userId, storefront);
     if (!cartDoc?.items?.length) {
       return respondCheckoutInputError(res, 400, 'CART_EMPTY', 'Cart is empty. Regenerate quote.');
     }

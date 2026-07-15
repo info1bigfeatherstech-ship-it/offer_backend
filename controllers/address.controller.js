@@ -3,6 +3,11 @@ const {
   validatePhysicalAddressForSave,
   shouldRunFullAddressValidation
 } = require("../utils/addressValidation");
+const {
+  resolveCustomerStorefrontFromReq,
+  mergeCustomerStorefrontFilter,
+  normalizeCustomerStorefront
+} = require("../utils/customerStorefrontScope");
 
 const clean = (val) => (typeof val === "string" ? val.trim() : val);
 
@@ -10,6 +15,7 @@ const clean = (val) => (typeof val === "string" ? val.trim() : val);
 const addAddress = async (req, res) => {
   try {
     const userId = req.userId;
+    const storefront = resolveCustomerStorefrontFromReq(req);
 
     const {
       addressType,
@@ -47,18 +53,23 @@ const addAddress = async (req, res) => {
     const d = validation.data;
 
     // =========================
-    // 🔍 DUPLICATE CHECK (SMART)
+    // 🔍 DUPLICATE CHECK (SMART) — same storefront only
     // =========================
-    const existingAddress = await Address.findOne({
-      userId,
-      fullName: d.fullName,
-      phone: d.phone,
-      houseNumber: d.houseNumber,
-      area: d.area,
-      city: d.city,
-      state: d.state,
-      postalCode: d.postalCode
-    });
+    const existingAddress = await Address.findOne(
+      mergeCustomerStorefrontFilter(
+        {
+          userId,
+          fullName: d.fullName,
+          phone: d.phone,
+          houseNumber: d.houseNumber,
+          area: d.area,
+          city: d.city,
+          state: d.state,
+          postalCode: d.postalCode
+        },
+        storefront
+      )
+    );
 
     if (existingAddress) {
       return res.status(200).json({
@@ -69,15 +80,20 @@ const addAddress = async (req, res) => {
     }
 
     // =========================
-    // 🔒 DEFAULT ADDRESS LOGIC
+    // 🔒 DEFAULT ADDRESS LOGIC (per storefront)
     // =========================
-    const addressCount = await Address.countDocuments({ userId });
+    const addressCount = await Address.countDocuments(
+      mergeCustomerStorefrontFilter({ userId }, storefront)
+    );
 
     let isDefault = false;
     if (addressCount === 0) {
       isDefault = true;
     } else if (isDefaultRaw === true || isDefaultRaw === "true") {
-      await Address.updateMany({ userId }, { $set: { isDefault: false } });
+      await Address.updateMany(
+        mergeCustomerStorefrontFilter({ userId }, storefront),
+        { $set: { isDefault: false } }
+      );
       isDefault = true;
     }
 
@@ -86,6 +102,7 @@ const addAddress = async (req, res) => {
     // =========================
     const address = new Address({
       userId,
+      storefront: normalizeCustomerStorefront(storefront),
       fullName: d.fullName,
       phone: d.phone,
       houseNumber: d.houseNumber,
@@ -128,11 +145,14 @@ const addAddress = async (req, res) => {
 const getAddresses = async (req, res) => {
   try {
     const userId = req.userId;
+    const storefront = resolveCustomerStorefrontFromReq(req);
 
     // =========================
-    // 📦 FETCH ADDRESSES
+    // 📦 FETCH ADDRESSES (storefront-scoped)
     // =========================
-    const addresses = await Address.find({ userId })
+    const addresses = await Address.find(
+      mergeCustomerStorefrontFilter({ userId }, storefront)
+    )
       .sort({ isDefault: -1, createdAt: -1 })
       .lean();
 
@@ -156,6 +176,7 @@ const getAddresses = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: addresses.length,
+      scope: storefront,
       defaultAddress,
       addresses: otherAddresses
     });
@@ -178,12 +199,16 @@ const updateAddress = async (req, res) => {
   try {
     const userId = req.userId;
     const { id } = req.params;
+    const storefront = resolveCustomerStorefrontFromReq(req);
 
     const updates = { ...req.body };
     delete updates._id;
     delete updates.userId;
+    delete updates.storefront;
 
-    const address = await Address.findOne({ _id: id, userId });
+    const address = await Address.findOne(
+      mergeCustomerStorefrontFilter({ _id: id, userId }, storefront)
+    );
 
     if (!address) {
       return res.status(404).json({
@@ -236,7 +261,10 @@ const updateAddress = async (req, res) => {
     }
 
     if (updates.isDefault === true || updates.isDefault === "true") {
-      await Address.updateMany({ userId }, { $set: { isDefault: false } });
+      await Address.updateMany(
+        mergeCustomerStorefrontFilter({ userId }, storefront),
+        { $set: { isDefault: false } }
+      );
       updates.isDefault = true;
     }
 
@@ -312,11 +340,14 @@ const deleteAddress = async (req, res) => {
   try {
     const userId = req.userId;
     const { id } = req.params;
+    const storefront = resolveCustomerStorefrontFromReq(req);
 
     // =========================
-    // 🔒 FIND ADDRESS (OWNERSHIP CHECK)
+    // 🔒 FIND ADDRESS (OWNERSHIP + STOREFRONT)
     // =========================
-    const address = await Address.findOne({ _id: id, userId });
+    const address = await Address.findOne(
+      mergeCustomerStorefrontFilter({ _id: id, userId }, storefront)
+    );
 
     if (!address) {
       return res.status(404).json({
@@ -330,14 +361,17 @@ const deleteAddress = async (req, res) => {
     // =========================
     // 🗑️ DELETE ADDRESS
     // =========================
-    await Address.deleteOne({ _id: id, userId });
+    await Address.deleteOne(
+      mergeCustomerStorefrontFilter({ _id: id, userId }, storefront)
+    );
 
     // =========================
-    // 🔁 DEFAULT FALLBACK LOGIC
+    // 🔁 DEFAULT FALLBACK LOGIC (same storefront)
     // =========================
     if (isDefault) {
-      const nextAddress = await Address.findOne({ userId })
-        .sort({ createdAt: -1 });
+      const nextAddress = await Address.findOne(
+        mergeCustomerStorefrontFilter({ userId }, storefront)
+      ).sort({ createdAt: -1 });
 
       if (nextAddress) {
         nextAddress.isDefault = true;

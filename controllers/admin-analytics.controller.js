@@ -23,9 +23,20 @@ function mergeAnd(base, extra) {
   return { $and: [base, extra] };
 }
 
+const {
+  mergeCustomerStorefrontFilter,
+  resolveCustomerStorefrontFromReq
+} = require('../utils/customerStorefrontScope');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
+
 async function fetchScopedUserIds(req) {
   const scopedUsers = await User.find(scopedUserQueryFromReq(req)).select('_id').lean();
   return scopedUsers.map((u) => u._id);
+}
+
+function scopedCartQueryFromReq(req, extra = {}) {
+  const storefront = resolveCustomerStorefrontFromReq(req);
+  return mergeCustomerStorefrontFilter(extra, storefront);
 }
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
@@ -124,7 +135,7 @@ const getAllUsers = async (req, res) => {
     // Get additional stats for each user
     const usersWithStats = await Promise.all(users.map(async (user) => {
       // Get cart count
-      const cartt = await Cart.findOne({ userId: user._id });
+      const cartt = await findCartForStorefront(user._id, resolveCustomerStorefrontFromReq(req));
       const cartItemsCount = cartt?.items?.length || 0;
       
       // Get wishlist count
@@ -292,7 +303,7 @@ const           getUserById = async (req, res) => {
       });
     }
 
-    const userCart = await Cart.findOne({ userId: user._id })
+    const userCart = await findCartForStorefront(user._id, resolveCustomerStorefrontFromReq(req))
       .populate(ADMIN_CART_POPULATE)
       .lean();
 
@@ -346,7 +357,7 @@ const getAllcarts = async (req, res) => {
       });
     }
 
-    const scopeQuery = { userId: { $in: scopedUserIds } };
+    const scopeQuery = scopedCartQueryFromReq(req, { userId: { $in: scopedUserIds } });
 
     const [carts, total] = await Promise.all([
       Cart.find(scopeQuery)
@@ -413,7 +424,7 @@ const getAbandonedcarts = async (req, res) => {
       });
     }
 
-    const scopeQuery = { userId: { $in: scopedUserIds } };
+    const scopeQuery = scopedCartQueryFromReq(req, { userId: { $in: scopedUserIds } });
 
     // Find carts older than cutoff date with items
     const carts = await Cart.find({
@@ -493,7 +504,7 @@ const getHighValuecarts = async (req, res) => {
       });
     }
 
-    const scopeQuery = { userId: { $in: scopedUserIds } };
+    const scopeQuery = scopedCartQueryFromReq(req, { userId: { $in: scopedUserIds } });
 
     const carts = await Cart.find({
       ...scopeQuery,
@@ -557,10 +568,12 @@ const getCartById = async (req, res) => {
       });
     }
 
-    const cart = await Cart.findOne({
-      _id: cartId,
-      userId: { $in: scopedUserIds }
-    })
+    const cart = await Cart.findOne(
+      scopedCartQueryFromReq(req, {
+        _id: cartId,
+        userId: { $in: scopedUserIds }
+      })
+    )
       .populate(ADMIN_CART_POPULATE)
       .lean();
 
