@@ -98,7 +98,8 @@ async function previewOrApplyPendingAddressEdit(opts) {
     throw createEditError(400, 'ORDER_ID_REQUIRED', 'orderId is required');
   }
 
-  const order = await Order.findOne({ orderId });
+  const { mergeOrderScopeFilter } = require('../utils/adminOrderScope');
+  const order = await Order.findOne(mergeOrderScopeFilter({ orderId }, opts.scopeMatch || null));
   assertEditablePendingOrder(order);
 
   const patch = pickEditableAddressPatch(opts.addressPatch);

@@ -1,9 +1,11 @@
 const express = require('express');
-const { body, param } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const { requireAdmin, requireSuperAdmin } = require('../middlewares/is-admin.middleware');
 const { uploadWholesalerProofs } = require('../middlewares/upload.middleware');
 const {
   submitWholesalerRequest,
+  completeWholesalerDetails,
+  getWholesalerOnboardingStatus,
   listWholesalerRequests,
   getWholesalerRequestDetails,
   approveWholesalerRequest,
@@ -30,6 +32,11 @@ router.post(
   postOwnerReviewDecision
 );
 
+/**
+ * Phase 1: basic interest (name, email, phone, WhatsApp).
+ * Legacy clients that still POST full KYC + proofs in one shot are accepted
+ * and treated as details-complete pending owner approval.
+ */
 router.post(
   '/request',
   uploadWholesalerProofs,
@@ -38,6 +45,35 @@ router.post(
     body('whatsappNumber').trim().notEmpty().withMessage('whatsappNumber is required'),
     body('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required'),
     body('email').trim().isEmail().withMessage('Valid email is required'),
+    body('permanentAddress').optional({ checkFalsy: true }).trim().isString(),
+    body('businessAddress').optional({ checkFalsy: true }).trim().isString(),
+    body('deliveryAddress').optional({ checkFalsy: true }).trim().isString(),
+    body('sellingPlaceFrom').optional({ checkFalsy: true }).trim().isString(),
+    body('sellingZoneCity').optional({ checkFalsy: true }).trim().isString(),
+    body('productCategory').optional({ checkFalsy: true }).trim().isString(),
+    body('monthlyEstimatedPurchase').optional({ checkFalsy: true }).isNumeric(),
+    body('idProofUpload')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isString()
+      .withMessage('idProofUpload must be a string URL when provided'),
+    body('businessAddressProofUpload')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isString()
+      .withMessage('businessAddressProofUpload must be a string URL when provided')
+  ],
+  submitWholesalerRequest
+);
+
+/**
+ * Phase 2: after owner approval — business details + proofs; sends activation OTP on success.
+ */
+router.post(
+  '/complete-details',
+  uploadWholesalerProofs,
+  [
+    body('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required'),
     body('permanentAddress').trim().notEmpty().withMessage('permanentAddress is required'),
     body('businessAddress').trim().notEmpty().withMessage('businessAddress is required'),
     body('deliveryAddress').trim().notEmpty().withMessage('deliveryAddress is required'),
@@ -56,7 +92,13 @@ router.post(
       .isString()
       .withMessage('businessAddressProofUpload must be a string URL when provided')
   ],
-  submitWholesalerRequest
+  completeWholesalerDetails
+);
+
+router.get(
+  '/onboarding-status',
+  [query('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required')],
+  getWholesalerOnboardingStatus
 );
 
 router.post(

@@ -1,7 +1,6 @@
 // controllers/order.controller.js
 const Order = require('../models/Order');
 const Address = require('../models/Address');
-const Cart = require('../models/cart');
 const CheckoutQuote = require('../models/CheckoutQuote');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
@@ -17,8 +16,13 @@ const {
     cartFingerprintFromItems,
     roundMoney2
 } = require('../services/checkoutComputation.service');
-const { releaseReservedInventoryForOrder } = require('../services/orderInventory.service');
+const {
+    releaseReservedInventoryForOrder,
+    reserveInventoryForOrder
+} = require('../services/orderInventory.service');
 const { mergeOrderLineItemsIntoUserCart } = require('../services/restoreCartFromOrder.service');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
+const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
@@ -33,6 +37,9 @@ const {
 } = require('../utils/checkoutPaymentPolicy');
 const { generateOrderId } = require('../utils/orderId');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
+const {
+    mergeAdminOrderFilter
+} = require('../utils/adminOrderScope');
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
@@ -51,6 +58,11 @@ const {
 } = require('../utils/checkoutFlow');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { isLegacyAutoFulfillOnCheckout } = require('../constants/orderFulfillmentAutomation');
+const {
+    recoverOrderStatusAfterSuccessfulCapture,
+    recordOnlinePaymentAttemptFailure,
+    isMoneyCapturedPaymentStatus
+} = require('../utils/orderPaymentState');
 
 const normalizeDecisionCode = (errorLike, fallback) =>
     String(errorLike?.code || fallback || 'ORDER_FLOW_ERROR').trim().toUpperCase();
@@ -82,6 +94,54 @@ function clearOnlinePaymentHoldAfterSuccessfulCapture(order) {
         order.markModified('paymentHoldExpiresAt');
     }
     return true;
+}
+
+/**
+ * After money is captured: clear hold, heal payment_failed/cancelled mismatch, optionally re-reserve stock
+ * if an older failed webhook had released inventory.
+ * @returns {Promise<{ dirty: boolean, recovery: object|null }>}
+ */
+async function applySuccessfulOnlineCaptureSideEffects(order, trigger) {
+    let dirty = clearOnlinePaymentHoldAfterSuccessfulCapture(order);
+    const recovery = recoverOrderStatusAfterSuccessfulCapture(order, { trigger });
+    if (recovery.changed) {
+        dirty = true;
+        logger.info('[paymentState] Recovered orderStatus after capture', {
+            orderId: order.orderId,
+            trigger,
+            from: recovery.previousOrderStatus,
+            to: recovery.nextOrderStatus,
+            paymentStatus: order.paymentStatus
+        });
+
+        if (recovery.previousOrderStatus === 'payment_failed') {
+            try {
+                const inv = await reserveInventoryForOrder(order);
+                order.paymentInfo = order.paymentInfo || {};
+                order.paymentInfo.inventoryReReserve = {
+                    at: new Date(),
+                    reserved: inv.reserved,
+                    shortages: inv.shortages || []
+                };
+                if (typeof order.markModified === 'function') {
+                    order.markModified('paymentInfo');
+                }
+                dirty = true;
+                if ((inv.shortages || []).length > 0) {
+                    logger.error('[paymentState] Inventory shortage while recovering paid order', {
+                        orderId: order.orderId,
+                        shortages: inv.shortages
+                    });
+                }
+            } catch (invErr) {
+                logger.error('[paymentState] Inventory re-reserve failed after payment recovery', {
+                    orderId: order.orderId,
+                    message: invErr?.message || String(invErr)
+                });
+            }
+        }
+    }
+    return { dirty, recovery: recovery.changed ? recovery : null };
 }
 
 function normalizeReturnReasonType(value) {
@@ -1006,8 +1066,20 @@ exports.createOrder = async (req, res) => {
             });
         }
 
-        // 2. Get user's cart
-        const cartDoc = await Cart.findOne({ userId }).session(session);
+        if (!addressBelongsToStorefront(address, storefront)) {
+            await abortTransactionSafely(session);
+            if (idempotency.enabled) {
+                await OrderIdempotencyKey.deleteOne({ _id: idempotency.record._id });
+            }
+            return res.status(403).json({
+                success: false,
+                code: 'ADDRESS_STOREFRONT_MISMATCH',
+                message: 'Address does not belong to this storefront'
+            });
+        }
+
+        // 2. Get user's cart (same storefront)
+        const cartDoc = await findCartForStorefront(userId, storefront).session(session);
         if (!cartDoc || !cartDoc.items || cartDoc.items.length === 0) {
             await abortTransactionSafely(session);
             if (idempotency.enabled) {
@@ -1566,7 +1638,8 @@ exports.verifyPayment = async (req, res) => {
         order.paymentInfo = order.paymentInfo || {};
         order.paymentInfo.capturedPaymentIds = order.paymentInfo.capturedPaymentIds || [];
         if (order.paymentInfo.capturedPaymentIds.includes(razorpay_payment_id)) {
-            if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+            const { dirty } = await applySuccessfulOnlineCaptureSideEffects(order, 'verify_idempotent');
+            if (dirty) {
                 await order.save();
             }
             return res.json({
@@ -1594,6 +1667,10 @@ exports.verifyPayment = async (req, res) => {
             order.paymentStatus === 'paid' &&
             String(order.orderStatus || '').toLowerCase() === 'confirmed'
         ) {
+            const { dirty } = await applySuccessfulOnlineCaptureSideEffects(order, 'verify_already_confirmed');
+            if (dirty) {
+                await order.save();
+            }
             return res.json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -1601,6 +1678,28 @@ exports.verifyPayment = async (req, res) => {
                     orderId: order.orderId,
                     orderStatus: order.orderStatus,
                     paymentStatus: order.paymentStatus
+                }
+            });
+        }
+
+        // Fully paid + stuck terminal orderStatus (race / old bug) — heal without double-counting.
+        if (
+            String(order.paymentStatus || '').toLowerCase() === 'paid' &&
+            Number(order.amountPaidInr || 0) > 0.01
+        ) {
+            const { dirty } = await applySuccessfulOnlineCaptureSideEffects(order, 'verify_already_paid');
+            if (dirty) {
+                order.markModified('paymentInfo');
+                await order.save();
+            }
+            return res.json({
+                success: true,
+                message: 'Payment already verified',
+                order: {
+                    orderId: order.orderId,
+                    orderStatus: order.orderStatus,
+                    paymentStatus: order.paymentStatus,
+                    balanceDueInr: order.balanceDueInr
                 }
             });
         }
@@ -1671,9 +1770,6 @@ exports.verifyPayment = async (req, res) => {
         } else {
             order.paymentStatus = 'partially_paid';
         }
-        if (isLegacyAutoFulfillOnCheckout()) {
-            order.orderStatus = 'confirmed';
-        }
 
         order.paymentInfo = order.paymentInfo || {};
         order.paymentInfo.razorpayPaymentId = razorpay_payment_id;
@@ -1692,7 +1788,7 @@ exports.verifyPayment = async (req, res) => {
 
         order.paymentInfo.capturedPaymentIds.push(razorpay_payment_id);
 
-        clearOnlinePaymentHoldAfterSuccessfulCapture(order);
+        await applySuccessfulOnlineCaptureSideEffects(order, 'payment_verified');
 
         order.markModified('paymentInfo');
         await order.save();
@@ -1779,7 +1875,11 @@ exports.razorpayWebhook = async (req, res) => {
                     break;
                 }
                 if (order.paymentStatus === 'paid') {
-                    if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+                    const { dirty } = await applySuccessfulOnlineCaptureSideEffects(
+                        order,
+                        'webhook_already_paid'
+                    );
+                    if (dirty) {
                         await order.save();
                     }
                     break;
@@ -1788,7 +1888,11 @@ exports.razorpayWebhook = async (req, res) => {
                 order.paymentInfo = order.paymentInfo || {};
                 order.paymentInfo.capturedPaymentIds = order.paymentInfo.capturedPaymentIds || [];
                 if (order.paymentInfo.capturedPaymentIds.includes(payment.id)) {
-                    if (clearOnlinePaymentHoldAfterSuccessfulCapture(order)) {
+                    const { dirty } = await applySuccessfulOnlineCaptureSideEffects(
+                        order,
+                        'webhook_idempotent'
+                    );
+                    if (dirty) {
                         await order.save();
                     }
                     break;
@@ -1817,9 +1921,6 @@ exports.razorpayWebhook = async (req, res) => {
                 } else {
                     order.paymentStatus = 'partially_paid';
                 }
-                if (isLegacyAutoFulfillOnCheckout()) {
-                    order.orderStatus = 'confirmed';
-                }
                 order.paymentInfo.razorpayPaymentId = payment.id;
                 order.paymentInfo.status = 'success';
                 order.paymentInfo.paidAt = new Date(payment.created_at * 1000 || Date.now());
@@ -1833,7 +1934,7 @@ exports.razorpayWebhook = async (req, res) => {
                         s.paidAt = new Date();
                     }
                 }
-                clearOnlinePaymentHoldAfterSuccessfulCapture(order);
+                await applySuccessfulOnlineCaptureSideEffects(order, 'razorpay_webhook_payment_captured');
 
                 order.markModified('paymentInfo');
                 await order.save();
@@ -1866,19 +1967,40 @@ exports.razorpayWebhook = async (req, res) => {
                         { 'paymentInfo.sessions.razorpayOrderId': failedPayment.order_id }
                     ]
                 });
-                if (failedOrder && failedOrder.paymentStatus === 'pending') {
-                    failedOrder.paymentStatus = 'failed';
-                    failedOrder.orderStatus = 'payment_failed';
-                    normalizeTerminalUnpaidFinancials(failedOrder);
-                    failedOrder.paymentInfo = failedOrder.paymentInfo || {};
-                    failedOrder.paymentInfo.status = 'failed';
-                    failedOrder.paymentInfo.failureReason =
-                        failedPayment.error_description || failedPayment.error_code || 'Payment failed';
-                    failedOrder.paymentInfo.failureCode = failedPayment.error_code || '';
-                    failedOrder.markModified('paymentInfo');
-                    await failedOrder.save();
+                if (!failedOrder) {
+                    break;
+                }
 
-                    await releaseReservedInventoryForOrder(failedOrder);
+                // Late / out-of-order failure must never overwrite a settled payment.
+                if (
+                    isMoneyCapturedPaymentStatus(failedOrder.paymentStatus) ||
+                    Number(failedOrder.amountPaidInr || 0) > 0.01
+                ) {
+                    const { dirty } = await applySuccessfulOnlineCaptureSideEffects(
+                        failedOrder,
+                        'webhook_failed_ignored_already_paid'
+                    );
+                    if (dirty) {
+                        await failedOrder.save();
+                    }
+                    logger.info('[paymentState] Ignored payment.failed — order already has capture', {
+                        orderId: failedOrder.orderId,
+                        paymentStatus: failedOrder.paymentStatus,
+                        failedPaymentId: failedPayment.id || null
+                    });
+                    break;
+                }
+
+                // Session-level failure only: keep order pending so customer can retry in-hold.
+                // Terminal unpaid states come from abandon / payment-hold expiry / explicit cancel.
+                const recorded = recordOnlinePaymentAttemptFailure(failedOrder, failedPayment);
+                if (recorded.changed) {
+                    await failedOrder.save();
+                    logger.info('[paymentState] Recorded payment attempt failure (non-terminal)', {
+                        orderId: failedOrder.orderId,
+                        razorpayOrderId: failedPayment.order_id || null,
+                        razorpayPaymentId: failedPayment.id || null
+                    });
                 }
                 break;
             }
@@ -2186,20 +2308,28 @@ exports.initiatePendingOrderPayment = async (req, res) => {
             });
         }
 
-        if (order.orderStatus !== 'pending') {
-            return res.status(409).json({
-                success: false,
-                code: 'INVALID_ORDER_STATE',
-                message: `Order is ${order.orderStatus}. Retry payment is only for orders awaiting first payment.`
-            });
-        }
+        const orderStatusLower = String(order.orderStatus || '').toLowerCase();
+        const paymentStatusLower = String(order.paymentStatus || '').toLowerCase();
+        const unpaidOnlineAwaitingPay =
+            Number(order.amountPaidInr || 0) <= 0.01 &&
+            (orderStatusLower === 'pending' || orderStatusLower === 'payment_failed') &&
+            (paymentStatusLower === 'pending' || paymentStatusLower === 'failed');
 
-        if (order.paymentStatus !== 'pending') {
-            return res.status(409).json({
-                success: false,
-                code: 'INVALID_PAYMENT_STATE',
-                message: 'Payment already progressed. Use pay-balance if you owe a remaining amount.'
-            });
+        if (!unpaidOnlineAwaitingPay) {
+            if (orderStatusLower !== 'pending') {
+                return res.status(409).json({
+                    success: false,
+                    code: 'INVALID_ORDER_STATE',
+                    message: `Order is ${order.orderStatus}. Retry payment is only for orders awaiting first payment.`
+                });
+            }
+            if (paymentStatusLower !== 'pending') {
+                return res.status(409).json({
+                    success: false,
+                    code: 'INVALID_PAYMENT_STATE',
+                    message: 'Payment already progressed. Use pay-balance if you owe a remaining amount.'
+                });
+            }
         }
 
         if (Number(order.amountPaidInr || 0) > 0.01) {
@@ -2278,6 +2408,14 @@ exports.initiatePendingOrderPayment = async (req, res) => {
                 message: (body && (body.description || body.message)) || rzErr.message || 'Could not start payment',
                 detail: body?.code || null
             });
+        }
+
+        // Re-open checkout after a prior failed attempt (legacy webhook terminalized the order).
+        if (orderStatusLower === 'payment_failed' || paymentStatusLower === 'failed') {
+            order.orderStatus = 'pending';
+            order.paymentStatus = 'pending';
+            order.balanceDueInr = roundMoney2(order.totalAmount || 0);
+            order.amountPaidInr = 0;
         }
 
         order.paymentInfo = order.paymentInfo || {};
@@ -2442,7 +2580,7 @@ exports.abandonOnlineCheckout = async (req, res) => {
 
             await order.save({ session });
             await releaseReservedInventoryForOrder(order, session);
-            await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session);
+            await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
 
             await session.commitTransaction();
             session.endSession();
@@ -2501,6 +2639,24 @@ exports.getOrder = async (req, res) => {
 
         if (!canViewOrderForRequest(req, order, isOrderStaff)) {
             return buildUnauthorizedOrderResponse(res);
+        }
+
+        // Self-heal historical split state: paid/partially_paid but orderStatus still payment_failed.
+        if (
+            isMoneyCapturedPaymentStatus(order.paymentStatus) &&
+            Number(order.amountPaidInr || 0) > 0.01
+        ) {
+            try {
+                const { dirty } = await applySuccessfulOnlineCaptureSideEffects(order, 'get_order_self_heal');
+                if (dirty) {
+                    await order.save();
+                }
+            } catch (healErr) {
+                logger.warn('[getOrder] payment state self-heal skipped', {
+                    orderId,
+                    message: healErr?.message || String(healErr)
+                });
+            }
         }
 
         if (isOrderStaff) {
@@ -2863,7 +3019,7 @@ exports.updateOrderStatus = async (req, res) => {
             );
         }
 
-        const order = await Order.findOne({ orderId: orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3064,7 +3220,15 @@ function buildDefaultOrderTimeline(order) {
         ],
         payment_failed: [
             placed,
-            { status: 'Payment failed', completed: true, timestamp: order.updatedAt }
+            // Prefer paidAt when money captured but orderStatus was stuck (legacy bug / race).
+            Number(order.amountPaidInr || 0) > 0.01 &&
+            ['paid', 'partially_paid'].includes(String(order.paymentStatus || '').toLowerCase())
+                ? {
+                      status: 'Payment Confirmed',
+                      completed: true,
+                      timestamp: order.paymentInfo?.paidAt || order.updatedAt
+                  }
+                : { status: 'Payment failed', completed: true, timestamp: order.updatedAt }
         ]
     };
 
@@ -3369,21 +3533,23 @@ exports.listAdminReturnRequests = async (req, res) => {
         const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
         const skip = (page - 1) * limit;
 
-        const filter = {
-            'returnInfo.requestedAt': { $ne: null }
-        };
-        if (statusFilter) {
-            filter['returnInfo.status'] = statusFilter;
-        }
+        const listFilter = statusFilter
+            ? mergeAdminOrderFilter(req, {
+                'returnInfo.requestedAt': { $ne: null },
+                'returnInfo.status': statusFilter
+              })
+            : mergeAdminOrderFilter(req, {
+                'returnInfo.requestedAt': { $ne: null }
+              });
 
         const [rows, total] = await Promise.all([
-            Order.find(filter)
+            Order.find(listFilter)
                 .sort({ 'returnInfo.requestedAt': -1 })
                 .skip(skip)
                 .limit(limit)
-                .select('orderId totalAmount paymentStatus orderStatus returnInfo addressSnapshot createdAt updatedAt')
+                .select('orderId totalAmount paymentStatus orderStatus returnInfo addressSnapshot createdAt updatedAt storefront userType')
                 .lean(),
-            Order.countDocuments(filter)
+            Order.countDocuments(listFilter)
         ]);
 
         const data = rows.map((o) => ({
@@ -3426,7 +3592,7 @@ exports.listAdminReturnRequests = async (req, res) => {
 exports.getAdminReturnRequest = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const order = await Order.findOne({ orderId })
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }))
             .populate('items.productId', 'name slug')
             .lean();
         if (!order) {
@@ -3457,7 +3623,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
             return respondOrderError(res, 400, 'RETURN_DECISION_INVALID', 'Decision must be approve or reject');
         }
 
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3530,7 +3696,7 @@ exports.adminDecideReturnRequest = async (req, res) => {
 exports.adminInitiateReturnRefund = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3614,7 +3780,7 @@ exports.refundOrderPayment = async (req, res) => {
         const { orderId } = req.params;
         const { amount } = req.body || {};
 
-        const order = await Order.findOne({ orderId });
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
@@ -3697,7 +3863,9 @@ exports.sendReturnChatMessage = async (req, res) => {
             return respondOrderError(res, 400, 'MESSAGE_REQUIRED', 'Message content is required');
         }
 
-        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const query = isAdmin
+            ? mergeAdminOrderFilter(req, { orderId })
+            : { orderId, userId: req.userId };
         const order = await Order.findOne(query);
 
         if (!order) {
@@ -3757,7 +3925,9 @@ exports.getReturnChat = async (req, res) => {
         const { orderId } = req.params;
         const isAdmin = req.userRole === 'admin' || req.userRole === 'order_manager';
 
-        const query = isAdmin ? { orderId } : { orderId, userId: req.userId };
+        const query = isAdmin
+            ? mergeAdminOrderFilter(req, { orderId })
+            : { orderId, userId: req.userId };
         const order = await Order.findOne(query);
 
         if (!order) {

@@ -1,8 +1,8 @@
 // controllers/coupon.controller.js
 const Coupon = require('../models/Coupon');
-const Cart = require('../models/cart');
 const Order = require('../models/Order');
 const { evaluateCartForCheckout, couponUserEligible } = require('../services/checkoutComputation.service');
+const { findCartForStorefront } = require('../services/cartStorefront.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const FIRST_ORDER_COUPON_CODE = 'WELC01';
@@ -280,7 +280,7 @@ const validateCoupon = async (req, res) => {
 
         let effectiveSubtotal = Number(subtotal);
         if (useServercart || subtotal === undefined || subtotal === null) {
-            const cartDoc = await Cart.findOne({ userId });
+            const cartDoc = await findCartForStorefront(userId, req.storefront || 'ecomm');
             if (!cartDoc?.items?.length) {
                 return couponError(res, 400, 'CART_EMPTY', 'Cart is empty — add items before applying a coupon');
             }

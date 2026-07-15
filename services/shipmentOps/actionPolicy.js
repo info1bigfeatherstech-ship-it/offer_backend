@@ -17,6 +17,7 @@ const {
 } = require('./computeOpsState');
 const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
 const { isRtoProviderStatus } = require('./shiprocketStatusMap');
+const { isUnpaidTerminalOrder } = require('../../utils/orderPaymentState');
 
 /**
  * @param {string} orderStatus
@@ -56,8 +57,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
   const shipmentId = hasShipmentId(si);
   const shiprocket = hasShiprocketOrderId(si) || shipmentId || awb;
   const shiprocketRto = st === 'rto' || isRtoProviderStatus(si.providerStatus);
-  const terminal =
-    (['cancelled', 'payment_failed'].includes(st) && !shiprocketRto) || shiprocketRto;
+  const terminal = isUnpaidTerminalOrder(o) || shiprocketRto;
   const inTransit = IN_TRANSIT_ORDER_STATUSES.includes(st);
   const signals = normalizeProviderSignals({
     providerStatus: si.providerStatus,

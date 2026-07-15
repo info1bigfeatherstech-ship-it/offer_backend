@@ -5,6 +5,7 @@ const {
   previewOrApplyPendingOrderEdit,
   createEditError
 } = require('../services/adminPendingOrderEdit.service');
+const { getAdminOrderMatch } = require('../utils/adminOrderScope');
 const logger = require('../utils/logger');
 
 function sendError(res, err, fallbackMessage) {
@@ -34,7 +35,8 @@ exports.previewPendingOrderEdit = async (req, res) => {
       orderId,
       itemUpdates,
       commit: false,
-      adminUserId: req.user?.id || req.user?._id || null
+      adminUserId: req.user?.id || req.user?._id || null,
+      scopeMatch: getAdminOrderMatch(req)
     });
     return res.json({
       success: true,
@@ -61,7 +63,8 @@ exports.applyPendingOrderEdit = async (req, res) => {
       orderId,
       itemUpdates,
       commit: true,
-      adminUserId: req.user?.id || req.user?._id || null
+      adminUserId: req.user?.id || req.user?._id || null,
+      scopeMatch: getAdminOrderMatch(req)
     });
     return res.json({
       success: true,

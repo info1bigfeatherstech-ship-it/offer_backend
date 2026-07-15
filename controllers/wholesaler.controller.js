@@ -13,6 +13,11 @@ const { optimizeProductImageBuffer } = require('../utils/cloudinaryHelper');
 const { deleteFromR2ByUrl } = require('../utils/r2Storage');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
+const {
+  isWholesalerDetailsComplete,
+  looksLikeFullWholesalerPayload,
+  wholesalerOnboardingFlags
+} = require('../utils/wholesalerOnboarding');
 
 // Wholesaler activation OTP follows the same global expiry window as every
 // other OTP flow. Driven by OTP_EXPIRY_MINUTES env (default: 5 minutes).
@@ -39,17 +44,37 @@ function rawDigitsToWaMePath(raw) {
 }
 
 /**
- * Frontend URL where approved wholesalers complete activation (OTP + password).
+ * Frontend URL where approved wholesalers complete details / activate (OTP + password).
  * Override per environment; server must be restarted after .env changes.
  * In production this MUST be set — otherwise the email/SMS link would point to localhost.
+ * @param {{ mobileNumber?: string, step?: 'complete'|'otp'|string }} [opts]
  */
-function getWholesalerActivateAppUrl() {
+function getWholesalerActivateAppUrl(opts = {}) {
   const raw = String(process.env.WHOLESALER_ACTIVATE_APP_URL || '').trim().replace(/\/$/, '');
-  if (raw) return raw;
-  if (process.env.NODE_ENV === 'production') {
+  let base;
+  if (raw) {
+    base = raw;
+  } else if (process.env.NODE_ENV === 'production') {
     throw new Error('WHOLESALER_ACTIVATE_APP_URL must be set in production');
+  } else {
+    base = 'http://localhost:5173/activate';
   }
-  return 'http://localhost:5173/activate';
+
+  // Ensure path ends at /activate (env may be origin or full path).
+  const url = new URL(base.includes('://') ? base : `https://${base}`);
+  if (!/\/activate\/?$/i.test(url.pathname)) {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/activate`;
+  }
+
+  const mobile = String(opts.mobileNumber || '').replace(/\D/g, '').slice(-10);
+  const step = String(opts.step || '').trim().toLowerCase();
+  if (/^\d{10}$/.test(mobile)) {
+    url.searchParams.set('mobile', mobile);
+  }
+  if (step === 'complete' || step === 'otp') {
+    url.searchParams.set('step', step);
+  }
+  return url.toString();
 }
 
 function hashString(v) {
@@ -213,6 +238,20 @@ async function cleanupWholesalerProofIfPresent(rawUrl) {
 }
 
 function buildOwnerReviewTableRows(doc) {
+  const detailsComplete = isWholesalerDetailsComplete(doc);
+
+  // Phase-1 interest: owner only needs contact basics to approve/reject.
+  if (!detailsComplete) {
+    return [
+      ['Full name', doc.fullName],
+      ['WhatsApp', doc.whatsappNumber],
+      ['Mobile', doc.mobileNumber],
+      ['Email', doc.email]
+    ]
+      .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(v ?? ''))}</td></tr>`)
+      .join('');
+  }
+
   const rows = [
     ['Full name', doc.fullName],
     ['WhatsApp', doc.whatsappNumber],
@@ -225,7 +264,10 @@ function buildOwnerReviewTableRows(doc) {
     ['Selling from', doc.sellingPlaceFrom],
     ['City / zone', doc.sellingZoneCity],
     ['Product category', doc.productCategory],
-    ['Est. monthly purchase (₹)', String(doc.monthlyEstimatedPurchase)]
+    [
+      'Est. monthly purchase (₹)',
+      doc.monthlyEstimatedPurchase != null ? String(doc.monthlyEstimatedPurchase) : ''
+    ]
   ];
   return rows
     .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(v ?? ''))}</td></tr>`)
@@ -293,17 +335,41 @@ function buildOwnerReviewDocsSection(idMedia, bizMedia) {
 function buildOwnerReviewPageHtml({ doc, token, apiBase }) {
   const templatePath = path.join(__dirname, '..', 'templates', 'wholesaler-owner-review.html');
   const template = fs.readFileSync(templatePath, 'utf8');
+  const detailsComplete = isWholesalerDetailsComplete(doc);
   const idMedia = classifyWholesalerProof(doc.idProofUpload, { attachmentFilename: 'wholesaler-id-proof.pdf' });
   const bizMedia = classifyWholesalerProof(doc.businessAddressProofUpload, {
     attachmentFilename: 'wholesaler-business-proof.pdf'
   });
-  const summaryLine = escapeHtml(`${doc.fullName} · ${doc.sellingZoneCity} · ${doc.productCategory}`);
+  const summaryBits = detailsComplete
+    ? [doc.fullName, doc.mobileNumber, doc.sellingZoneCity, doc.productCategory]
+    : [doc.fullName, doc.mobileNumber, doc.email];
+  const summaryLine = escapeHtml(
+    summaryBits.filter((x) => String(x || '').trim()).join(' · ') || doc.fullName || 'Wholesaler request'
+  );
   const decisionUrl = escapeHtml(`${apiBase}/api/wholesaler/owner-review/decision`);
   const tokenField = escapeHtml(token);
+
+  const lede = detailsComplete
+    ? 'Verify details and documents, then choose an action.'
+    : 'This is a basic interest request. Review contact details, then approve or reject.';
+  const detailsSummaryLabel = detailsComplete ? 'Full application details' : 'Basic contact details';
+  const docsSection = detailsComplete
+    ? `<section class="docs" aria-label="Documents"><h2 class="h2">Documents</h2>${buildOwnerReviewDocsSection(
+        idMedia,
+        bizMedia
+      )}</section>`
+    : `<section class="docs docs-basic" aria-label="Next step"><p class="muted">Business addresses and ID proofs are collected after approval.</p></section>`;
+  const approveHint = detailsComplete
+    ? 'Applicant can complete activation after approval.'
+    : 'After approval, the applicant will complete business details, then activate with OTP.';
+
   return template
+    .replace(/\{\{LEDE\}\}/g, escapeHtml(lede))
     .replace(/\{\{SUMMARY_LINE\}\}/g, summaryLine)
+    .replace(/\{\{DETAILS_SUMMARY_LABEL\}\}/g, escapeHtml(detailsSummaryLabel))
     .replace(/\{\{TABLE_ROWS\}\}/g, buildOwnerReviewTableRows(doc))
-    .replace(/\{\{DOCS_SECTION\}\}/g, buildOwnerReviewDocsSection(idMedia, bizMedia))
+    .replace(/\{\{DOCS_SECTION\}\}/g, docsSection)
+    .replace(/\{\{APPROVE_HINT\}\}/g, escapeHtml(approveHint))
     .replace(/\{\{DECISION_URL\}\}/g, decisionUrl)
     .replace(/\{\{TOKEN\}\}/g, tokenField);
 }
@@ -480,29 +546,35 @@ function buildPrivilegedConflictPayload() {
   };
 }
 
-function buildExistingWholesalerConflictPayload(status, requestId = null) {
+function buildExistingWholesalerConflictPayload(status, requestId = null, extras = {}) {
   const normalizedStatus = String(status || '').trim().toLowerCase();
   if (normalizedStatus === 'activated') {
     return {
       success: false,
       code: 'WHOLESALER_ALREADY_ACTIVE',
       message: 'A wholesaler account already exists for this mobile/email.',
-      requestId
+      requestId,
+      ...extras
     };
   }
   if (normalizedStatus === 'approved') {
+    const needsDetails = extras.detailsComplete === false;
     return {
       success: false,
-      code: 'WHOLESALER_ALREADY_APPROVED',
-      message: 'A wholesaler request for this mobile/email is already approved. Please activate the account instead of submitting a new request.',
-      requestId
+      code: needsDetails ? 'WHOLESALER_APPROVED_COMPLETE_DETAILS' : 'WHOLESALER_ALREADY_APPROVED',
+      message: needsDetails
+        ? 'Your request is approved. Please complete business details, then activate with OTP.'
+        : 'A wholesaler request for this mobile/email is already approved. Please activate the account instead of submitting a new request.',
+      requestId,
+      ...extras
     };
   }
   return {
     success: false,
     code: 'WHOLESALER_REQUEST_ALREADY_EXISTS',
     message: 'A wholesaler request already exists for this mobile/email.',
-    requestId
+    requestId,
+    ...extras
   };
 }
 
@@ -521,44 +593,47 @@ exports.submitWholesalerRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
     }
 
-    const payload = {
-      fullName: req.body.fullName,
-      whatsappNumber: normalizePhone(req.body.whatsappNumber),
-      mobileNumber: normalizePhone(req.body.mobileNumber),
-      email: String(req.body.email || '').trim().toLowerCase(),
-      permanentAddress: req.body.permanentAddress,
-      haveShop: req.body.haveShop === true || req.body.haveShop === 'true',
-      businessAddress: req.body.businessAddress,
-      deliveryAddress: req.body.deliveryAddress,
-      sellingPlaceFrom: req.body.sellingPlaceFrom,
-      sellingZoneCity: req.body.sellingZoneCity,
-      productCategory: req.body.productCategory,
-      monthlyEstimatedPurchase: Number(req.body.monthlyEstimatedPurchase),
+    const fullName = String(req.body.fullName || '').trim();
+    const whatsappNumber = normalizePhone(req.body.whatsappNumber);
+    const mobileNumber = normalizePhone(req.body.mobileNumber);
+    const email = String(req.body.email || '').trim().toLowerCase();
+
+    if (!fullName) {
+      return res.status(400).json({ success: false, message: 'fullName is required' });
+    }
+    if (!/^\d{10}$/.test(mobileNumber)) {
+      return res.status(400).json({ success: false, message: 'Valid 10-digit mobileNumber is required' });
+    }
+    if (!/^\d{10}$/.test(whatsappNumber)) {
+      return res.status(400).json({ success: false, message: 'Valid 10-digit whatsappNumber is required' });
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: 'Valid email is required' });
+    }
+
+    // Resolve proofs only when client sent files/URLs (legacy one-shot).
+    const proofHolder = {
+      fullName,
       idProofUpload: req.body.idProofUpload,
       businessAddressProofUpload: req.body.businessAddressProofUpload
     };
+    const files = req.files || {};
+    const hasProofInput = Boolean(
+      (Array.isArray(files.idProof) && files.idProof[0]) ||
+        (Array.isArray(files.idProofUpload) && files.idProofUpload[0]) ||
+        (Array.isArray(files.businessAddressProof) && files.businessAddressProof[0]) ||
+        (Array.isArray(files.businessAddressProofUpload) && files.businessAddressProofUpload[0]) ||
+        String(req.body.idProofUpload || '').trim() ||
+        String(req.body.businessAddressProofUpload || '').trim()
+    );
+    if (hasProofInput) {
+      await resolveWholesalerProofUrls(req, proofHolder);
+    }
 
-    await resolveWholesalerProofUrls(req, payload);
-
-    if (!/^\d{10}$/.test(payload.mobileNumber)) {
-      return res.status(400).json({ success: false, message: 'Valid 10-digit mobileNumber is required' });
-    }
-    if (!/^\d{10}$/.test(payload.whatsappNumber)) {
-      return res.status(400).json({ success: false, message: 'Valid 10-digit whatsappNumber is required' });
-    }
-    if (!payload.email || !payload.fullName || !payload.permanentAddress) {
-      return res.status(400).json({ success: false, message: 'Missing required wholesaler details' });
-    }
-    if (!payload.idProofUpload || !payload.businessAddressProofUpload) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'idProofUpload and businessAddressProofUpload are required (provide URLs or upload files as idProof/businessAddressProof)'
-      });
-    }
+    const isLegacyFull = looksLikeFullWholesalerPayload(req.body, proofHolder);
 
     const existingUser = await User.findOne({
-      $or: [{ phone: payload.mobileNumber }, { email: payload.email }]
+      $or: [{ phone: mobileNumber }, { email }]
     }).select('userType role status');
 
     if (isPrivilegedAccount(existingUser)) {
@@ -571,35 +646,268 @@ exports.submitWholesalerRequest = async (req, res) => {
 
     const existingRequest = await WholesalerDetails.findOne({
       status: { $in: ['pending', 'approved', 'activated'] },
-      $or: [{ mobileNumber: payload.mobileNumber }, { email: payload.email }]
+      $or: [{ mobileNumber }, { email }]
     })
       .sort({ updatedAt: -1 })
-      .select('_id status');
+      .select('_id status permanentAddress businessAddress deliveryAddress sellingPlaceFrom sellingZoneCity productCategory monthlyEstimatedPurchase idProofUpload businessAddressProofUpload detailsSubmittedAt');
 
     if (existingRequest) {
-      return res.status(409).json(buildExistingWholesalerConflictPayload(existingRequest.status, existingRequest._id));
+      const flags = wholesalerOnboardingFlags(existingRequest);
+      return res.status(409).json(
+        buildExistingWholesalerConflictPayload(existingRequest.status, existingRequest._id, {
+          detailsComplete: flags.detailsComplete,
+          canCompleteDetails: flags.canCompleteDetails,
+          canRequestActivationOtp: flags.canRequestActivationOtp
+        })
+      );
     }
 
-    const requestDoc = await WholesalerDetails.create({
-      ...payload,
+    const createPayload = {
+      fullName,
+      whatsappNumber,
+      mobileNumber,
+      email,
       userId: null,
       isApproved: false,
       status: 'pending',
-      ownerReviewLinkVersion: 0
-    });
+      ownerReviewLinkVersion: 0,
+      detailsSubmittedAt: null
+    };
+
+    if (isLegacyFull) {
+      createPayload.permanentAddress = String(req.body.permanentAddress || '').trim();
+      createPayload.haveShop = req.body.haveShop === true || req.body.haveShop === 'true';
+      createPayload.businessAddress = String(req.body.businessAddress || '').trim();
+      createPayload.deliveryAddress = String(req.body.deliveryAddress || '').trim();
+      createPayload.sellingPlaceFrom = String(req.body.sellingPlaceFrom || '').trim();
+      createPayload.sellingZoneCity = String(req.body.sellingZoneCity || '').trim();
+      createPayload.productCategory = String(req.body.productCategory || '').trim();
+      createPayload.monthlyEstimatedPurchase = Number(req.body.monthlyEstimatedPurchase);
+      createPayload.idProofUpload = String(proofHolder.idProofUpload || '').trim();
+      createPayload.businessAddressProofUpload = String(proofHolder.businessAddressProofUpload || '').trim();
+      createPayload.detailsSubmittedAt = new Date();
+    }
+
+    const requestDoc = await WholesalerDetails.create(createPayload);
+    const flags = wholesalerOnboardingFlags(requestDoc);
 
     return res.status(201).json({
       success: true,
-      message: 'Wholesaler request submitted successfully. Admin will notify the owner for review.',
+      message: isLegacyFull
+        ? 'Wholesaler request submitted successfully. Admin will notify the owner for review.'
+        : 'Interest submitted successfully. Admin will notify the owner for review. After approval, complete business details to activate.',
       request: {
         id: requestDoc._id,
         status: requestDoc.status,
         fullName: requestDoc.fullName,
-        mobileNumber: requestDoc.mobileNumber
+        mobileNumber: requestDoc.mobileNumber,
+        email: requestDoc.email,
+        ...flags
       }
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Error submitting wholesaler request', error: error.message });
+  }
+};
+
+/**
+ * Phase 2: after owner approval, applicant submits business details + proofs.
+ * On success, activation OTP is sent (same channel as activate/send-otp).
+ */
+exports.completeWholesalerDetails = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
+    }
+
+    const mobileNumber = normalizePhone(req.body.mobileNumber);
+    if (!/^\d{10}$/.test(mobileNumber)) {
+      return res.status(400).json({ success: false, message: 'Valid 10-digit mobileNumber is required' });
+    }
+
+    const doc = await WholesalerDetails.findOne({ mobileNumber, status: 'approved' }).sort({ updatedAt: -1 });
+    if (!doc) {
+      return res.status(404).json({
+        success: false,
+        code: 'WHOLESALER_APPROVAL_NOT_FOUND',
+        message: 'No approved wholesaler request found for this mobile number'
+      });
+    }
+
+    if (isWholesalerDetailsComplete(doc)) {
+      return res.status(409).json({
+        success: false,
+        code: 'WHOLESALER_DETAILS_ALREADY_COMPLETE',
+        message: 'Business details are already submitted. Request activation OTP to finish setup.',
+        requestId: doc._id,
+        canRequestActivationOtp: true
+      });
+    }
+
+    const payload = {
+      fullName: doc.fullName,
+      permanentAddress: String(req.body.permanentAddress || '').trim(),
+      haveShop: req.body.haveShop === true || req.body.haveShop === 'true',
+      businessAddress: String(req.body.businessAddress || '').trim(),
+      deliveryAddress: String(req.body.deliveryAddress || '').trim(),
+      sellingPlaceFrom: String(req.body.sellingPlaceFrom || '').trim(),
+      sellingZoneCity: String(req.body.sellingZoneCity || '').trim(),
+      productCategory: String(req.body.productCategory || '').trim(),
+      monthlyEstimatedPurchase: Number(req.body.monthlyEstimatedPurchase),
+      idProofUpload: req.body.idProofUpload,
+      businessAddressProofUpload: req.body.businessAddressProofUpload
+    };
+
+    await resolveWholesalerProofUrls(req, payload);
+
+    if (!payload.permanentAddress || !payload.businessAddress || !payload.deliveryAddress) {
+      return res.status(400).json({ success: false, message: 'permanentAddress, businessAddress and deliveryAddress are required' });
+    }
+    if (!payload.sellingPlaceFrom || !payload.sellingZoneCity || !payload.productCategory) {
+      return res.status(400).json({ success: false, message: 'sellingPlaceFrom, sellingZoneCity and productCategory are required' });
+    }
+    if (!Number.isFinite(payload.monthlyEstimatedPurchase) || payload.monthlyEstimatedPurchase < 0) {
+      return res.status(400).json({ success: false, message: 'monthlyEstimatedPurchase must be a non-negative number' });
+    }
+    if (!payload.idProofUpload || !payload.businessAddressProofUpload) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'idProofUpload and businessAddressProofUpload are required (provide URLs or upload files as idProof/businessAddressProof)'
+      });
+    }
+
+    // Optional identity lock: if email/whatsapp/name sent, must match stored basic identity.
+    if (req.body.email) {
+      const email = String(req.body.email || '').trim().toLowerCase();
+      if (email && email !== doc.email) {
+        return res.status(409).json({
+          success: false,
+          code: 'IDENTITY_MISMATCH',
+          message: 'Email does not match the approved request'
+        });
+      }
+    }
+
+    doc.permanentAddress = payload.permanentAddress;
+    doc.haveShop = payload.haveShop;
+    doc.businessAddress = payload.businessAddress;
+    doc.deliveryAddress = payload.deliveryAddress;
+    doc.sellingPlaceFrom = payload.sellingPlaceFrom;
+    doc.sellingZoneCity = payload.sellingZoneCity;
+    doc.productCategory = payload.productCategory;
+    doc.monthlyEstimatedPurchase = payload.monthlyEstimatedPurchase;
+    doc.idProofUpload = payload.idProofUpload;
+    doc.businessAddressProofUpload = payload.businessAddressProofUpload;
+    doc.detailsSubmittedAt = new Date();
+
+    const otp = generateOTP();
+    doc.activationOtpHash = hashString(otp);
+    doc.activationOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
+    doc.activationOtpAttempts = 0;
+    doc.activationOtpSentAt = new Date();
+    await doc.save();
+
+    let otpSent = true;
+    try {
+      await deliverOtpFor({
+        phone: doc.mobileNumber,
+        email: doc.email,
+        otp,
+        purpose: 'wholesaler_activation'
+      });
+    } catch (deliverErr) {
+      otpSent = false;
+      console.error(
+        'Wholesaler activation OTP delivery failed after complete-details:',
+        deliverErr?.message,
+        deliverErr?.details || ''
+      );
+    }
+
+    const flags = wholesalerOnboardingFlags(doc);
+
+    return res.status(200).json({
+      success: true,
+      message: otpSent
+        ? 'Business details saved. Activation OTP sent — verify OTP and set your password to activate.'
+        : 'Business details saved, but OTP could not be sent. Use activate/send-otp to resend.',
+      otpSent,
+      request: {
+        id: doc._id,
+        status: doc.status,
+        mobileNumber: doc.mobileNumber,
+        email: doc.email,
+        detailsSubmittedAt: doc.detailsSubmittedAt,
+        ...flags
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Error completing wholesaler details',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Public: check where an applicant is in onboarding (by mobile).
+ */
+exports.getWholesalerOnboardingStatus = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
+    }
+
+    const mobileNumber = normalizePhone(req.query.mobileNumber || req.body?.mobileNumber);
+    if (!/^\d{10}$/.test(mobileNumber)) {
+      return res.status(400).json({ success: false, message: 'Valid 10-digit mobileNumber is required' });
+    }
+
+    const doc = await WholesalerDetails.findOne({
+      mobileNumber,
+      status: { $in: ['pending', 'approved', 'rejected', 'activated'] }
+    })
+      .sort({ updatedAt: -1 })
+      .select(
+        'fullName email mobileNumber whatsappNumber status detailsSubmittedAt permanentAddress businessAddress deliveryAddress sellingPlaceFrom sellingZoneCity productCategory monthlyEstimatedPurchase idProofUpload businessAddressProofUpload createdAt updatedAt'
+      )
+      .lean();
+
+    if (!doc) {
+      return res.status(404).json({
+        success: false,
+        code: 'WHOLESALER_REQUEST_NOT_FOUND',
+        message: 'No wholesaler request found for this mobile number'
+      });
+    }
+
+    const flags = wholesalerOnboardingFlags(doc);
+
+    return res.status(200).json({
+      success: true,
+      request: {
+        id: doc._id,
+        fullName: doc.fullName,
+        email: doc.email,
+        mobileNumber: doc.mobileNumber,
+        whatsappNumber: doc.whatsappNumber,
+        status: doc.status,
+        detailsSubmittedAt: doc.detailsSubmittedAt || null,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+        ...flags
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Error fetching onboarding status',
+      error: error.message
+    });
   }
 };
 
@@ -629,6 +937,7 @@ exports.listWholesalerRequests = async (req, res) => {
 
     const requests = rows.map((row) => ({
       ...row,
+      ...wholesalerOnboardingFlags(row),
       ownerReviewMirror: {
         ...requestSummaryForOwner(row),
         media: {
@@ -700,6 +1009,7 @@ exports.getWholesalerRequestDetails = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Wholesaler request not found' });
     }
     const plain = doc.toObject ? doc.toObject() : doc;
+    const flags = wholesalerOnboardingFlags(plain);
     const ownerReviewMirror = {
       ...requestSummaryForOwner(plain),
       media: {
@@ -709,7 +1019,7 @@ exports.getWholesalerRequestDetails = async (req, res) => {
     };
     return res.status(200).json({
       success: true,
-      request: plain,
+      request: { ...plain, ...flags },
       /** Same applicant + document context as the owner review link (for admin UIs). */
       ownerReviewMirror,
       recordHint: 'MongoDB model WholesalerDetails; this document is the wholesaler application row.'
@@ -822,7 +1132,7 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
     }
 
     const doc = await WholesalerDetails.findById(req.params.id).select(
-      'fullName whatsappNumber mobileNumber status email'
+      'fullName whatsappNumber mobileNumber status email detailsSubmittedAt permanentAddress businessAddress deliveryAddress sellingPlaceFrom sellingZoneCity productCategory monthlyEstimatedPurchase idProofUpload businessAddressProofUpload'
     );
     if (!doc) {
       return res.status(404).json({ success: false, message: 'Wholesaler request not found' });
@@ -849,20 +1159,42 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
 
     let messagePlain;
     if (doc.status === 'approved') {
-      const activateUrl = getWholesalerActivateAppUrl();
-      messagePlain = [
-        `Hello ${doc.fullName},`,
-        '',
-        '*Good news:* your wholesaler application has been approved.',
-        '',
-        'Click to activate your account (open in browser):',
-        activateUrl,
-        '',
-        'Complete account setup: request OTP on the app/website using your registered mobile number, then set your password.',
-        `Registered mobile: ${doc.mobileNumber}`,
-        '',
-        '— Team OfferWaleBaba'
-      ].join('\n');
+      const detailsDone = isWholesalerDetailsComplete(doc);
+      if (!detailsDone) {
+        const completeUrl = getWholesalerActivateAppUrl({
+          mobileNumber: doc.mobileNumber,
+          step: 'complete'
+        });
+        messagePlain = [
+          `Hello ${doc.fullName},`,
+          '',
+          '*Good news:* your wholesaler interest request has been approved.',
+          '',
+          'Open this link to *complete your business details* (address, category, ID proofs). After you submit, you will set a password with OTP:',
+          completeUrl,
+          '',
+          `Your registered mobile (${doc.mobileNumber}) is already attached to this link.`,
+          '',
+          '— Team OfferWaleBaba'
+        ].join('\n');
+      } else {
+        const activateUrl = getWholesalerActivateAppUrl({
+          mobileNumber: doc.mobileNumber,
+          step: 'otp'
+        });
+        messagePlain = [
+          `Hello ${doc.fullName},`,
+          '',
+          '*Good news:* your wholesaler application has been approved.',
+          '',
+          'Open this link to activate your account with OTP and set your password:',
+          activateUrl,
+          '',
+          `Registered mobile: ${doc.mobileNumber}`,
+          '',
+          '— Team OfferWaleBaba'
+        ].join('\n');
+      }
     } else if (doc.status === 'rejected') {
       messagePlain = [
         `Hello ${doc.fullName},`,
@@ -882,7 +1214,11 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
       waMeUrl,
       messagePlain,
       applicantWaPath: applicantPath,
-      request: { id: doc._id, status: doc.status }
+      request: {
+        id: doc._id,
+        status: doc.status,
+        ...wholesalerOnboardingFlags(doc)
+      }
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Error building applicant notify payload', error: error.message });
@@ -890,12 +1226,25 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
 };
 
 function requestSummaryForOwner(doc) {
-  return {
+  const flags = wholesalerOnboardingFlags(doc);
+  const base = {
     id: doc._id,
     fullName: doc.fullName,
     whatsappNumber: doc.whatsappNumber,
     mobileNumber: doc.mobileNumber,
     email: doc.email,
+    status: doc.status,
+    createdAt: doc.createdAt,
+    detailsSubmittedAt: doc.detailsSubmittedAt || null,
+    ...flags
+  };
+
+  if (!flags.detailsComplete) {
+    return base;
+  }
+
+  return {
+    ...base,
     permanentAddress: doc.permanentAddress,
     haveShop: doc.haveShop,
     businessAddress: doc.businessAddress,
@@ -905,9 +1254,7 @@ function requestSummaryForOwner(doc) {
     productCategory: doc.productCategory,
     monthlyEstimatedPurchase: doc.monthlyEstimatedPurchase,
     idProofUpload: doc.idProofUpload,
-    businessAddressProofUpload: doc.businessAddressProofUpload,
-    status: doc.status,
-    createdAt: doc.createdAt
+    businessAddressProofUpload: doc.businessAddressProofUpload
   };
 }
 
@@ -1114,8 +1461,15 @@ exports.approveWholesalerRequest = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: 'Wholesaler request approved (superadmin override). Applicant can request activation OTP.',
-      request: { id: doc._id, status: doc.status, reviewedAt: doc.reviewedAt }
+      message: isWholesalerDetailsComplete(doc)
+        ? 'Wholesaler request approved (superadmin override). Applicant can request activation OTP.'
+        : 'Wholesaler request approved (superadmin override). Applicant must complete business details, then activate with OTP.',
+      request: {
+        id: doc._id,
+        status: doc.status,
+        reviewedAt: doc.reviewedAt,
+        ...wholesalerOnboardingFlags(doc)
+      }
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Error approving wholesaler request', error: error.message });
@@ -1184,6 +1538,20 @@ exports.sendWholesalerActivationOtp = async (req, res) => {
       );
     }
 
+    if (!isWholesalerDetailsComplete(doc)) {
+      return authContractError(
+        res,
+        409,
+        'WHOLESALER_DETAILS_INCOMPLETE',
+        'Complete business details before requesting activation OTP.',
+        {
+          requestId: doc._id,
+          canCompleteDetails: true,
+          canRequestActivationOtp: false
+        }
+      );
+    }
+
     const otp = generateOTP();
     doc.activationOtpHash = hashString(otp);
     doc.activationOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
@@ -1248,6 +1616,19 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
         404,
         'WHOLESALER_APPROVAL_NOT_FOUND',
         'No approved request found for this mobile number'
+      );
+    }
+
+    if (!isWholesalerDetailsComplete(doc)) {
+      return authContractError(
+        res,
+        409,
+        'WHOLESALER_DETAILS_INCOMPLETE',
+        'Complete business details before activating the account.',
+        {
+          requestId: doc._id,
+          canCompleteDetails: true
+        }
       );
     }
 

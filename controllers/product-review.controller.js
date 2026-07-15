@@ -1,7 +1,10 @@
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const ProductReview = require('../models/ProductReview');
-const { syncProductRatingFromReviews } = require('../services/productReviewSync.service');
+const {
+  syncProductRatingFromReviews,
+  aggregateActiveReviewSummary
+} = require('../services/productReviewSync.service');
 const {
   findDeliveredPurchaseForProduct,
   getProductReviewEligibility,
@@ -14,6 +17,11 @@ const {
   normalizeStoredImages,
   parseRemoveImagePublicIds
 } = require('../services/reviewImageUpload.service');
+const {
+  resolveReviewStorefrontFromReq,
+  mergeReviewStorefrontFilter,
+  normalizeReviewStorefront
+} = require('../utils/reviewStorefrontScope');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(String(id));
 
@@ -39,6 +47,7 @@ function serializeCustomerReview(review) {
     isActive: review.isActive,
     verifiedPurchase: Boolean(review.verifiedPurchase),
     orderId: review.orderId || null,
+    storefront: normalizeReviewStorefront(review.storefront),
     images: mapPublicImages(review.images),
     createdAt: review.createdAt,
     updatedAt: review.updatedAt
@@ -99,19 +108,20 @@ const getPublicSummary = async (req, res) => {
       return jsonError(res, 400, 'INVALID_PRODUCT_ID', 'Invalid product id');
     }
 
-    const product = await Product.findById(productId).select('rating').lean();
+    const product = await Product.findById(productId).select('_id').lean();
     if (!product) {
       return jsonError(res, 404, 'PRODUCT_NOT_FOUND', 'Product not found');
     }
 
-    const count = product.rating?.count ?? 0;
-    const value = count > 0 ? product.rating?.value ?? null : null;
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const summary = await aggregateActiveReviewSummary(productId, storefront);
 
     return res.json({
       success: true,
+      scope: storefront,
       summary: {
-        averageRating: value,
-        reviewCount: count
+        averageRating: summary.averageRating,
+        reviewCount: summary.reviewCount
       }
     });
   } catch (err) {
@@ -132,13 +142,19 @@ const listPublicReviews = async (req, res) => {
       return jsonError(res, 404, 'PRODUCT_NOT_FOUND', 'Product not found');
     }
 
+    const storefront = resolveReviewStorefrontFromReq(req);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const skip = Math.max(0, parseInt(req.query.skip, 10) || 0);
 
-    const docs = await ProductReview.find({
-      productId,
-      isActive: true
-    })
+    const docs = await ProductReview.find(
+      mergeReviewStorefrontFilter(
+        {
+          productId,
+          isActive: true
+        },
+        storefront
+      )
+    )
       .sort({ createdAt: -1, rating: -1 })
       .skip(skip)
       .limit(limit)
@@ -153,10 +169,11 @@ const listPublicReviews = async (req, res) => {
       author: publicAuthorLabel(r),
       verifiedPurchase: Boolean(r.verifiedPurchase),
       source: r.source,
+      storefront: normalizeReviewStorefront(r.storefront),
       images: mapPublicImages(r.images)
     }));
 
-    return res.json({ success: true, reviews });
+    return res.json({ success: true, scope: storefront, reviews });
   } catch (err) {
     console.error('[listPublicReviews]', err);
     return jsonError(res, 500, 'REVIEW_LIST_ERROR', 'Could not load reviews');
@@ -182,9 +199,11 @@ const getReviewEligibilityForProduct = async (req, res) => {
       return jsonError(res, 404, 'PRODUCT_NOT_FOUND', 'Product not found');
     }
 
-    const eligibility = await getProductReviewEligibility(userId, productId);
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const eligibility = await getProductReviewEligibility(userId, productId, { storefront });
     return res.json({
       success: true,
+      scope: storefront,
       eligibility: {
         canCreate: Boolean(eligibility.canCreate),
         canUpdate: Boolean(eligibility.canUpdate),
@@ -200,6 +219,7 @@ const getReviewEligibilityForProduct = async (req, res) => {
               isActive: eligibility.review.isActive,
               verifiedPurchase: Boolean(eligibility.review.verifiedPurchase),
               orderId: eligibility.review.orderId || null,
+              storefront: normalizeReviewStorefront(eligibility.review.storefront),
               images: mapPublicImages(eligibility.review.images),
               createdAt: eligibility.review.createdAt,
               updatedAt: eligibility.review.updatedAt
@@ -258,18 +278,25 @@ const getMyReviewForProduct = async (req, res) => {
       return jsonError(res, 400, 'INVALID_PRODUCT_ID', 'Invalid product id');
     }
 
-    const review = await ProductReview.findOne({
-      productId,
-      userId,
-      source: 'customer'
-    }).lean();
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const review = await ProductReview.findOne(
+      mergeReviewStorefrontFilter(
+        {
+          productId,
+          userId,
+          source: 'customer'
+        },
+        storefront
+      )
+    ).lean();
 
     if (!review) {
-      return res.json({ success: true, review: null });
+      return res.json({ success: true, scope: storefront, review: null });
     }
 
     return res.json({
       success: true,
+      scope: storefront,
       review: serializeCustomerReview(review)
     });
   } catch (err) {
@@ -332,11 +359,18 @@ const createCustomerReview = async (req, res) => {
       );
     }
 
-    const existing = await ProductReview.findOne({
-      productId,
-      userId,
-      source: 'customer'
-    })
+    const storefront = resolveReviewStorefrontFromReq(req);
+
+    const existing = await ProductReview.findOne(
+      mergeReviewStorefrontFilter(
+        {
+          productId,
+          userId,
+          source: 'customer'
+        },
+        storefront
+      )
+    )
       .select('_id')
       .lean();
     if (existing) {
@@ -349,7 +383,8 @@ const createCustomerReview = async (req, res) => {
     }
 
     const purchase = await findDeliveredPurchaseForProduct(userId, productId, {
-      orderId: orderIdHint
+      orderId: orderIdHint,
+      storefront
     });
 
     // If client sent a specific orderId, it must be a valid delivered purchase.
@@ -391,6 +426,7 @@ const createCustomerReview = async (req, res) => {
         productId,
         userId,
         source: 'customer',
+        storefront,
         rating,
         comment,
         images: uploadedImages,
@@ -433,124 +469,19 @@ const createCustomerReview = async (req, res) => {
 };
 
 const updateCustomerReview = async (req, res) => {
-  let uploadedImages = [];
   try {
     const userId = req.user?.id;
     if (!userId) {
       return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
     }
 
-    const { id } = req.params;
-    if (!isValidObjectId(id)) {
-      return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
-    }
-
-    const { rating: ratingRaw, comment: commentRaw, removeImagePublicIds } =
-      parseReviewRequestBody(req);
-    const patch = {};
-    const incomingFiles = getIncomingReviewImageFiles(req);
-
-    if (ratingRaw !== undefined && ratingRaw !== null && String(ratingRaw).trim() !== '') {
-      const rating = Number(ratingRaw);
-      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-        return jsonError(res, 400, 'INVALID_RATING', 'Rating must be an integer from 1 to 5');
-      }
-      patch.rating = rating;
-    }
-
-    if (commentRaw !== undefined) {
-      patch.comment = String(commentRaw || '').trim().slice(0, 2000);
-    }
-
-    const review = await ProductReview.findOne({
-      _id: id,
-      userId,
-      source: 'customer'
-    });
-
-    if (!review) {
-      return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
-    }
-
-    const existingImages = normalizeStoredImages(review.images);
-    const removeSet = new Set(removeImagePublicIds || []);
-    const keptImages = existingImages.filter((img) => {
-      if (img.publicId && removeSet.has(img.publicId)) return false;
-      if (img.url && removeSet.has(img.url)) return false;
-      return true;
-    });
-    const removedImages = existingImages.filter((img) => {
-      if (img.publicId && removeSet.has(img.publicId)) return true;
-      if (img.url && removeSet.has(img.url)) return true;
-      return false;
-    });
-
-    if (incomingFiles.length > MAX_REVIEW_IMAGES) {
-      return jsonError(
-        res,
-        400,
-        'TOO_MANY_IMAGES',
-        `You can upload up to ${MAX_REVIEW_IMAGES} images per review`
-      );
-    }
-
-    if (keptImages.length + incomingFiles.length > MAX_REVIEW_IMAGES) {
-      return jsonError(
-        res,
-        400,
-        'TOO_MANY_IMAGES',
-        `You can have at most ${MAX_REVIEW_IMAGES} images per review`
-      );
-    }
-
-    if (incomingFiles.length && !Boolean(review.verifiedPurchase)) {
-      return jsonError(
-        res,
-        403,
-        'PHOTOS_REQUIRE_PURCHASE',
-        'Photos can only be added on verified purchase reviews. Manage photos from My Orders after delivery.'
-      );
-    }
-
-    if (incomingFiles.length) {
-      uploadedImages = await uploadReviewImages(incomingFiles, {
-        productId: String(review.productId),
-        userId: String(userId),
-        orderId: review.orderId
-      });
-    }
-
-    const nextImages = [...keptImages, ...uploadedImages];
-    const hasImageChanges =
-      incomingFiles.length > 0 || removedImages.length > 0;
-
-    if (
-      Object.keys(patch).length === 0 &&
-      !hasImageChanges
-    ) {
-      return jsonError(res, 400, 'NO_CHANGES', 'No valid fields to update');
-    }
-
-    Object.assign(review, patch);
-    if (hasImageChanges) {
-      review.images = nextImages;
-    }
-
-    await review.save();
-    if (removedImages.length) {
-      await deleteReviewImagesFromCloudinary(removedImages);
-    }
-    await syncProductRatingFromReviews(review.productId);
-
-    return res.json({
-      success: true,
-      message: 'Review updated',
-      review: serializeCustomerReview(review)
-    });
+    return jsonError(
+      res,
+      403,
+      'REVIEW_LOCKED',
+      'Reviews cannot be edited after submission.'
+    );
   } catch (err) {
-    if (uploadedImages.length) {
-      await deleteReviewImagesFromCloudinary(uploadedImages);
-    }
     console.error('[updateCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_UPDATE_ERROR', 'Could not update review');
   }
@@ -563,16 +494,19 @@ const listAdminReviews = async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const skip = (page - 1) * limit;
+    const storefront = resolveReviewStorefrontFromReq(req);
 
-    const query = {};
+    const base = {};
     if (req.query.productId && isValidObjectId(req.query.productId)) {
-      query.productId = req.query.productId;
+      base.productId = req.query.productId;
     }
     if (req.query.source === 'customer' || req.query.source === 'admin') {
-      query.source = req.query.source;
+      base.source = req.query.source;
     }
-    if (req.query.isActive === 'true') query.isActive = true;
-    if (req.query.isActive === 'false') query.isActive = false;
+    if (req.query.isActive === 'true') base.isActive = true;
+    if (req.query.isActive === 'false') base.isActive = false;
+
+    const query = mergeReviewStorefrontFilter(base, storefront);
 
     const [total, docs] = await Promise.all([
       ProductReview.countDocuments(query),
@@ -594,6 +528,7 @@ const listAdminReviews = async (req, res) => {
       return {
         _id: r._id,
         source: r.source,
+        storefront: normalizeReviewStorefront(r.storefront),
         rating: r.rating,
         comment: r.comment || '',
         isActive: r.isActive,
@@ -624,6 +559,7 @@ const listAdminReviews = async (req, res) => {
 
     return res.json({
       success: true,
+      scope: storefront,
       reviews,
       pagination: { page, limit, total, pages: Math.ceil(total / limit) || 0 }
     });
@@ -645,7 +581,10 @@ const patchReviewStatus = async (req, res) => {
       return jsonError(res, 400, 'INVALID_STATUS', 'isActive (boolean) is required');
     }
 
-    const review = await ProductReview.findById(id);
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const review = await ProductReview.findOne(
+      mergeReviewStorefrontFilter({ _id: id }, storefront)
+    );
     if (!review) {
       return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
     }
@@ -657,7 +596,11 @@ const patchReviewStatus = async (req, res) => {
     return res.json({
       success: true,
       message: 'Review status updated',
-      review: { _id: review._id, isActive: review.isActive }
+      review: {
+        _id: review._id,
+        isActive: review.isActive,
+        storefront: normalizeReviewStorefront(review.storefront)
+      }
     });
   } catch (err) {
     console.error('[patchReviewStatus]', err);
@@ -668,6 +611,7 @@ const patchReviewStatus = async (req, res) => {
 const createAdminGeneratedReview = async (req, res) => {
   try {
     const { productId, rating: ratingRaw, comment, displayName, isActive } = req.body || {};
+    const storefront = resolveReviewStorefrontFromReq(req);
 
     if (!isValidObjectId(productId)) {
       return jsonError(res, 400, 'INVALID_PRODUCT_ID', 'Invalid product id');
@@ -686,6 +630,7 @@ const createAdminGeneratedReview = async (req, res) => {
     const review = await ProductReview.create({
       productId,
       source: 'admin',
+      storefront,
       rating,
       comment: String(comment || '').trim().slice(0, 2000),
       displayName: String(displayName || '').trim().slice(0, 120),
@@ -699,6 +644,7 @@ const createAdminGeneratedReview = async (req, res) => {
       message: 'Generated review created',
       review: {
         _id: review._id,
+        storefront: review.storefront,
         rating: review.rating,
         comment: review.comment,
         displayName: review.displayName,
@@ -718,8 +664,11 @@ const updateAdminGeneratedReview = async (req, res) => {
       return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
     }
 
-    const review = await ProductReview.findById(id);
-    if (!review || review.source !== 'admin') {
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const review = await ProductReview.findOne(
+      mergeReviewStorefrontFilter({ _id: id, source: 'admin' }, storefront)
+    );
+    if (!review) {
       return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Generated review not found');
     }
 
@@ -750,6 +699,7 @@ const updateAdminGeneratedReview = async (req, res) => {
       message: 'Review updated',
       review: {
         _id: review._id,
+        storefront: review.storefront,
         rating: review.rating,
         comment: review.comment,
         displayName: review.displayName,
@@ -769,8 +719,11 @@ const deleteAdminGeneratedReview = async (req, res) => {
       return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
     }
 
-    const review = await ProductReview.findById(id);
-    if (!review || review.source !== 'admin') {
+    const storefront = resolveReviewStorefrontFromReq(req);
+    const review = await ProductReview.findOne(
+      mergeReviewStorefrontFilter({ _id: id, source: 'admin' }, storefront)
+    );
+    if (!review) {
       return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Generated review not found');
     }
 
@@ -796,33 +749,12 @@ const deleteCustomerReview = async (req, res) => {
       return jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
     }
 
-    const { id } = req.params;
-    if (!isValidObjectId(id)) {
-      return jsonError(res, 400, 'INVALID_REVIEW_ID', 'Invalid review id');
-    }
-
-    const review = await ProductReview.findOne({
-      _id: id,
-      userId,
-      source: 'customer'
-    });
-
-    if (!review) {
-      return jsonError(res, 404, 'REVIEW_NOT_FOUND', 'Review not found');
-    }
-
-    const productId = review.productId;
-    const images = normalizeStoredImages(review.images);
-    await review.deleteOne();
-    if (images.length) {
-      await deleteReviewImagesFromCloudinary(images);
-    }
-    await syncProductRatingFromReviews(productId);
-
-    return res.json({
-      success: true,
-      message: 'Your review was deleted'
-    });
+    return jsonError(
+      res,
+      403,
+      'REVIEW_LOCKED',
+      'Reviews cannot be deleted after submission.'
+    );
   } catch (err) {
     console.error('[deleteCustomerReview]', err);
     return jsonError(res, 500, 'REVIEW_DELETE_ERROR', 'Could not delete review');

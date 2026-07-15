@@ -12,6 +12,8 @@ const {
 } = require('../utils/pushVapid');
 const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
+const { findCartForStorefront } = require('./cartStorefront.service');
+const { mergeCustomerStorefrontFilter, normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -182,8 +184,9 @@ async function deactivateSubscription(subscriptionDoc, reason) {
   });
 }
 
-async function sendCartReminderPushToUser({ userId, userName, scopeQuery = {}, enforceDailyLimit = false }) {
-  const cartDoc = await Cart.findOne({ userId }).populate(ADMIN_CART_POPULATE).lean();
+async function sendCartReminderPushToUser({ userId, userName, scopeQuery = {}, enforceDailyLimit = false, storefront = 'ecomm' }) {
+  const sf = normalizeCustomerStorefront(storefront);
+  const cartDoc = await findCartForStorefront(userId, sf).populate(ADMIN_CART_POPULATE).lean();
   const cartSummary = buildCartSummary(cartDoc);
 
   if (!cartSummary.itemCount) {
@@ -374,10 +377,15 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
   const scopedUserIds = scopedUsers.map((u) => u._id);
   const userNameById = new Map(scopedUsers.map((u) => [String(u._id), u.name]));
 
-  const cartsWithItems = await Cart.find({
-    userId: { $in: scopedUserIds },
-    'items.0': { $exists: true },
-  })
+  const cartsWithItems = await Cart.find(
+    mergeCustomerStorefrontFilter(
+      {
+        userId: { $in: scopedUserIds },
+        'items.0': { $exists: true }
+      },
+      'ecomm'
+    )
+  )
     .select('userId')
     .lean();
 

@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
 const SOURCES = ['customer', 'admin'];
+const STOREFRONTS = ['ecomm', 'wholesale'];
 
 const productReviewSchema = new mongoose.Schema(
   {
@@ -8,6 +9,16 @@ const productReviewSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Product',
       required: true,
+      index: true
+    },
+    /**
+     * Which storefront this review belongs to.
+     * Legacy docs without this field are treated as ecomm at query time.
+     */
+    storefront: {
+      type: String,
+      enum: STOREFRONTS,
+      default: 'ecomm',
       index: true
     },
     source: {
@@ -79,11 +90,12 @@ const productReviewSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-productReviewSchema.index({ productId: 1, isActive: 1, rating: -1, createdAt: -1 });
+productReviewSchema.index({ productId: 1, storefront: 1, isActive: 1, rating: -1, createdAt: -1 });
 productReviewSchema.index(
-  { productId: 1, userId: 1 },
+  { productId: 1, userId: 1, storefront: 1 },
   {
     unique: true,
+    name: 'uniq_customer_review_per_product_storefront',
     partialFilterExpression: { source: 'customer', userId: { $type: 'objectId' } }
   }
 );
@@ -93,6 +105,9 @@ productReviewSchema.index(
  * Use sync logic or return a Promise; throw to fail validation.
  */
 productReviewSchema.pre('validate', function normalizeProductReview() {
+  if (!this.storefront) {
+    this.storefront = 'ecomm';
+  }
   if (this.source === 'customer') {
     if (!this.userId) {
       throw new Error('Customer reviews require userId');
@@ -109,3 +124,4 @@ productReviewSchema.pre('validate', function normalizeProductReview() {
 
 module.exports = mongoose.model('ProductReview', productReviewSchema);
 module.exports.REVIEW_SOURCES = SOURCES;
+module.exports.REVIEW_STOREFRONTS = STOREFRONTS;

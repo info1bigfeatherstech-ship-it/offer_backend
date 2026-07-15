@@ -46,7 +46,17 @@ const cartSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      unique: true,
+      index: true
+    },
+
+    /**
+     * One cart per user per storefront.
+     * Legacy carts without this field are treated as ecomm at query time.
+     */
+    storefront: {
+      type: String,
+      enum: ['ecomm', 'wholesale'],
+      default: 'ecomm',
       index: true
     },
 
@@ -82,6 +92,17 @@ const cartSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+cartSchema.index(
+  { userId: 1, storefront: 1 },
+  { unique: true, name: 'uniq_cart_per_user_storefront' }
+);
+
+cartSchema.pre('validate', function normalizeCartStorefront() {
+  if (!this.storefront) {
+    this.storefront = 'ecomm';
+  }
+});
 
 //
 // =======================

@@ -21,7 +21,7 @@ function toObjectId(id) {
 /**
  * @param {string|import('mongoose').Types.ObjectId} userId
  * @param {string|import('mongoose').Types.ObjectId} productId
- * @param {{ orderId?: string|null }} [opts]
+ * @param {{ orderId?: string|null, storefront?: string|null }} [opts]
  * @returns {Promise<{ eligible: boolean, order: object|null, code?: string, message?: string }>}
  */
 async function findDeliveredPurchaseForProduct(userId, productId, opts = {}) {
@@ -36,30 +36,59 @@ async function findDeliveredPurchaseForProduct(userId, productId, opts = {}) {
     };
   }
 
-  const filter = {
-    userId: uid,
-    orderStatus: { $in: [...REVIEWABLE_ORDER_STATUSES] },
-    'items.productId': pid,
-  };
+  const { mergeReviewStorefrontFilter, normalizeReviewStorefront } = require('../utils/reviewStorefrontScope');
+  const storefront = normalizeReviewStorefront(opts.storefront);
+
+  const filter = mergeReviewStorefrontFilter(
+    {
+      userId: uid,
+      orderStatus: { $in: [...REVIEWABLE_ORDER_STATUSES] },
+      'items.productId': pid,
+    },
+    storefront
+  );
 
   const orderIdRaw = String(opts.orderId || '').trim();
   if (orderIdRaw) {
-    filter.orderId = orderIdRaw;
+    // orderId is unique enough; still require same storefront via merge above when no explicit — but when orderId given, pin by orderId
+    // Rebuild so orderId is AND with storefront
+    const pinned = mergeReviewStorefrontFilter(
+      {
+        userId: uid,
+        orderId: orderIdRaw,
+        orderStatus: { $in: [...REVIEWABLE_ORDER_STATUSES] },
+        'items.productId': pid,
+      },
+      storefront
+    );
+    const order = await Order.findOne(pinned)
+      .sort({ 'shipmentInfo.deliveredAt': -1, updatedAt: -1 })
+      .select('orderId orderStatus items.productId items.variantId shipmentInfo.deliveredAt storefront userType')
+      .lean();
+
+    if (!order) {
+      return {
+        eligible: false,
+        order: null,
+        code: 'ORDER_NOT_ELIGIBLE',
+        message:
+          'This order is not eligible for review (must be delivered and contain this product on this storefront).',
+      };
+    }
+    return { eligible: true, order };
   }
 
   const order = await Order.findOne(filter)
     .sort({ 'shipmentInfo.deliveredAt': -1, updatedAt: -1 })
-    .select('orderId orderStatus items.productId items.variantId shipmentInfo.deliveredAt')
+    .select('orderId orderStatus items.productId items.variantId shipmentInfo.deliveredAt storefront userType')
     .lean();
 
   if (!order) {
     return {
       eligible: false,
       order: null,
-      code: orderIdRaw ? 'ORDER_NOT_ELIGIBLE' : 'NO_DELIVERED_PURCHASE',
-      message: orderIdRaw
-        ? 'This order is not eligible for review (must be delivered and contain this product).'
-        : 'You can review this product after an order containing it has been delivered.',
+      code: 'NO_DELIVERED_PURCHASE',
+      message: 'You can review this product after an order containing it has been delivered.',
     };
   }
 
@@ -69,10 +98,14 @@ async function findDeliveredPurchaseForProduct(userId, productId, opts = {}) {
 /**
  * @param {string|import('mongoose').Types.ObjectId} userId
  * @param {string|import('mongoose').Types.ObjectId} productId
+ * @param {{ storefront?: string|null }} [opts]
  */
-async function getProductReviewEligibility(userId, productId) {
+async function getProductReviewEligibility(userId, productId, opts = {}) {
   const uid = toObjectId(userId);
   const pid = toObjectId(productId);
+  const { mergeReviewStorefrontFilter, normalizeReviewStorefront } = require('../utils/reviewStorefrontScope');
+  const storefront = normalizeReviewStorefront(opts.storefront);
+
   if (!uid || !pid) {
     return {
       canCreate: false,
@@ -86,31 +119,35 @@ async function getProductReviewEligibility(userId, productId) {
     };
   }
 
-  const existing = await ProductReview.findOne({
-    productId: pid,
-    userId: uid,
-    source: 'customer',
-  })
-    .select('_id rating comment isActive verifiedPurchase orderId images createdAt updatedAt')
+  const existing = await ProductReview.findOne(
+    mergeReviewStorefrontFilter(
+      {
+        productId: pid,
+        userId: uid,
+        source: 'customer',
+      },
+      storefront
+    )
+  )
+    .select('_id rating comment isActive verifiedPurchase orderId images storefront createdAt updatedAt')
     .lean();
 
   if (existing) {
     return {
       canCreate: false,
-      canUpdate: true,
+      canUpdate: false,
       hasReview: true,
       review: existing,
       qualifyingOrderId: existing.orderId || null,
       verifiedPurchaseEligible: Boolean(existing.verifiedPurchase),
-      canAttachImages: Boolean(existing.verifiedPurchase),
+      canAttachImages: false,
       code: 'ALREADY_REVIEWED',
-      message: 'You have already reviewed this product. You can update your review.',
+      message: 'You have already submitted a review for this product.',
     };
   }
 
-  const purchase = await findDeliveredPurchaseForProduct(uid, pid);
+  const purchase = await findDeliveredPurchaseForProduct(uid, pid, { storefront });
   const verifiedPurchaseEligible = Boolean(purchase.eligible);
-  // Any logged-in customer can write a review; delivered order only adds Verified purchase + photos.
   return {
     canCreate: true,
     canUpdate: false,
@@ -143,7 +180,7 @@ async function getOrderReviewableItems(userId, orderId) {
   }
 
   const order = await Order.findOne({ orderId: oid, userId: uid })
-    .select('orderId orderStatus items.productId items.variantId items.quantity')
+    .select('orderId orderStatus storefront items.productId items.variantId items.quantity')
     .populate('items.productId', 'name slug')
     .lean();
 
@@ -159,6 +196,8 @@ async function getOrderReviewableItems(userId, orderId) {
 
   const status = String(order.orderStatus || '').toLowerCase();
   const orderEligible = REVIEWABLE_ORDER_STATUSES.includes(status);
+  const { mergeReviewStorefrontFilter, normalizeReviewStorefront } = require('../utils/reviewStorefrontScope');
+  const storefront = normalizeReviewStorefront(order.storefront);
 
   const productIds = (order.items || [])
     .map((it) => it.productId?._id || it.productId)
@@ -168,11 +207,16 @@ async function getOrderReviewableItems(userId, orderId) {
   const uniqueProductIds = [...new Set(productIds)].filter((id) => isValidObjectId(id));
 
   const existingReviews = uniqueProductIds.length
-    ? await ProductReview.find({
-        userId: uid,
-        source: 'customer',
-        productId: { $in: uniqueProductIds.map((id) => toObjectId(id)) },
-      })
+    ? await ProductReview.find(
+        mergeReviewStorefrontFilter(
+          {
+            userId: uid,
+            source: 'customer',
+            productId: { $in: uniqueProductIds.map((id) => toObjectId(id)) },
+          },
+          storefront
+        )
+      )
         .select('_id productId')
         .lean()
     : [];

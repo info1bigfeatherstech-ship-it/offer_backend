@@ -8,6 +8,17 @@ const addressSchema = new mongoose.Schema({
     index: true
   },
 
+  /**
+   * Which storefront owns this saved address.
+   * Legacy docs without this field are treated as ecomm at query time.
+   */
+  storefront: {
+    type: String,
+    enum: ['ecomm', 'wholesale'],
+    default: 'ecomm',
+    index: true
+  },
+
   fullName: {
     type: String,
     required: true,
@@ -120,9 +131,16 @@ const addressSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
+addressSchema.index({ userId: 1, storefront: 1, isDefault: 1 });
 addressSchema.index({ userId: 1, isDefault: 1 });
 addressSchema.index({ postalCode: 1 }); // ✅ Add for delivery checks
 addressSchema.index({ city: 1, state: 1 }); // ✅ Add for location-based queries
 addressSchema.index({ createdAt: -1 }); // ✅ Add for sorting
+
+addressSchema.pre('validate', function normalizeAddressStorefront() {
+  if (!this.storefront) {
+    this.storefront = 'ecomm';
+  }
+});
 
 module.exports = mongoose.model('Address', addressSchema);

@@ -4,6 +4,8 @@ const Cart = require('../models/cart');
 const User = require('../models/User');
 const cartReminderTemplate = require('../templates/cartReminderEmail.template');
 const logger = require('../utils/logger');
+const { findCartForStorefront } = require('./cartStorefront.service');
+const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -289,7 +291,7 @@ async function sendBulkCartReminderEmails({ userIds, scopeQuery = {} }) {
       continue;
     }
 
-    const cartDoc = await Cart.findOne({ userId: user._id }).populate(ADMIN_CART_POPULATE).lean();
+    const cartDoc = await findCartForStorefront(user._id, 'ecomm').populate(ADMIN_CART_POPULATE).lean();
     const cartSummary = buildCartSummary(cartDoc);
 
     if (!cartSummary.itemCount) {

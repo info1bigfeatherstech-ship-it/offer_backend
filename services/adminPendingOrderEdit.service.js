@@ -621,12 +621,17 @@ async function previewOrApplyPendingOrderEdit(opts) {
   const itemUpdates = opts.itemUpdates;
   const commit = Boolean(opts.commit);
   const adminUserId = opts.adminUserId || null;
+  const scopeMatch = opts.scopeMatch || null;
 
   if (!orderId) {
     throw createEditError(400, 'ORDER_ID_REQUIRED', 'orderId is required');
   }
 
-  const order = await Order.findOne({ orderId }).populate('items.productId', 'name slug');
+  const { mergeOrderScopeFilter } = require('../utils/adminOrderScope');
+  const order = await Order.findOne(mergeOrderScopeFilter({ orderId }, scopeMatch)).populate(
+    'items.productId',
+    'name slug'
+  );
   assertEditablePendingOrder(order);
 
   const before = snapshotMoney(order);

@@ -3,6 +3,7 @@ const Product = require('../models/Product');
 const ProductReview = require('../models/ProductReview');
 const cacheService = require('./cache.service');
 const cacheConfig = require('../config/cache.config');
+const { buildReviewStorefrontMatch } = require('../utils/reviewStorefrontScope');
 
 async function invalidateProductCaches() {
   try {
@@ -19,21 +20,47 @@ function roundAvg(sum, count) {
 }
 
 /**
- * Recomputes aggregate rating on Product from active reviews and busts list/detail cache.
+ * Aggregate active reviews for a product (optionally scoped to one storefront).
+ * @param {string|mongoose.Types.ObjectId} productId
+ * @param {'ecomm'|'wholesale'|null} [storefront]
+ * @returns {Promise<{ averageRating: number|null, reviewCount: number }>}
+ */
+async function aggregateActiveReviewSummary(productId, storefront = null) {
+  const pid =
+    typeof productId === 'string' ? new mongoose.Types.ObjectId(productId) : productId;
+
+  const match = { productId: pid, isActive: true };
+  const scoped =
+    storefront != null
+      ? { $and: [match, buildReviewStorefrontMatch(storefront)] }
+      : match;
+
+  const agg = await ProductReview.aggregate([
+    { $match: scoped },
+    { $group: { _id: null, count: { $sum: 1 }, sum: { $sum: '$rating' } } }
+  ]);
+
+  const count = agg[0]?.count || 0;
+  const sum = agg[0]?.sum || 0;
+  return {
+    averageRating: roundAvg(sum, count),
+    reviewCount: count
+  };
+}
+
+/**
+ * Recomputes Product.rating from **ecomm** active reviews (legacy cards / ecomm lists).
+ * Wholesale PDP uses public summary API filtered by storefront instead.
  * @param {string|mongoose.Types.ObjectId} productId
  */
 async function syncProductRatingFromReviews(productId) {
   const pid =
     typeof productId === 'string' ? new mongoose.Types.ObjectId(productId) : productId;
 
-  const agg = await ProductReview.aggregate([
-    { $match: { productId: pid, isActive: true } },
-    { $group: { _id: null, count: { $sum: 1 }, sum: { $sum: '$rating' } } }
-  ]);
-
-  const count = agg[0]?.count || 0;
-  const sum = agg[0]?.sum || 0;
-  const value = roundAvg(sum, count);
+  const { averageRating: value, reviewCount: count } = await aggregateActiveReviewSummary(
+    pid,
+    'ecomm'
+  );
 
   await Product.updateOne(
     { _id: pid },
@@ -45,5 +72,6 @@ async function syncProductRatingFromReviews(productId) {
 
 module.exports = {
   syncProductRatingFromReviews,
+  aggregateActiveReviewSummary,
   invalidateProductCaches
 };

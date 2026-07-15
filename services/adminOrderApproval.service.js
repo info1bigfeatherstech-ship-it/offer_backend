@@ -11,6 +11,7 @@ const { releaseReservedInventoryForOrder } = require('./orderInventory.service')
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { ensureShipmentForOrderExport } = require('../controllers/order.controller');
 const { mergeReturnInfo } = require('./rtoRefund.service');
+const { mergeOrderScopeFilter } = require('../utils/adminOrderScope');
 
 const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping' };
 
@@ -113,14 +114,15 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
  * @param {string} orderId
  * @returns {Promise<object>}
  */
-async function runAdminApproveOrderSingle(orderId) {
+async function runAdminApproveOrderSingle(orderId, opts = {}) {
   const id = String(orderId || '').trim();
   if (!id) {
     return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
   }
 
   try {
-    const order = await Order.findOne({ orderId: id }).populate(FULFILLMENT_ITEM_POPULATE);
+    const filter = mergeOrderScopeFilter({ orderId: id }, opts.scopeMatch || null);
+    const order = await Order.findOne(filter).populate(FULFILLMENT_ITEM_POPULATE);
     if (!order) {
       return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
     }
@@ -215,7 +217,7 @@ async function runAdminApproveOrderSingle(orderId) {
  * @param {string} orderId
  * @returns {Promise<object>}
  */
-async function runAdminCancelOrderSingle(orderId) {
+async function runAdminCancelOrderSingle(orderId, opts = {}) {
   const id = String(orderId || '').trim();
   if (!id) {
     return { orderId: orderId || '', success: false, skipped: false, code: 'ORDER_ID_REQUIRED', message: 'orderId is required' };
@@ -225,7 +227,8 @@ async function runAdminCancelOrderSingle(orderId) {
   session.startTransaction();
 
   try {
-    const order = await Order.findOne({ orderId: id }).session(session).populate(FULFILLMENT_ITEM_POPULATE);
+    const filter = mergeOrderScopeFilter({ orderId: id }, opts.scopeMatch || null);
+    const order = await Order.findOne(filter).session(session).populate(FULFILLMENT_ITEM_POPULATE);
     if (!order) {
       await session.abortTransaction();
       session.endSession();

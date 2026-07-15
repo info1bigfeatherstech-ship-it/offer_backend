@@ -9,6 +9,7 @@ const {
   isVariantListedOnStorefront
 } = require('../utils/storefrontCatalog');
 const { sanitizeCartItems } = require('../services/cartSanitize.service');
+const { findCartForStorefront, findOrCreateCartForStorefront } = require('../services/cartStorefront.service');
 
 const CART_PRODUCT_SELECT =
   'name slug title description brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt variants';
@@ -157,12 +158,12 @@ const getcart = async (req, res) => {
   try {
     const storefront = storefrontOrDefault(req);
 
-    let cartDoc = await Cart.findOne({ userId });
+    let cartDoc = await findCartForStorefront(userId, storefront);
     if (cartDoc?.items?.length) {
       await sanitizeCartItems(cartDoc, storefront, { persist: true });
     }
 
-    const cart = await Cart.findOne({ userId })
+    const cart = await findCartForStorefront(userId, storefront)
       .populate({
         path: 'items.productId',
         select: CART_PRODUCT_SELECT
@@ -346,10 +347,7 @@ const addTocart = async (req, res) => {
     }));
 
     // Upsert cart and item
-    let cart = await Cart.findOne({ userId });
-    if (!cart) {
-      cart = new Cart({ userId, items: [] });
-    }
+    let cart = await findOrCreateCartForStorefront(userId, storefront);
 
     // Check existing same item
     const existing = cart.items.find(it => 
@@ -384,7 +382,7 @@ const addTocart = async (req, res) => {
     await cart.save();
 
     // Return cart with full data
-    const updatedcart = await Cart.findOne({ userId })
+    const updatedcart = await findCartForStorefront(userId, storefront)
       .populate({
         path: 'items.productId',
         select: CART_PRODUCT_SELECT
@@ -464,7 +462,7 @@ const updatecartItem = async (req, res) => {
   }
 
   try {
-    const cart = await Cart.findOne({ userId });
+    const cart = await findCartForStorefront(userId, storefront);
     if (!cart) {
       return res.status(404).json({ 
         success: false, 
@@ -492,7 +490,7 @@ const updatecartItem = async (req, res) => {
       cart.calculateTotal();
       await cart.save();
       
-      const updatedcart = await Cart.findOne({ userId })
+      const updatedcart = await findCartForStorefront(userId, storefront)
         .populate({ 
           path: 'items.productId', 
           select: CART_PRODUCT_SELECT
@@ -578,7 +576,7 @@ const updatecartItem = async (req, res) => {
     await cart.save();
 
     // Populate for response
-    const populatedcart = await Cart.findOne({ userId })
+    const populatedcart = await findCartForStorefront(userId, storefront)
       .populate({ 
         path: 'items.productId', 
         select: CART_PRODUCT_SELECT
@@ -648,8 +646,7 @@ const mergecart = async (req, res) => {
   }
 
   try {
-    let cart = await Cart.findOne({ userId });
-    if (!cart) cart = new Cart({ userId, items: [] });
+    let cart = await findOrCreateCartForStorefront(userId, storefront);
 
     for (const incoming of items) {
       let { productId, variantId, quantity, productSlug } = incoming;
@@ -710,7 +707,7 @@ const mergecart = async (req, res) => {
     await cart.save();
 
     // Return updated cart
-    const populatedcart = await Cart.findOne({ userId })
+    const populatedcart = await findCartForStorefront(userId, storefront)
       .populate({ 
         path: 'items.productId', 
         select: CART_PRODUCT_SELECT
@@ -766,7 +763,7 @@ const removecartItem = async (req, res) => {
   const { productId, variantId } = req.body;
 
   try {
-    const cart = await Cart.findOne({ userId });
+    const cart = await findCartForStorefront(userId, storefront);
     if (!cart) {
       return res.status(404).json({ 
         success: false, 
@@ -782,7 +779,7 @@ const removecartItem = async (req, res) => {
     cart.calculateTotal();
     await cart.save();
 
-    const populatedcart = await Cart.findOne({ userId })
+    const populatedcart = await findCartForStorefront(userId, storefront)
       .populate({ 
         path: 'items.productId', 
         select: CART_PRODUCT_SELECT
@@ -839,7 +836,7 @@ const bulkRemove = async (req, res) => {
   const { items } = req.body;
 
   try {
-    const cart = await Cart.findOne({ userId });
+    const cart = await findCartForStorefront(userId, storefront);
     if (!cart) {
       return res.status(404).json({ 
         success: false, 
@@ -857,7 +854,7 @@ const bulkRemove = async (req, res) => {
     cart.calculateTotal();
     await cart.save();
 
-    const populatedcart = await Cart.findOne({ userId })
+    const populatedcart = await findCartForStorefront(userId, storefront)
       .populate({ 
         path: 'items.productId', 
         select: CART_PRODUCT_SELECT
@@ -913,7 +910,7 @@ const clearcart = async (req, res) => {
   const storefront = storefrontOrDefault(req);
 
   try {
-    const cart = await Cart.findOne({ userId });
+    const cart = await findCartForStorefront(userId, storefront);
     if (!cart) {
       return res.json({ 
         success: true, 

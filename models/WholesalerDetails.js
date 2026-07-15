@@ -1,133 +1,161 @@
 const mongoose = require('mongoose');
 
-const wholesalerDetailsSchema = new mongoose.Schema({
+const wholesalerDetailsSchema = new mongoose.Schema(
+  {
     userId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: false,
-        default: null
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: false,
+      default: null
     },
     fullName: {
-        type: String,
-        required: true
+      type: String,
+      required: true,
+      trim: true
     },
     whatsappNumber: {
-        type: String,
-        required: true
+      type: String,
+      required: true
     },
     mobileNumber: {
-        type: String,
-        required: true
+      type: String,
+      required: true
     },
     email: {
-        type: String,
-        required: true
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true
     },
+
+    /**
+     * Business / KYC fields — optional until phase-2 (complete-details) after owner approval.
+     * Legacy one-shot applications still store them at create time.
+     */
     permanentAddress: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     haveShop: {
-        type: Boolean,
-        required: true
+      type: Boolean,
+      default: false
     },
     businessAddress: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     deliveryAddress: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     sellingPlaceFrom: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     sellingZoneCity: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     productCategory: {
-        type: String,
-        required: true
+      type: String,
+      default: '',
+      trim: true
     },
     monthlyEstimatedPurchase: {
-        type: Number,
-        required: true
+      type: Number,
+      default: null
     },
     idProofUpload: {
-        type: String,
-        required: true
+      type: String,
+      default: ''
     },
     businessAddressProofUpload: {
-        type: String,
-        required: true
+      type: String,
+      default: ''
     },
+
+    /**
+     * Set when phase-2 KYC/details were submitted (or at create for legacy full applications).
+     * Null = basic interest only; activation OTP requires details to be complete.
+     */
+    detailsSubmittedAt: {
+      type: Date,
+      default: null,
+      index: true
+    },
+
     isApproved: {
-        type: Boolean,
-        default: false
+      type: Boolean,
+      default: false
     },
     status: {
-        type: String,
-        enum: ['pending', 'approved', 'rejected', 'activated'],
-        default: 'pending',
-        index: true
+      type: String,
+      enum: ['pending', 'approved', 'rejected', 'activated'],
+      default: 'pending',
+      index: true
     },
     reviewReason: {
-        type: String,
-        default: ''
+      type: String,
+      default: ''
     },
     reviewedAt: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null
     },
     reviewedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        default: null
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
     },
     linkedUserId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        default: null
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
     },
     activationOtpHash: {
-        type: String,
-        default: null,
-        select: false
+      type: String,
+      default: null,
+      select: false
     },
     activationOtpExpiresAt: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null
     },
     activationOtpSentAt: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null
     },
     activationOtpAttempts: {
-        type: Number,
-        default: 0
+      type: Number,
+      default: 0
     },
     activatedAt: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null
     },
     /** Incremented when admin generates a new owner review link; token must match this version. */
     ownerReviewLinkVersion: {
-        type: Number,
-        default: 0,
-        min: 0
+      type: Number,
+      default: 0,
+      min: 0
     },
     ownerNotifiedAt: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null
     },
     ownerNotifiedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        default: null
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
     }
-}, { timestamps: true });
+  },
+  { timestamps: true }
+);
 
 wholesalerDetailsSchema.index({ mobileNumber: 1, status: 1 });
 wholesalerDetailsSchema.index({ email: 1, status: 1 });
