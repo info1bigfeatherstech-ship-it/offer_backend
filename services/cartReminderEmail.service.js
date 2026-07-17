@@ -236,10 +236,12 @@ function delay(ms) {
 /**
  * Send cart reminder emails to the given user IDs (scoped).
  * Skips users with empty carts or missing email.
+ * Cart is loaded for the request storefront (default ecomm — live ecomm-safe).
  *
- * @param {{ userIds: string[], scopeQuery?: object }} params
+ * @param {{ userIds: string[], scopeQuery?: object, storefront?: string }} params
  */
-async function sendBulkCartReminderEmails({ userIds, scopeQuery = {} }) {
+async function sendBulkCartReminderEmails({ userIds, scopeQuery = {}, storefront = 'ecomm' }) {
+  const sf = normalizeCustomerStorefront(storefront);
   const rawIds = Array.isArray(userIds) ? userIds : [];
   const uniqueIds = [...new Set(rawIds.map((id) => String(id || '').trim()).filter(Boolean))];
 
@@ -275,7 +277,8 @@ async function sendBulkCartReminderEmails({ userIds, scopeQuery = {} }) {
     sent: 0,
     skipped: 0,
     failed: 0,
-    details: []
+    details: [],
+    storefront: sf
   };
 
   const foundIds = new Set(users.map((u) => String(u._id)));
@@ -291,7 +294,7 @@ async function sendBulkCartReminderEmails({ userIds, scopeQuery = {} }) {
       continue;
     }
 
-    const cartDoc = await findCartForStorefront(user._id, 'ecomm').populate(ADMIN_CART_POPULATE).lean();
+    const cartDoc = await findCartForStorefront(user._id, sf).populate(ADMIN_CART_POPULATE).lean();
     const cartSummary = buildCartSummary(cartDoc);
 
     if (!cartSummary.itemCount) {

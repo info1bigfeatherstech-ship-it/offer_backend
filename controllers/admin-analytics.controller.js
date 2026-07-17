@@ -998,7 +998,8 @@ const bulkCartReminderPush = async (req, res) => {
 
     const results = await sendBulkCartReminderPushes({
       userIds,
-      scopeQuery: scopedUserQueryFromReq(req)
+      scopeQuery: scopedUserQueryFromReq(req),
+      storefront: resolveCustomerStorefrontFromReq(req)
     });
 
     return res.status(200).json({
@@ -1046,7 +1047,8 @@ const bulkCartReminderEmail = async (req, res) => {
 
     const results = await sendBulkCartReminderEmails({
       userIds,
-      scopeQuery: scopedUserQueryFromReq(req)
+      scopeQuery: scopedUserQueryFromReq(req),
+      storefront: resolveCustomerStorefrontFromReq(req)
     });
 
     return res.status(200).json({
