@@ -30,6 +30,8 @@ const {
   mergeProductChannelStatus,
   mergeVariantChannelVisibility,
   hasWholesalePricingConfig,
+  hasWholesalePricingEligibleVariant,
+  hasActiveWholesaleVariantForCatalog,
   getVariantAvailabilityByStorefront,
   deriveProductChannelStatusFromVariants,
   propagateProductChannelStatusToVariants,
@@ -55,18 +57,9 @@ const invalidateProductCaches = async (productSlug = null) => {
   }
 };
 
+/** Bulk path: same PRODUCT + SEARCH patterns as single-product invalidation. */
 const invalidateAllProductCaches = async () => {
-  try {
-    const cacheService = require('../services/cache.service');
-    
-    // Flush all product-related caches
-    await cacheService.forget('p:*');
-    await cacheService.forget('s:*');
-    
-    console.log('✅ All product caches invalidated (bulk)');
-  } catch (err) {
-    console.error('Cache invalidation error:', err);
-  }
+  await invalidateProductCaches('all-bulk');
 };
 
 // =============================================
@@ -123,15 +116,6 @@ function validateRequiredShippingFields(rawShipping) {
       dimensions: { length, width, height }
     }
   };
-}
-
-function hasActiveWholesaleVariantForCatalog(doc) {
-  if (!doc || !Array.isArray(doc.variants)) return false;
-  return doc.variants.some((v) => {
-    const ws = v?.channelVisibility?.wholesale;
-    const isVisibleWholesale = ws != null ? ws === "active" : v.isActive !== false;
-    return isVisibleWholesale && hasWholesalePricingConfig(v);
-  });
 }
 
 function collectWholesaleInventoryWarnings(variants = []) {
@@ -1227,12 +1211,12 @@ const createProduct = async (req, res) => {
 
     if (
       product.channelStatus?.wholesale === "active" &&
-      !hasActiveWholesaleVariantForCatalog(product)
+      !hasWholesalePricingEligibleVariant(product)
     ) {
       return res.status(400).json({
         success: false,
         message:
-          "Cannot enable wholesale storefront: no variant has wholesale=true, valid wholesaleBase (>0), and wholesale visibility active. Update at least one variant first."
+          "Cannot enable wholesale storefront: no variant has wholesale=true and wholesaleBase > 0. Update at least one variant first."
       });
     }
 
@@ -4250,12 +4234,12 @@ const updateProduct = async (req, res) => {
 
     if (
       doc.channelStatus?.wholesale === "active" &&
-      !hasActiveWholesaleVariantForCatalog(doc)
+      !hasWholesalePricingEligibleVariant(doc)
     ) {
       return res.status(400).json({
         success: false,
         message:
-          "Wholesale storefront is active but no eligible wholesale variant is available. Add/update at least one variant with wholesale=true, wholesaleBase (>0), and wholesale visibility active."
+          "Wholesale storefront is active but no eligible wholesale variant is available. Add/update at least one variant with wholesale=true and wholesaleBase > 0."
       });
     }
 
@@ -4688,14 +4672,14 @@ const bulkUpdateProductStatus = async (req, res) => {
 
       if (
         nextChannelStatus.wholesale === 'active' &&
-        !hasActiveWholesaleVariantForCatalog(doc)
+        !hasWholesalePricingEligibleVariant(doc)
       ) {
         skipped.push({
           slug: doc.slug,
           name: doc.name,
           reasonCode: 'WHOLESALE_ELIGIBILITY_MISSING',
           reason:
-            'Wholesale activation skipped: no variant is eligible (requires wholesale=true, wholesaleBase>0, and wholesale visibility active).'
+            'Wholesale activation skipped: no variant has wholesale=true and wholesaleBase > 0.'
         });
         continue;
       }
@@ -4827,7 +4811,8 @@ const updateVariantChannelVisibility = async (req, res) => {
     doc.markModified('variants');
     reconcileProductCatalogState(doc);
 
-    // Prevent wholesale storefront active state without an eligible active variant.
+    // After visibility change + reconcile: product wholesale active only if
+    // at least one variant remains pricing-eligible and wholesale-visible.
     if (
       doc.channelStatus?.wholesale === 'active' &&
       !hasActiveWholesaleVariantForCatalog(doc)
@@ -4835,7 +4820,7 @@ const updateVariantChannelVisibility = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          'Wholesale storefront remains active only when at least one variant is wholesale-eligible and wholesale-visible.'
+          'Wholesale storefront remains active only when at least one variant is wholesale-eligible (wholesale=true, wholesaleBase>0) and wholesale-visible.'
       });
     }
 

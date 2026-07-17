@@ -58,6 +58,34 @@ function hasWholesalePricingConfig(variant) {
   return Boolean(variant?.wholesale === true && Number.isFinite(wholesaleBase) && wholesaleBase > 0);
 }
 
+/**
+ * True if any variant has wholesale pricing configured (visibility ignored).
+ * Use BEFORE activate / bulk-activate (chicken-egg safe).
+ * @param {object|Array} docOrVariants product doc or variants array
+ */
+function hasWholesalePricingEligibleVariant(docOrVariants) {
+  const list = Array.isArray(docOrVariants)
+    ? docOrVariants
+    : docOrVariants && Array.isArray(docOrVariants.variants)
+      ? docOrVariants.variants
+      : [];
+  return list.some((v) => hasWholesalePricingConfig(v));
+}
+
+/**
+ * True if any variant is storefront-listable on wholesale (pricing + visibility active).
+ * Use AFTER propagate / reconcile for consistency checks.
+ * @param {object|Array} docOrVariants
+ */
+function hasActiveWholesaleVariantForCatalog(docOrVariants) {
+  const list = Array.isArray(docOrVariants)
+    ? docOrVariants
+    : docOrVariants && Array.isArray(docOrVariants.variants)
+      ? docOrVariants.variants
+      : [];
+  return list.some((v) => effectiveVariantChannelStatus(v, 'wholesale') === 'active');
+}
+
 function _toSafeNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -327,6 +355,7 @@ function filterVariantsForStorefront(variants, storefront) {
 function deriveProductChannelStatusFromVariants(variants) {
   const list = Array.isArray(variants) ? variants : [];
 
+  // Ecomm: visibility-driven (unchanged — live storefront depends on this).
   const hasActiveEcomm = list.some((v) => {
     const state = v?.channelVisibility?.ecomm;
     return state === 'active' || (state == null && v?.isActive !== false);
@@ -334,7 +363,24 @@ function deriveProductChannelStatusFromVariants(variants) {
   const hasDraftEcomm = list.some((v) => (v?.channelVisibility?.ecomm || 'draft') === 'draft');
   const ecomm = hasActiveEcomm ? 'active' : hasDraftEcomm ? 'draft' : 'archived';
 
-  const wholesale = list.some((v) => hasWholesalePricingConfig(v)) ? 'active' : 'draft';
+  // Wholesale: must mirror ecomm visibility rules, with pricing as a hard gate.
+  // Product wholesale is active only when at least one variant has both:
+  //   - wholesale pricing eligible (wholesale=true + wholesaleBase>0)
+  //   - channelVisibility.wholesale active (or legacy null + isActive !== false)
+  // Pricing alone must NOT force active (fixes deactivate → still Active in admin).
+  const hasActiveWholesale = list.some((v) => {
+    if (!hasWholesalePricingConfig(v)) return false;
+    const state = v?.channelVisibility?.wholesale;
+    return state === 'active' || (state == null && v?.isActive !== false);
+  });
+  const hasDraftWholesale = list.some((v) => {
+    if (!hasWholesalePricingConfig(v)) return false;
+    const state = v?.channelVisibility?.wholesale || 'draft';
+    return state === 'draft';
+  });
+  // Prefer draft over archived when no priced wholesale variants — matches prior
+  // wholesale derive fallback and avoids accidental wholesale archived side-effects.
+  const wholesale = hasActiveWholesale ? 'active' : hasDraftWholesale ? 'draft' : 'draft';
 
   return { ecomm, wholesale };
 }
@@ -396,6 +442,8 @@ module.exports = {
   isProductListedOnStorefront,
   isVariantListedOnStorefront,
   hasWholesalePricingConfig,
+  hasWholesalePricingEligibleVariant,
+  hasActiveWholesaleVariantForCatalog,
   getVariantAvailability,
   getVariantAvailabilityByStorefront,
   mongoProductCatalogActiveFilter,
