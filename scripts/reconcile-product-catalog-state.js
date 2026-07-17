@@ -6,11 +6,12 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const { reconcileProductCatalogState } = require('../utils/storefrontCatalog');
+const { LifecycleExpiration$ } = require('@aws-sdk/client-s3');
 
 async function main() {
-  const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
+  const uri = process.env.MONGO_DB_URI || process.env.MONGO_DB_URI;
   if (!uri) {
-    console.error('MONGODB_URI not set');
+    console.error('MONGO_DB_URI not set');
     process.exit(1);
   }
 

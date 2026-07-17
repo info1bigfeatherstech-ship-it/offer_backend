@@ -41,6 +41,10 @@ const {
     mergeAdminOrderFilter
 } = require('../utils/adminOrderScope');
 const {
+    isCustomerProductReturnRequest,
+    buildAdminProductReturnRequestMatch
+} = require('../utils/productReturnRequest');
+const {
     normalizePaymentMethod,
     normalizePaymentPlan,
     normalizeBalanceCollection,
@@ -3533,14 +3537,14 @@ exports.listAdminReturnRequests = async (req, res) => {
         const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
         const skip = (page - 1) * limit;
 
+        // Only customer product-return requests (not cancel / amendment refunds).
+        const productReturnMatch = buildAdminProductReturnRequestMatch();
         const listFilter = statusFilter
             ? mergeAdminOrderFilter(req, {
-                'returnInfo.requestedAt': { $ne: null },
+                ...productReturnMatch,
                 'returnInfo.status': statusFilter
               })
-            : mergeAdminOrderFilter(req, {
-                'returnInfo.requestedAt': { $ne: null }
-              });
+            : mergeAdminOrderFilter(req, productReturnMatch);
 
         const [rows, total] = await Promise.all([
             Order.find(listFilter)
@@ -3564,6 +3568,7 @@ exports.listAdminReturnRequests = async (req, res) => {
             returnInfo: {
                 status: o.returnInfo?.status || null,
                 reasonType: o.returnInfo?.reasonType || null,
+                refundContext: o.returnInfo?.refundContext || null,
                 requestedAt: o.returnInfo?.requestedAt || null,
                 approvedAt: o.returnInfo?.approvedAt || null,
                 rejectedAt: o.returnInfo?.rejectedAt || null,
@@ -3598,8 +3603,8 @@ exports.getAdminReturnRequest = async (req, res) => {
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
-        if (!order.returnInfo?.requestedAt) {
-            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No return request found for this order');
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No customer product return request found for this order');
         }
         if (order.returnInfo) {
             order.returnInfo.windowDays = RETURN_REQUEST_WINDOW_DAYS;
@@ -3626,6 +3631,9 @@ exports.adminDecideReturnRequest = async (req, res) => {
         const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No customer product return request found for this order');
         }
         if (String(order.returnInfo?.status || '').toLowerCase() !== 'requested') {
             return respondOrderError(res, 409, 'RETURN_DECISION_NOT_ALLOWED', 'Only requested returns can be reviewed');
@@ -3700,8 +3708,8 @@ exports.adminInitiateReturnRefund = async (req, res) => {
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
-        if (!order.returnInfo?.requestedAt) {
-            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No return request found for this order');
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(res, 404, 'RETURN_REQUEST_NOT_FOUND', 'No customer product return request found for this order');
         }
         if (!isReturnRefundEligible(order)) {
             return respondOrderError(
@@ -3872,11 +3880,16 @@ exports.sendReturnChatMessage = async (req, res) => {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
         }
 
-        const requestedAt = order.returnInfo?.requestedAt;
-        if (!requestedAt) {
-            return respondOrderError(res, 400, 'RETURN_NOT_REQUESTED', 'Chat is only available for orders with active return requests');
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_NOT_REQUESTED',
+                'Chat is only available for customer product return requests'
+            );
         }
 
+        const requestedAt = order.returnInfo?.requestedAt;
         const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
         const deadlineAt = new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000);
         const isExpired = new Date() > deadlineAt;
@@ -3932,6 +3945,15 @@ exports.getReturnChat = async (req, res) => {
 
         if (!order) {
             return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_NOT_REQUESTED',
+                'Chat is only available for customer product return requests'
+            );
         }
 
         if (order.returnInfo) {
