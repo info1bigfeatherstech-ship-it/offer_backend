@@ -7,6 +7,10 @@ const {
   buildRtoAutoSyncCandidateFilter,
   TERMINAL_RTO_ADMIN_STATUSES,
 } = require('../services/adminRtoAutoSync.service');
+const {
+  resolveDateRange,
+  buildScopedDateMatch,
+} = require('../services/adminOrderDashboard.service');
 
 const from = new Date('2026-01-01T00:00:00.000Z');
 const to = new Date('2026-07-13T23:59:59.999Z');
@@ -25,6 +29,20 @@ assert.ok(
 
 // Must not look like forward-only sync statuses list
 assert.ok(!andStr.includes('pending') || andStr.includes('"rto"'), 'not forward-only pending filter');
+
+// Lifetime / all: no createdAt window on auto-sync candidates.
+const allFilter = buildRtoAutoSyncCandidateFilter({ staleMs: 15 * 60 * 1000 });
+assert.ok(!JSON.stringify(allFilter).includes('createdAt'), 'all-time sync must not force createdAt');
+
+const allRange = resolveDateRange({ rangePreset: 'all' });
+assert.strictEqual(allRange.presetLabel, 'all');
+assert.strictEqual(allRange.from, null);
+assert.strictEqual(allRange.to, null);
+const allMatch = buildScopedDateMatch(allRange.from, allRange.to, {});
+assert.deepStrictEqual(allMatch, {});
+
+const windowed = buildScopedDateMatch(from, to, {});
+assert.ok(windowed.createdAt, 'windowed match keeps createdAt');
 
 console.log('OK: buildRtoAutoSyncCandidateFilter shape looks correct');
 console.log(JSON.stringify(filter, null, 2));
