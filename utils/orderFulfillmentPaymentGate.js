@@ -4,6 +4,8 @@
  * Rules (keep in sync with product expectations):
  * - COD: may ship before online capture (cash at delivery).
  * - Online, full settlement: require paymentStatus === "paid" (pending/initiated block).
+ * - Online, partial refund after capture (OOS amendment / goodwill): allow when the order still
+ *   has a positive total and a positive paid balance — full "refunded" / "failed" still block.
  * - Online, advance with remaining balance via COD: allow once the first Razorpay instalment
  *   meets the same minimum as at order creation (advance % of total, capped like checkout).
  * - Online, advance with remaining balance online: treat like full — must be fully paid.
@@ -30,6 +32,19 @@ function computeLockedAdvanceFirstChargeInr(totalAmount, advancePercent) {
 }
 
 /**
+ * True when a partial refund left something shippable (money still captured for remaining bill).
+ * Full refunds use paymentStatus "refunded" and stay blocked.
+ * @param {object} order
+ * @returns {boolean}
+ */
+function isPartiallyRefundedStillShippable(order) {
+  const total = roundMoney2(Number(order?.totalAmount) || 0);
+  const paid = roundMoney2(Number(order?.amountPaidInr) || 0);
+  if (!(total > 0.01) || !(paid > 0.01)) return false;
+  return true;
+}
+
+/**
  * @param {import('mongoose').Document|object} order
  * @returns {FulfillmentPaymentOk|FulfillmentPaymentBlocked}
  */
@@ -53,12 +68,30 @@ function evaluateOrderPaymentForShiprocketFulfillment(order) {
   }
 
   const status = String(order.paymentStatus || '').toLowerCase();
-  if (['failed', 'refunded', 'partially_refunded'].includes(status)) {
+  // Full failure / full refund: never ship. Partial refund (amendment webhook, etc.): allow when
+  // the remaining bill is still paid — do not block label/manifest on already-shipped prepaid orders.
+  if (status === 'failed' || status === 'refunded') {
     return {
       ok: false,
       code: 'PAYMENT_NOT_SUCCESSFUL',
       message: 'Payment is not in a state that allows shipping.',
       details: { paymentStatus: status }
+    };
+  }
+
+  if (status === 'partially_refunded') {
+    if (isPartiallyRefundedStillShippable(order)) {
+      return { ok: true, reason: 'partially_refunded_balance_shippable' };
+    }
+    return {
+      ok: false,
+      code: 'PAYMENT_NOT_SUCCESSFUL',
+      message: 'Payment is not in a state that allows shipping.',
+      details: {
+        paymentStatus: status,
+        amountPaidInr: roundMoney2(Number(order.amountPaidInr) || 0),
+        totalAmount: roundMoney2(Number(order.totalAmount) || 0)
+      }
     };
   }
 
@@ -135,5 +168,6 @@ function fulfillmentPaymentBlockHttpStatus(code) {
 module.exports = {
   evaluateOrderPaymentForShiprocketFulfillment,
   computeLockedAdvanceFirstChargeInr,
+  isPartiallyRefundedStillShippable,
   fulfillmentPaymentBlockHttpStatus
 };
