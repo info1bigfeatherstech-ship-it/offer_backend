@@ -37,8 +37,10 @@ class CartReminderPushSchedulerService {
 
     if (!isPushConfigured()) return { skipped: true, reason: 'PUSH_NOT_CONFIGURED' };
 
-    const autoEnabled = await leadsPushSettingsService.isAutoPushEnabled('ecomm');
-    if (!autoEnabled) {
+    // Per-storefront toggles: ecomm path unchanged; wholesale only when its auto setting is on.
+    const ecommEnabled = await leadsPushSettingsService.isAutoPushEnabled('ecomm');
+    const wholesaleEnabled = await leadsPushSettingsService.isAutoPushEnabled('wholesale');
+    if (!ecommEnabled && !wholesaleEnabled) {
       return { skipped: true, reason: 'AUTO_DISABLED' };
     }
 
@@ -55,8 +57,22 @@ class CartReminderPushSchedulerService {
 
     this.isRunning = true;
     try {
-      const scopeQuery = { userType: 'user' };
-      const results = await sendAutoCartReminderPushes({ scopeQuery });
+      const results = { ecomm: null, wholesale: null };
+
+      if (ecommEnabled) {
+        results.ecomm = await sendAutoCartReminderPushes({
+          scopeQuery: { userType: 'user' },
+          storefront: 'ecomm',
+        });
+      }
+
+      if (wholesaleEnabled) {
+        results.wholesale = await sendAutoCartReminderPushes({
+          scopeQuery: { userType: 'wholesaler' },
+          storefront: 'wholesale',
+        });
+      }
+
       this.lastAutoRunDateKey = dateKey;
       return results;
     } catch (err) {

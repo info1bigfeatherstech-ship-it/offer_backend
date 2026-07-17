@@ -251,8 +251,10 @@ async function sendCartReminderPushToUser({ userId, userName, scopeQuery = {}, e
 
 /**
  * Manual bulk cart reminder push (admin).
+ * @param {{ userIds: string[], scopeQuery?: object, storefront?: string }} params
  */
-async function sendBulkCartReminderPushes({ userIds, scopeQuery = {} }) {
+async function sendBulkCartReminderPushes({ userIds, scopeQuery = {}, storefront = 'ecomm' }) {
+  const sf = normalizeCustomerStorefront(storefront);
   const rawIds = Array.isArray(userIds) ? userIds : [];
   const uniqueIds = [...new Set(rawIds.map((id) => String(id || '').trim()).filter(Boolean))];
 
@@ -288,6 +290,7 @@ async function sendBulkCartReminderPushes({ userIds, scopeQuery = {} }) {
     skipped: 0,
     failed: 0,
     details: [],
+    storefront: sf,
   };
 
   const foundIds = new Set(users.map((u) => String(u._id)));
@@ -302,6 +305,7 @@ async function sendBulkCartReminderPushes({ userIds, scopeQuery = {} }) {
         userName: user.name,
         scopeQuery,
         enforceDailyLimit: false,
+        storefront: sf,
       });
 
       if (outcome.status === 'sent') {
@@ -356,22 +360,27 @@ async function sendBulkCartReminderPushes({ userIds, scopeQuery = {} }) {
 
 /**
  * Auto daily push: users with cart items + active push subscription, max once per IST day.
+ * Storefront defaults to ecomm (live cron / ecomm-safe). Pass wholesale for wholesaler carts.
+ *
+ * @param {{ scopeQuery?: object, storefront?: string }} [opts]
  */
-async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
+async function sendAutoCartReminderPushes({ scopeQuery = {}, storefront = 'ecomm' } = {}) {
+  const sf = normalizeCustomerStorefront(storefront);
+
   if (!isPushConfigured()) {
-    return { skipped: true, reason: 'PUSH_NOT_CONFIGURED' };
+    return { skipped: true, reason: 'PUSH_NOT_CONFIGURED', storefront: sf };
   }
 
-  const autoEnabled = await leadsPushSettingsService.isAutoPushEnabled('ecomm');
+  const autoEnabled = await leadsPushSettingsService.isAutoPushEnabled(sf);
   if (!autoEnabled) {
-    return { skipped: true, reason: 'AUTO_DISABLED' };
+    return { skipped: true, reason: 'AUTO_DISABLED', storefront: sf };
   }
 
   ensureVapidConfigured();
 
   const scopedUsers = await User.find(scopeQuery).select('_id name').lean();
   if (!scopedUsers.length) {
-    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0 };
+    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0, storefront: sf };
   }
 
   const scopedUserIds = scopedUsers.map((u) => u._id);
@@ -383,7 +392,7 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
         userId: { $in: scopedUserIds },
         'items.0': { $exists: true }
       },
-      'ecomm'
+      sf
     )
   )
     .select('userId')
@@ -391,7 +400,7 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
 
   const cartUserIds = [...new Set(cartsWithItems.map((c) => String(c.userId)))];
   if (!cartUserIds.length) {
-    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0 };
+    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0, storefront: sf };
   }
 
   const startOfToday = getStartOfTodayUtcForIst();
@@ -406,10 +415,10 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
 
   const userIdsToNotify = [...new Set(subscriptions.map((s) => String(s.userId)))];
   if (!userIdsToNotify.length) {
-    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0 };
+    return { sent: 0, skipped: 0, failed: 0, processedUsers: 0, storefront: sf };
   }
 
-  const results = { sent: 0, skipped: 0, failed: 0, processedUsers: 0 };
+  const results = { sent: 0, skipped: 0, failed: 0, processedUsers: 0, storefront: sf };
 
   for (let i = 0; i < userIdsToNotify.length; i += AUTO_BATCH_SIZE) {
     const batch = userIdsToNotify.slice(i, i + AUTO_BATCH_SIZE);
@@ -421,6 +430,7 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
           userId,
           userName: userNameById.get(userId),
           enforceDailyLimit: true,
+          storefront: sf,
         });
 
         if (outcome.status === 'sent') results.sent += 1;
@@ -430,6 +440,7 @@ async function sendAutoCartReminderPushes({ scopeQuery = {} } = {}) {
         results.failed += 1;
         logger.error('[cartReminderPush] auto send user failed', {
           userId,
+          storefront: sf,
           message: err?.message || String(err),
         });
       }

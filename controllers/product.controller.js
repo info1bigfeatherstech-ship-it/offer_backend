@@ -84,6 +84,32 @@ function parsePositiveNumber(value) {
   return num;
 }
 
+const VALID_FOMO_TYPES = ['viewing_now', 'product_left', 'custom'];
+
+/**
+ * Build a safe fomo object from a CSV/ZIP import row.
+ *
+ * Client CSV often leaves FOMO columns blank. Rules:
+ * - Empty / missing fomoEnabled  → false (never an error)
+ * - Empty / missing / invalid fomoType → default "viewing_now" (never an enum error)
+ * - FOMO only turns ON when fomoEnabled is explicitly true/yes/1
+ */
+function buildFomoFromImportRow(row = {}) {
+  const rawEnabled = row.fomoEnabled;
+  const enabled = parseBoolean(rawEnabled); // blank/undefined/null/"" → false
+
+  const rawType = String(row.fomoType || '').trim().toLowerCase();
+  const type = VALID_FOMO_TYPES.includes(rawType) ? rawType : 'viewing_now';
+
+  return {
+    enabled,
+    type,
+    viewingNow: Number(row.viewingNow) || 0,
+    productLeft: Number(row.productLeft) || 0,
+    customMessage: row.customMessage || '',
+  };
+}
+
 function validateRequiredShippingFields(rawShipping) {
   const shipping = rawShipping && typeof rawShipping === "object" ? rawShipping : {};
   const dimensions =
@@ -226,6 +252,93 @@ function normalizeBulkImportRow(row) {
     row.productCode = String(rawProductCode).trim();
   }
   return row;
+}
+
+function trimBulkImportRowStrings(row) {
+  if (!row || typeof row !== "object") return row;
+  for (const key of Object.keys(row)) {
+    if (typeof row[key] === "string") {
+      row[key] = row[key].trim();
+    }
+  }
+  return row;
+}
+
+/**
+ * True only when EVERY cell is empty / whitespace.
+ * Excel CSV exports often append trailing blank rows — those must be ignored,
+ * not reported as "Unknown / productCode missing".
+ * Any non-empty cell means the row is real and must still be validated.
+ */
+const BULK_IMPORT_INTERNAL_KEYS = new Set([
+  'rowNumber',
+  '_preValidationError',
+  '_productCodeAdjustedFrom'
+]);
+
+function isCompletelyBlankBulkImportRow(row) {
+  if (!row || typeof row !== "object") return true;
+
+  for (const [key, value] of Object.entries(row)) {
+    if (BULK_IMPORT_INTERNAL_KEYS.has(key)) continue;
+    if (value == null) continue;
+
+    if (typeof value === "string") {
+      if (value.trim() !== "") return false;
+      continue;
+    }
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) return false;
+      continue;
+    }
+    if (typeof value === "boolean") return false;
+    if (Array.isArray(value)) {
+      if (value.length > 0) return false;
+      continue;
+    }
+    if (typeof value === "object") {
+      try {
+        const json = JSON.stringify(value);
+        if (json && json !== "{}" && json !== "[]" && json !== "null") return false;
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Drop Excel trailing blank rows and stamp stable Excel rowNumbers (header = row 1).
+ * Partial rows (e.g. only productCode filled) are kept and will fail validation.
+ */
+function finalizeParsedBulkImportRows(rawRows = []) {
+  const rows = [];
+  let skippedBlankRows = 0;
+
+  for (let i = 0; i < rawRows.length; i++) {
+    const row = rawRows[i];
+    if (!row || typeof row !== "object") {
+      skippedBlankRows++;
+      continue;
+    }
+    trimBulkImportRowStrings(row);
+    normalizeBulkImportRow(row);
+
+    if (isCompletelyBlankBulkImportRow(row)) {
+      skippedBlankRows++;
+      continue;
+    }
+
+    row.rowNumber = i + 2; // Excel/CSV: row 1 = header, first data row = 2
+    rows.push(row);
+  }
+
+  return {
+    rows,
+    skippedBlankRows,
+    physicalDataRows: rawRows.length
+  };
 }
 
 function escapeRegex(text) {
@@ -1294,18 +1407,33 @@ const importProductsFromCSV = async (req, res) => {
     // =============================================
     // STEP 1: Read and validate CSV
     // =============================================
-    const rows = [];
+    const rawRows = [];
     await new Promise((resolve, reject) => {
       const stream = fs.createReadStream(filePath)
         .pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
       
-      stream.on("data", (row) => rows.push(normalizeBulkImportRow(row)));
+      stream.on("data", (row) => rawRows.push(row));
       stream.on("end", resolve);
       stream.on("error", reject);
     });
-    
+
+    const { rows, skippedBlankRows } = finalizeParsedBulkImportRows(rawRows);
     stats.totalRows = rows.length;
-    console.log(`📊 Total rows in CSV: ${stats.totalRows}`);
+    console.log(
+      `📊 Total product rows in CSV: ${stats.totalRows}` +
+      (skippedBlankRows ? ` (ignored ${skippedBlankRows} blank trailing/empty row(s))` : '')
+    );
+
+    if (!rows.length) {
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(400).json({
+        success: false,
+        message: skippedBlankRows
+          ? "CSV has no product rows (only blank rows were found)"
+          : "CSV file is empty",
+        skippedBlankRows
+      });
+    }
     
     // =============================================
     // STEP 2: Validate CSV structure
@@ -1329,23 +1457,13 @@ const importProductsFromCSV = async (req, res) => {
     // =============================================
     const productMap = new Map();
     
-    for (let idx = 0; idx < rows.length; idx++) {
-      const row = rows[idx];
-      
-      // Trim all values
-      Object.keys(row).forEach((key) => {
-        if (typeof row[key] === "string") {
-          row[key] = row[key].trim();
-        }
-      });
-      normalizeBulkImportRow(row);
-      
-      const productName = row.name;
+    for (const row of rows) {
+      const productName = String(row.name || '').trim();
       if (!productName) {
         stats.failed.push({
           product: "Unknown",
           reason: "Product name is missing",
-          rowNumber: idx + 2
+          rowNumber: row.rowNumber
         });
         continue;
       }
@@ -1356,10 +1474,10 @@ const importProductsFromCSV = async (req, res) => {
         productMap.set(key, {
           name: productName,
           rows: [],
-          originalIndex: idx
+          originalIndex: row.rowNumber
         });
       }
-      productMap.get(key).rows.push({ ...row, rowNumber: idx + 2 });
+      productMap.get(key).rows.push(row);
     }
     
     stats.uniqueProducts = productMap.size;
@@ -1409,9 +1527,78 @@ const importProductsFromCSV = async (req, res) => {
         }
       }
     }
+
+    // =============================================
+    // STEP 3.6: ALL-OR-NOTHING preflight — if any product/row is invalid,
+    // do not insert/update anything; return a clear error CSV instead.
+    // =============================================
+    const preflightErrors = [];
+    if (stats.failed.length > 0) {
+      // Name-missing rows collected while grouping
+      for (const f of stats.failed) {
+        preflightErrors.push({
+          rowNumber: f.rowNumber ?? '',
+          productName: f.product || 'Unknown',
+          productCode: f.productCode || '',
+          error: f.reason || 'Validation failed'
+        });
+      }
+    }
+
+    for (const [, productData] of productMap) {
+      const preview = await validateImportCsvProductGroupPreview(
+        productData.name,
+        productData.rows || []
+      );
+      if (!preview.hasErrors) continue;
+      for (const err of preview.productErrors || preview.errors || []) {
+        preflightErrors.push({
+          rowNumber: '',
+          productName: productData.name,
+          productCode: '',
+          error: err
+        });
+      }
+      for (const variant of preview.variants || []) {
+        for (const err of variant.errors || []) {
+          preflightErrors.push({
+            rowNumber: variant.rowNumber ?? '',
+            productName: productData.name,
+            productCode: variant.productCode || '',
+            error: err
+          });
+        }
+      }
+    }
+
+    if (preflightErrors.length > 0) {
+      const report = await generateErrorReport(preflightErrors, req, 'failed-import');
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      console.log(
+        `🛑 CSV import aborted in preflight. Errors: ${preflightErrors.length}. No products saved.`
+      );
+      return res.status(422).json({
+        success: false,
+        aborted: true,
+        message:
+          `Import blocked: ${preflightErrors.length} error(s) found. ` +
+          `No products were listed. Fix the error report and try again.`,
+        totalRows: stats.totalRows,
+        uniqueProducts: stats.uniqueProducts,
+        inserted: 0,
+        updated: 0,
+        failed: preflightErrors.length,
+        downloadUrl: report.downloadUrl,
+        errorReportFileName: report.fileName
+      });
+    }
+
+    // Clear grouping-time failures — preflight already gated them.
+    stats.failed = [];
+    const runInsertedProductIds = [];
     
     // =============================================
-    // STEP 4: Process products (SYNCHRONOUSLY)
+    // STEP 4: Process products (SYNCHRONOUSLY) — only after clean preflight
     // =============================================
     let batchNumber = 0;
     let currentBatch = [];
@@ -1424,14 +1611,8 @@ const importProductsFromCSV = async (req, res) => {
       try {
         const preValidationError = productRows.find((r) => r._preValidationError)?._preValidationError;
         if (preValidationError) {
-          stats.failed.push({
-            product: productName,
-            reason: preValidationError,
-            rows: productRows.map(r => r.rowNumber)
-          });
-          const progress = ((i + 1) / productsArray.length * 100).toFixed(2);
-          console.log(`📈 Progress: ${progress}% | Inserted: ${stats.inserted} | Updated: ${stats.updated} | Failed: ${stats.failed.length}`);
-          continue;
+          // Should be unreachable after preflight; treat as hard abort signal.
+          throw new Error(preValidationError);
         }
         // Process single product with all its variants
         const result = await processProductWithRollback(productName, productRows, stats);
@@ -1439,16 +1620,13 @@ const importProductsFromCSV = async (req, res) => {
         if (result.success) {
           if (result.action === 'inserted') {
             stats.inserted++;
+            if (result.product?._id) runInsertedProductIds.push(result.product._id);
           } else if (result.action === 'updated') {
             stats.updated++;
           }
           currentBatch.push(result.product);
         } else {
-          stats.failed.push({
-            product: productName,
-            reason: result.error,
-            rows: productRows.map(r => r.rowNumber)
-          });
+          throw new Error(result.error || 'Product processing failed');
         }
         
         // Insert batch when full
@@ -1459,33 +1637,60 @@ const importProductsFromCSV = async (req, res) => {
         }
         
         const progress = ((i + 1) / productsArray.length * 100).toFixed(2);
-        console.log(`📈 Progress: ${progress}% | Inserted: ${stats.inserted} | Updated: ${stats.updated} | Failed: ${stats.failed.length}`);
+        console.log(`📈 Progress: ${progress}% | Inserted: ${stats.inserted} | Updated: ${stats.updated}`);
         
       } catch (productError) {
         console.error(`❌ Error processing ${productName}:`, productError.message);
+        // Unexpected runtime failure: do not continue partial import.
         stats.failed.push({
           product: productName,
           reason: productError.message,
-          rows: productRows.map(r => r.rowNumber)
+          rows: productRows.map(r => r.rowNumber),
+          productCode: productRows.map((r) => normalizeProductCode(r.productCode)).filter(Boolean).join(' | ')
         });
+        break;
       }
     }
     
     // Final batch
-    if (currentBatch.length > 0) {
+    if (currentBatch.length > 0 && stats.failed.length === 0) {
       batchNumber++;
       await flushBatch(currentBatch, batchNumber, stats);
     }
     
     // =============================================
-    // STEP 5: Generate failure report
+    // STEP 5: If runtime failure, roll back inserts from this run and abort.
     // =============================================
     let errorReportUrl = null;
     
     if (stats.failed.length > 0) {
-      const report = await generateErrorReport(stats.failed, req);
+      for (const id of runInsertedProductIds) {
+        try {
+          await Product.deleteOne({ _id: id });
+        } catch (rollbackErr) {
+          console.error('CSV import rollback delete failed:', id, rollbackErr.message);
+        }
+      }
+      if (runInsertedProductIds.length) {
+        await invalidateAllProductCaches();
+      }
+      const report = await generateErrorReport(stats.failed, req, 'failed-import');
       errorReportUrl = report.downloadUrl;
-      console.log(`📄 Error report ready: ${errorReportUrl}`);
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(422).json({
+        success: false,
+        aborted: true,
+        message:
+          `Import aborted after unexpected error(s). Changes from this batch were rolled back. ` +
+          `Fix the error report and retry.`,
+        totalRows: stats.totalRows,
+        uniqueProducts: stats.uniqueProducts,
+        inserted: 0,
+        updated: 0,
+        failed: stats.failed.length,
+        downloadUrl: errorReportUrl,
+        errorReportFileName: report.fileName
+      });
     }
     
     // Cleanup
@@ -1494,13 +1699,12 @@ const importProductsFromCSV = async (req, res) => {
     }
     
     // =============================================
-    // STEP 6: Send FINAL response with download link
+    // STEP 6: Send FINAL response
     // =============================================
     console.log(`\n🎉 IMPORT COMPLETED!`);
     console.log(`📊 Summary:`);
     console.log(`   ✅ Inserted: ${stats.inserted}`);
     console.log(`   🔄 Updated: ${stats.updated}`);
-    console.log(`   ❌ Failed: ${stats.failed.length}`);
     
     return res.status(200).json({
       success: true,
@@ -1509,8 +1713,8 @@ const importProductsFromCSV = async (req, res) => {
       uniqueProducts: stats.uniqueProducts,
       inserted: stats.inserted,
       updated: stats.updated,
-      failed: stats.failed.length,
-      downloadUrl: errorReportUrl  // ✅ Direct download link in response
+      failed: 0,
+      downloadUrl: null
     });
     
   } catch (error) {
@@ -1774,20 +1978,28 @@ const previewImportProductsFromCSV = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Uploaded file not found' });
     }
 
-    const rows = [];
+    const rawRows = [];
     await new Promise((resolve, reject) => {
       fs.createReadStream(filePath)
         .pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
-        .on('data', (row) => rows.push(normalizeBulkImportRow(row)))
+        .on('data', (row) => rawRows.push(row))
         .on('end', resolve)
         .on('error', reject);
     });
+
+    const { rows, skippedBlankRows } = finalizeParsedBulkImportRows(rawRows);
 
     if (!rows.length) {
       try {
         fs.unlinkSync(filePath);
       } catch (_) {}
-      return res.status(422).json({ success: false, message: 'CSV file is empty' });
+      return res.status(422).json({
+        success: false,
+        message: skippedBlankRows
+          ? 'CSV has no product rows (only blank rows were found)'
+          : 'CSV file is empty',
+        skippedBlankRows
+      });
     }
 
     const requiredColumns = ['name', 'category', 'basePrice'];
@@ -1806,19 +2018,14 @@ const previewImportProductsFromCSV = async (req, res) => {
     }
 
     const productMap = new Map();
-    for (let idx = 0; idx < rows.length; idx++) {
-      const row = rows[idx];
-      Object.keys(row).forEach((key) => {
-        if (typeof row[key] === 'string') row[key] = row[key].trim();
-      });
-      normalizeBulkImportRow(row);
-      const productName = row.name;
+    for (const row of rows) {
+      const productName = String(row.name || '').trim();
       if (!productName) continue;
       const key = productName.toLowerCase();
       if (!productMap.has(key)) {
         productMap.set(key, { name: productName, rows: [] });
       }
-      productMap.get(key).rows.push({ ...row, rowNumber: idx + 2 });
+      productMap.get(key).rows.push(row);
     }
 
     const products = [];
@@ -1844,6 +2051,17 @@ const previewImportProductsFromCSV = async (req, res) => {
       fs.unlinkSync(filePath);
     } catch (_) {}
 
+    let downloadUrl = null;
+    let errorReportFileName = null;
+    if (invalidProducts > 0) {
+      const errorRows = flattenPreviewProductsToErrorRows(products);
+      if (errorRows.length > 0) {
+        const report = await generateErrorReport(errorRows, req, 'failed-import');
+        downloadUrl = report.downloadUrl;
+        errorReportFileName = report.fileName;
+      }
+    }
+
     return res.status(200).json({
       success: true,
       message: 'Import preview (URL images CSV) — no changes saved',
@@ -1853,9 +2071,15 @@ const previewImportProductsFromCSV = async (req, res) => {
         totalProducts: products.length,
         validProducts,
         invalidProducts,
-        hasValidationErrors: invalidProducts > 0
+        hasValidationErrors: invalidProducts > 0,
+        importBlocked: invalidProducts > 0
       },
       products,
+      downloadUrl,
+      errorReportFileName,
+      warning: invalidProducts > 0
+        ? `${invalidProducts} product(s) have validation errors. Import is blocked until every row is fixed.`
+        : null,
       hint: 'Fix errors then call POST /api/admin/products/import-csv with the same file.'
     });
   } catch (error) {
@@ -2213,13 +2437,7 @@ async function buildNewProductWithVariants(productName, productRows, variants) {
       enabled: parseBoolean(firstRow.soldEnabled),
       count: Number(firstRow.soldCount) || 0,
     },
-    fomo: {
-    enabled: parseBoolean(firstRow.fomoEnabled),
-      type: firstRow.fomoType || "viewing_now",
-      viewingNow: Number(firstRow.viewingNow) || 0,
-      productLeft: Number(firstRow.productLeft) || 0,
-      customMessage: firstRow.customMessage || "",
-    },
+    fomo: buildFomoFromImportRow(firstRow),
   };
   reconcileProductCatalogState(productObj);
 
@@ -2308,43 +2526,384 @@ async function flushBatch(batch, batchNumber, stats) {
 // =============================================
 // =============================================
 // HELPER: Generate error report CSV with download URL
+// Columns are fixed for admin clarity: rowNumber | productName | productCode | error
 // =============================================
-async function generateErrorReport(failedItems, req = null) {
-  const { Parser } = require('json2csv');
-  
-  const parser = new Parser({
-    fields: ['product', 'reason', 'rows', 'timestamp']
-  });
-  
-  const reportData = failedItems.map(item => ({
-    product: item.product,
-    reason: item.reason,
-    rows: item.rows ? item.rows.join(', ') : 'N/A',
-    timestamp: new Date().toISOString()
-  }));
-  
-  const csvData = parser.parse(reportData);
-  const fileName = `failed-import-${Date.now()}.csv`;
+const BULK_ERROR_REPORT_FIELDS = ['rowNumber', 'productName', 'productCode', 'error'];
+
+function normalizeBulkErrorRows(failedItems = []) {
+  const rows = [];
+  for (const item of failedItems) {
+    if (!item) continue;
+
+    // Already in canonical shape
+    if (
+      item.rowNumber != null ||
+      item.productName != null ||
+      (item.error != null && item.productCode != null && item.product == null && item.reason == null)
+    ) {
+      const errorText = item.error || item.reason || 'Unknown error';
+      if (Array.isArray(item.rows) && item.rows.length > 0 && item.rowNumber == null) {
+        for (const rn of item.rows) {
+          rows.push({
+            rowNumber: rn ?? '',
+            productName: item.productName || item.product || 'Unknown',
+            productCode: item.productCode || '',
+            error: errorText
+          });
+        }
+        continue;
+      }
+      rows.push({
+        rowNumber: item.rowNumber ?? '',
+        productName: item.productName || item.product || 'Unknown',
+        productCode: item.productCode || '',
+        error: errorText
+      });
+      continue;
+    }
+
+    // Legacy URL-import shape: { product, reason, rows: [] }
+    const productName = item.productName || item.product || 'Unknown';
+    const errorText = item.error || item.reason || 'Unknown error';
+    const productCode = item.productCode || '';
+    if (Array.isArray(item.rows) && item.rows.length > 0) {
+      for (const rn of item.rows) {
+        rows.push({
+          rowNumber: rn ?? '',
+          productName,
+          productCode,
+          error: errorText
+        });
+      }
+    } else if (item.row != null && typeof item.row === 'string') {
+      // Legacy ZIP shape: { row: "Name (row 12)", productCode, error }
+      const match = item.row.match(/^(.*)\s*\(row\s*([^)]+)\)\s*$/i);
+      rows.push({
+        rowNumber: match ? match[2].trim() : (item.rowNumber || ''),
+        productName: match ? match[1].trim() : item.row,
+        productCode,
+        error: errorText
+      });
+    } else {
+      rows.push({
+        rowNumber: item.rowNumber ?? '',
+        productName,
+        productCode,
+        error: errorText
+      });
+    }
+  }
+  return rows;
+}
+
+async function generateErrorReport(failedItems, req = null, filePrefix = 'failed-import') {
+  const reportData = normalizeBulkErrorRows(failedItems);
+  const parser = new Parser({ fields: BULK_ERROR_REPORT_FIELDS });
+  const csvData = reportData.length
+    ? parser.parse(reportData)
+    : `${BULK_ERROR_REPORT_FIELDS.join(',')}\n`;
+
+  const safePrefix = String(filePrefix || 'failed-import').replace(/[^a-z0-9_-]/gi, '');
+  const fileName = `${safePrefix}-${Date.now()}.csv`;
   const filePath = path.join(__dirname, '../uploads', fileName);
-  
+
+  if (!fs.existsSync(path.dirname(filePath))) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  }
   fs.writeFileSync(filePath, csvData);
-  console.log(`📄 Error report generated: ${filePath}`);
-  
-  // Generate download URL if req is provided
+  console.log(`📄 Error report generated: ${filePath} (${reportData.length} row(s))`);
+
   let downloadUrl = null;
   if (req) {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
-    // ✅ FIX: Match your actual route
     downloadUrl = `${baseUrl}/api/admin/products/download-error-report/${fileName}`;
     console.log(`🔗 Download URL: ${downloadUrl}`);
   }
-  
+
   return {
     path: `/uploads/${fileName}`,
-    downloadUrl: downloadUrl,
-    fileName: fileName,
-    fullPath: filePath
+    downloadUrl,
+    fileName,
+    fullPath: filePath,
+    rowCount: reportData.length
   };
+}
+
+/**
+ * Flatten preview product/variant errors into downloadable report rows.
+ * Uses full variant lists (not UI-truncated slices).
+ */
+function flattenPreviewProductsToErrorRows(products = []) {
+  const rows = [];
+  for (const product of products) {
+    const productName = product?.name || 'Unknown';
+    const productLevelErrors = product?.errors || product?.productErrors || [];
+    for (const err of productLevelErrors) {
+      rows.push({
+        rowNumber: '',
+        productName,
+        productCode: '',
+        error: err
+      });
+    }
+    for (const variant of product?.variants || []) {
+      for (const err of variant?.errors || []) {
+        rows.push({
+          rowNumber: variant.rowNumber ?? '',
+          productName,
+          productCode: variant.productCode || '',
+          error: err
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+/**
+ * ZIP + CSV preflight: collect every blocking error before any DB write or R2 upload.
+ * Missing / wrong / empty image folders are hard errors (all-or-nothing).
+ */
+async function collectZipBulkPreflightErrors(rows, rootFolder) {
+  const errors = [];
+  const seenCodes = new Map(); // productCode -> rowNumber
+
+  for (const row of rows) {
+    // Defense in depth: blank rows should already be filtered before preflight.
+    if (isCompletelyBlankBulkImportRow(row)) continue;
+
+    const productName = String(row.name || '').trim() || 'Unknown';
+    const rowNumber = row.rowNumber ?? '';
+    let productCode = normalizeProductCode(row.productCode);
+
+    if (row._preValidationError) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode: productCode || '',
+        error: row._preValidationError
+      });
+      continue;
+    }
+
+    if (!String(row.name || '').trim()) {
+      errors.push({
+        rowNumber,
+        productName: 'Unknown',
+        productCode: productCode || '',
+        error: 'Product name is missing'
+      });
+    }
+
+    if (!productCode) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode: '',
+        error: `productCode is missing in row ${rowNumber || '?'}. Use column "productCode".`
+      });
+      continue;
+    }
+
+    if (seenCodes.has(productCode)) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: `Duplicate productCode ${productCode} in CSV (also on row ${seenCodes.get(productCode)})`
+      });
+    } else {
+      seenCodes.set(productCode, rowNumber);
+    }
+
+    let parsedCode = null;
+    try {
+      parsedCode = parseProductCodeParts(productCode, `row "${productName}"`);
+      productCode = parsedCode.normalized;
+      row.productCode = productCode;
+    } catch (e) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: e.message
+      });
+    }
+
+    const basePrice = parseFloat(String(row.basePrice || '').replace(/[^0-9.]/g, '') || 0);
+    if (isNaN(basePrice) || basePrice <= 0) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: `Invalid basePrice: ${row.basePrice}`
+      });
+    }
+    const salePrice = row.salePrice
+      ? parseFloat(String(row.salePrice).replace(/[^0-9.]/g, ''))
+      : null;
+    if (salePrice != null && !isNaN(salePrice) && !isNaN(basePrice) && salePrice >= basePrice) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: `Sale price (${salePrice}) must be less than base price (${basePrice})`
+      });
+    }
+
+    const wholesale = parseBoolean(row.wholesale);
+    if (wholesale && (!row.wholesaleBase || String(row.wholesaleBase).trim() === '')) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: 'wholesaleBase is required when wholesale=true'
+      });
+    }
+
+    if (!row.category || !String(row.category).trim()) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: 'category is required'
+      });
+    } else {
+      const categoryDoc = await Category.findOne({
+        name: { $regex: new RegExp(`^${escapeRegex(String(row.category).trim())}$`, 'i') }
+      }).select('_id name');
+      if (!categoryDoc) {
+        errors.push({
+          rowNumber,
+          productName,
+          productCode,
+          error: `Category not found: ${row.category}`
+        });
+      }
+    }
+
+    // Hard requirement: ZIP folder must exist and contain at least one image.
+    if (rootFolder) {
+      const folderCandidates = getImageFolderCandidatesForRow(row);
+      const { folderPath: imageFolder } = resolveImageFolderByCandidates(
+        rootFolder,
+        folderCandidates
+      );
+      if (!imageFolder) {
+        errors.push({
+          rowNumber,
+          productName,
+          productCode,
+          error:
+            `Image folder not found for productCode ${productCode}. ` +
+            `Tried: ${folderCandidates.join(', ')}. ` +
+            `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
+        });
+      } else {
+        const images = fs.readdirSync(imageFolder).filter((file) =>
+          /\.(jpg|jpeg|png|gif|webp)$/i.test(file)
+        );
+        if (!images.length) {
+          errors.push({
+            rowNumber,
+            productName,
+            productCode,
+            error:
+              `No valid images (jpg/jpeg/png/gif/webp) found in folder for productCode ${productCode}.`
+          });
+        }
+      }
+    } else {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: 'Images ZIP was not provided or could not be extracted'
+      });
+    }
+
+    // Cross-product code ownership (same rules as live import)
+    if (productCode) {
+      try {
+        const existingProductWithCode = await Product.findOne({
+          'variants.productCode': productCodeToDbQuery(productCode)
+        }).select('name');
+        if (existingProductWithCode) {
+          const sameName =
+            String(existingProductWithCode.name || '').trim().toLowerCase() ===
+            String(productName || '').trim().toLowerCase();
+          if (!sameName) {
+            errors.push({
+              rowNumber,
+              productName,
+              productCode,
+              error:
+                `productCode ${productCode} belongs to product "${existingProductWithCode.name}". ` +
+                `Please use a different productCode for "${productName}".`
+            });
+          }
+        }
+      } catch (_) {
+        /* ignore lookup noise in preflight */
+      }
+    }
+  }
+
+  // New products that start mid-series without -1 in this CSV
+  const byName = new Map();
+  for (const row of rows) {
+    const key = String(row.name || '').trim().toLowerCase();
+    if (!key) continue;
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(row);
+  }
+  for (const [, group] of byName) {
+    const existingProduct = await Product.findOne({
+      name: {
+        $regex: new RegExp(
+          `^${escapeRegex(String(group[0]?.name || '').trim())}$`,
+          'i'
+        )
+      }
+    }).select('_id name variants.productCode');
+    if (existingProduct) continue;
+
+    for (const row of group) {
+      try {
+        const parsed = parseProductCodeParts(
+          normalizeProductCode(row.productCode),
+          'productCode'
+        );
+        if (parsed.sequence != null && parsed.sequence > 1) {
+          const hasFirst = group.some((sibling) => {
+            try {
+              const sp = parseProductCodeParts(
+                normalizeProductCode(sibling.productCode),
+                'productCode'
+              );
+              return sp.base === parsed.base && sp.sequence === 1;
+            } catch {
+              return false;
+            }
+          });
+          if (!hasFirst) {
+            errors.push({
+              rowNumber: row.rowNumber ?? '',
+              productName: String(row.name || '').trim() || 'Unknown',
+              productCode: normalizeProductCode(row.productCode) || '',
+              error:
+                `Cannot import variant ${parsed.normalized}: product does not exist yet. ` +
+                `Include ${parsed.base}-1 (or bare ${parsed.base}) in this CSV first.`
+            });
+          }
+        }
+      } catch {
+        // format errors already recorded above
+      }
+    }
+  }
+
+  return errors;
 }
 
 
@@ -2627,27 +3186,39 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       `Top-level folders: ${describeAvailableImageFolders(rootFolder)}`
     );
 
-    // Parse CSV
-    const rows = [];
+    // Parse CSV (ignore Excel trailing blank rows)
+    const rawRows = [];
     await new Promise((resolve, reject) => {
       fs.createReadStream(csvPath)
         .pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
         .on("data", (data) => {
-          // Trim all string values
-          Object.keys(data).forEach(key => {
-            if (typeof data[key] === 'string') {
-              data[key] = data[key].trim();
-            }
-          });
-          normalizeBulkImportRow(data);
-          data.rowNumber = rows.length + 2; // header is row 1
-          rows.push(data);
+          rawRows.push(data);
         })
         .on("end", resolve)
         .on("error", reject);
     });
 
-    console.log(`📊 Total rows in CSV: ${rows.length}`);
+    const { rows, skippedBlankRows } = finalizeParsedBulkImportRows(rawRows);
+
+    console.log(
+      `📊 Total product rows in CSV: ${rows.length}` +
+      (skippedBlankRows ? ` (ignored ${skippedBlankRows} blank trailing/empty row(s))` : '')
+    );
+
+    if (!rows.length) {
+      if (csvPath && fs.existsSync(csvPath)) fs.unlinkSync(csvPath);
+      if (zipPath && fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+      if (extractPath && fs.existsSync(extractPath)) {
+        fs.rmSync(extractPath, { recursive: true, force: true });
+      }
+      return res.status(422).json({
+        success: false,
+        message: skippedBlankRows
+          ? "CSV has no product rows (only blank rows were found)"
+          : "CSV file is empty",
+        skippedBlankRows
+      });
+    }
 
     // Normalize and validate productCode series per product upfront.
     // Example for 3 variants: 4321-1, 4321-2, 4321-3 (01, 02 also accepted on input)
@@ -2719,18 +3290,60 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       failed: 0,
       errors: [],
       products: [],
-      // Rows that were created/updated successfully but with NO images
-      // (folder missing / empty / upload skipped). Admin can re-upload later.
+      // Kept for response shape compatibility; all-or-nothing policy means
+      // missing images abort the whole batch before any writes.
       missingImages: []
     };
 
+    // =============================================
+    // PREFLIGHT (all-or-nothing): validate CSV + ZIP fully BEFORE any
+    // product save or R2/Cloudinary upload. If anything is wrong, abort
+    // with a downloadable error report and zero side effects.
+    // =============================================
+    const preflightErrors = await collectZipBulkPreflightErrors(rows, rootFolder);
+    if (preflightErrors.length > 0) {
+      const report = await generateErrorReport(preflightErrors, req, 'failed-upload');
+      console.log(
+        `🛑 Bulk ZIP upload aborted in preflight. Errors: ${preflightErrors.length}. No products saved, no images uploaded.`
+      );
+
+      if (csvPath && fs.existsSync(csvPath)) fs.unlinkSync(csvPath);
+      if (zipPath && fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+      if (extractPath && fs.existsSync(extractPath)) {
+        fs.rmSync(extractPath, { recursive: true, force: true });
+      }
+
+      return res.status(422).json({
+        success: false,
+        aborted: true,
+        message:
+          `Upload blocked: ${preflightErrors.length} error(s) found in CSV/ZIP. ` +
+          `No products were listed and no images were uploaded. Fix the error report and try again.`,
+        totalRows: rows.length,
+        successful: 0,
+        failed: preflightErrors.length,
+        createdWithoutImagesCount: 0,
+        missingImages: [],
+        downloadUrl: report.downloadUrl,
+        errorReportFileName: report.fileName
+      });
+    }
+
     const BATCH_SIZE = 50;
     const BATCH_DELAY_MS = 1000;
+    // Track side effects for rollback if an unexpected runtime error occurs
+    // after preflight (keeps batch all-or-nothing even then).
+    const runSideEffects = {
+      insertedProductIds: [],
+      updatedVariantRemovals: [], // { productId, productCode }
+      uploadedPublicIds: []
+    };
 
     // =============================================
     // Process rows sequentially within batch (avoids same-product race on -1/-2)
     // =============================================
-    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    let runtimeAbort = false;
+    for (let i = 0; i < rows.length && !runtimeAbort; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE);
       const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
       
@@ -2762,44 +3375,35 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           // Upload images from productCode folder.
           // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
           //
-          // POLICY (intentional, requested by product):
-          //   Missing images must NOT block product/variant creation. The
-          //   product is created with an empty images array and is flagged so
-          //   the admin can see in the response which rows lack images and
-          //   re-upload them later. This matches the preview controller which
-          //   already treats missing images as a warning, not an error.
+          // POLICY (client / production): missing or wrong ZIP folders are hard
+          // errors. Preflight already blocks the batch; here we still refuse to
+          // create products without images and never soft-skip uploads.
           const folderCandidates = getImageFolderCandidatesForRow(row);
           const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
             rootFolder,
             folderCandidates
           );
 
-          let variantImages = [];
-          let imagesWarning = null;
-
           if (!imageFolder) {
-            imagesWarning =
+            throw new Error(
               `Image folder not found for productCode ${productCode}. ` +
               `Tried: ${folderCandidates.join(", ")}. ` +
-              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}. ` +
-              `Product/variant created without images — re-upload images later.`;
-            console.warn(`⚠️ ${imagesWarning}`);
-          } else {
-            try {
-              variantImages = await uploadVariantImages(
-                imageFolder,
-                row.name,
-                matchedCode || productCode
-              );
-            } catch (imgErr) {
-              // Folder exists but empty / all uploads failed → don't block
-              // product creation. Record the reason for the response report.
-              variantImages = [];
-              imagesWarning =
-                `Image upload skipped for productCode ${productCode}: ${imgErr.message}. ` +
-                `Product/variant created without images — re-upload images later.`;
-              console.warn(`⚠️ ${imagesWarning}`);
-            }
+              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
+            );
+          }
+
+          const variantImages = await uploadVariantImages(
+            imageFolder,
+            row.name,
+            matchedCode || productCode
+          );
+          if (!variantImages.length) {
+            throw new Error(
+              `No images were uploaded for productCode ${productCode}. Refusing to create product without images.`
+            );
+          }
+          for (const img of variantImages) {
+            if (img?.publicId) runSideEffects.uploadedPublicIds.push(img.publicId);
           }
 
           // Resolve product before variant build — primary only when creating a new product (first row)
@@ -2898,14 +3502,10 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'updated' });
-            if (imagesWarning) {
-              stats.missingImages.push({
-                row: `${row.name} (row ${row.rowNumber || '?'})`,
-                productCode,
-                action: 'updated',
-                reason: imagesWarning
-              });
-            }
+            runSideEffects.updatedVariantRemovals.push({
+              productId: product._id,
+              productCode
+            });
           } else {
             const existingProductWithCode = await Product.findOne({
               "variants.productCode": productCodeToDbQuery(productCode)
@@ -2955,13 +3555,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
                 enabled: parseBoolean(row.soldEnabled),
                 count: Number(row.soldCount) || 0,
               },
-              fomo: {
-                enabled: parseBoolean(row.fomoEnabled),
-                type: row.fomoType || "viewing_now",
-                viewingNow: Number(row.viewingNow) || 0,
-                productLeft: Number(row.productLeft) || 0,
-                customMessage: row.customMessage || "",
-              }
+              fomo: buildFomoFromImportRow(row)
             });
 
             const newProductShippingCheck = validateVariantsResolvableShipping(product.shipping, product.variants, product);
@@ -2972,28 +3566,24 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             await product.save();
             stats.successful++;
             stats.products.push({ name: row.name, productCode, action: 'inserted' });
-            if (imagesWarning) {
-              stats.missingImages.push({
-                row: `${row.name} (row ${row.rowNumber || '?'})`,
-                productCode,
-                action: 'inserted',
-                reason: imagesWarning
-              });
-            }
+            runSideEffects.insertedProductIds.push(product._id);
           }
           
         } catch (err) {
           stats.failed++;
           stats.errors.push({
-            row: `${row.name || "Unknown"} (row ${row.rowNumber || "?"})`,
-            productCode: row.productCode,
+            rowNumber: row.rowNumber ?? '',
+            productName: row.name || 'Unknown',
+            productCode: normalizeProductCode(row.productCode) || '',
             error: err.message
           });
           console.error(`❌ Failed to process ${row.name}:`, err.message);
+          runtimeAbort = true;
+          break;
         }
       }
       
-      if (i + BATCH_SIZE < rows.length) {
+      if (!runtimeAbort && i + BATCH_SIZE < rows.length) {
         console.log(`⏳ Waiting ${BATCH_DELAY_MS}ms before next batch...`);
         await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
       }
@@ -3002,22 +3592,73 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     }
 
     // =============================================
-    // Generate error report if any failures
+    // If any runtime failure after preflight: roll back this run's side
+    // effects so the website never ends up with a partial batch.
     // =============================================
-    let errorReportUrl = null;
-    
     if (stats.errors.length > 0) {
-      const { Parser } = require('json2csv');
-      const parser = new Parser({ fields: ["row", "productCode", "error"] });
-      const csvData = parser.parse(stats.errors);
-      const fileName = `failed-upload-${Date.now()}.csv`;
-      const errorReportPath = path.join(__dirname, "../uploads", fileName);
-      fs.writeFileSync(errorReportPath, csvData);
-      console.log(`📄 Error report generated: ${errorReportPath}`);
-      
-      const baseUrl = `${req.protocol}://${req.get('host')}`;
-      errorReportUrl = `${baseUrl}/api/admin/products/download-error-report/${fileName}`;
-      console.log(`🔗 Download URL: ${errorReportUrl}`);
+      console.log(
+        `🛑 Runtime failure after preflight — rolling back ${runSideEffects.insertedProductIds.length} insert(s), ` +
+        `${runSideEffects.updatedVariantRemovals.length} variant update(s), ` +
+        `${runSideEffects.uploadedPublicIds.length} uploaded image(s).`
+      );
+
+      for (const productId of runSideEffects.insertedProductIds) {
+        try {
+          await Product.deleteOne({ _id: productId });
+        } catch (rollbackErr) {
+          console.error('Rollback delete product failed:', productId, rollbackErr.message);
+        }
+      }
+
+      for (const { productId, productCode } of runSideEffects.updatedVariantRemovals) {
+        try {
+          const doc = await Product.findById(productId);
+          if (!doc) continue;
+          doc.variants = (doc.variants || []).filter(
+            (v) => normalizeProductCode(v.productCode) !== normalizeProductCode(productCode)
+          );
+          reconcileProductCatalogState(doc);
+          await doc.save();
+        } catch (rollbackErr) {
+          console.error('Rollback remove variant failed:', productId, productCode, rollbackErr.message);
+        }
+      }
+
+      const uniquePublicIds = [...new Set(runSideEffects.uploadedPublicIds.filter(Boolean))];
+      await Promise.all(
+        uniquePublicIds.map(async (id) => {
+          try {
+            await deleteFromCloudinary(id);
+          } catch (imgErr) {
+            console.error('Rollback image delete failed:', id, imgErr.message);
+          }
+        })
+      );
+
+      await invalidateAllProductCaches();
+
+      const report = await generateErrorReport(stats.errors, req, 'failed-upload');
+
+      if (csvPath && fs.existsSync(csvPath)) fs.unlinkSync(csvPath);
+      if (zipPath && fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+      if (extractPath && fs.existsSync(extractPath)) {
+        fs.rmSync(extractPath, { recursive: true, force: true });
+      }
+
+      return res.status(422).json({
+        success: false,
+        aborted: true,
+        message:
+          `Upload aborted after unexpected error(s). All changes from this batch were rolled back. ` +
+          `No products from this upload remain listed. Download the error report, fix, and retry.`,
+        totalRows: rows.length,
+        successful: 0,
+        failed: stats.errors.length,
+        createdWithoutImagesCount: 0,
+        missingImages: [],
+        downloadUrl: report.downloadUrl,
+        errorReportFileName: report.fileName
+      });
     }
 
     // Cleanup
@@ -3030,26 +3671,21 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
     console.log(`\n🎉 BULK UPLOAD COMPLETED!`);
     console.log(`✅ Successful: ${stats.successful}`);
     console.log(`❌ Failed: ${stats.failed}`);
-    if (stats.missingImages.length > 0) {
-      console.log(`🖼️  Created without images: ${stats.missingImages.length} (admin should re-upload images for these)`);
-    }
+
+    await invalidateAllProductCaches();
 
     // =============================================
-    // Send FINAL response with download link
+    // Send FINAL response
     // =============================================
     return res.status(200).json({
       success: true,
-      message: stats.missingImages.length > 0
-        ? `Bulk upload completed. ${stats.missingImages.length} product(s) created without images — see "missingImages" to re-upload.`
-        : "Bulk upload completed",
+      message: "Bulk upload completed",
       totalRows: rows.length,
       successful: stats.successful,
-      failed: stats.failed,
-      // Products that succeeded but have no images yet. Empty array when all
-      // products had their images uploaded.
-      createdWithoutImagesCount: stats.missingImages.length,
-      missingImages: stats.missingImages,
-      downloadUrl: errorReportUrl  // ✅ Direct download link in response
+      failed: 0,
+      createdWithoutImagesCount: 0,
+      missingImages: [],
+      downloadUrl: null
     });
     
   } catch (error) {
@@ -3179,29 +3815,32 @@ const previewBulkUpload = async (req, res) => {
     // =============================================
     // STEP 3: Read and parse CSV
     // =============================================
-    const rows = [];
+    const rawRows = [];
     await new Promise((resolve, reject) => {
       const stream = fs.createReadStream(csvPath)
         .pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
       
       stream.on("data", (row) => {
-        Object.keys(row).forEach(key => {
-          if (typeof row[key] === "string") {
-            row[key] = row[key].trim();
-          }
-        });
-        normalizeBulkImportRow(row);
-        rows.push(row);
+        rawRows.push(row);
       });
       stream.on("end", resolve);
       stream.on("error", reject);
     });
 
+    const { rows, skippedBlankRows } = finalizeParsedBulkImportRows(rawRows);
+
     if (!rows.length) {
       return res.status(422).json({
         success: false,
-        message: "CSV file is empty"
+        message: skippedBlankRows
+          ? "CSV has no product rows (only blank rows were found)"
+          : "CSV file is empty",
+        skippedBlankRows
       });
+    }
+
+    if (skippedBlankRows > 0) {
+      console.log(`ℹ️ Preview ignored ${skippedBlankRows} blank trailing/empty CSV row(s)`);
     }
 
     // =============================================
@@ -3225,9 +3864,8 @@ const previewBulkUpload = async (req, res) => {
     // =============================================
     const productMap = new Map();
     
-    for (let idx = 0; idx < rows.length; idx++) {
-      const row = rows[idx];
-      const productName = row.name;
+    for (const row of rows) {
+      const productName = String(row.name || '').trim();
       if (!productName) continue;
       
       const key = productName.toLowerCase();
@@ -3235,10 +3873,10 @@ const previewBulkUpload = async (req, res) => {
         productMap.set(key, {
           name: productName,
           rows: [],
-          originalIndex: idx
+          originalIndex: row.rowNumber
         });
       }
-      productMap.get(key).rows.push({ ...row, rowNumber: idx + 2 });
+      productMap.get(key).rows.push(row);
     }
 
     // =============================================
@@ -3390,11 +4028,11 @@ const previewBulkUpload = async (req, res) => {
             hasImages = imageCount > 0;
             if (hasImages) totalImagesFound++;
             if (!hasImages) {
-              variantWarnings.push(`No images found for productCode ${productCode}`);
+              variantErrors.push(`No images found for productCode ${productCode}`);
               missingImagesCount++;
             }
           } else {
-            variantWarnings.push(
+            variantErrors.push(
               `Image folder not found for productCode ${productCode} ` +
               `(tried: ${folderCandidates.join(", ")}; ` +
               `available: ${describeAvailableImageFolders(rootFolder)})`
@@ -3481,7 +4119,10 @@ const previewBulkUpload = async (req, res) => {
         },
         hasImages: variants.some(v => v.hasImages),
         errors: productErrors,
-        variants: variants.slice(0, 5), // Show first 5 variants
+        // Keep full variant error list for error-report generation; UI may still
+        // show a truncated copy via `variantsPreview`.
+        variants,
+        variantsPreview: variants.slice(0, 5),
         nextSuggestedProductCode,
         hasErrors
       });
@@ -3501,7 +4142,21 @@ const previewBulkUpload = async (req, res) => {
     }
     
     // =============================================
-    // STEP 8: Send response
+    // STEP 8: Error report when anything is invalid (all-or-nothing gate)
+    // =============================================
+    let downloadUrl = null;
+    let errorReportFileName = null;
+    if (invalidProducts > 0) {
+      const errorRows = flattenPreviewProductsToErrorRows(products);
+      if (errorRows.length > 0) {
+        const report = await generateErrorReport(errorRows, req, 'failed-upload');
+        downloadUrl = report.downloadUrl;
+        errorReportFileName = report.fileName;
+      }
+    }
+
+    // =============================================
+    // STEP 9: Send response
     // =============================================
     const uploadType = hasZip ? "ZIP + CSV" : "CSV only (with image URLs)";
     console.log(`📊 Preview Summary (${uploadType}): ${products.length} products, Valid: ${validProducts}, Invalid: ${invalidProducts}`);
@@ -3520,11 +4175,20 @@ const previewBulkUpload = async (req, res) => {
         totalImagesFound: totalImagesFound,
         missingImages: missingImagesCount,
         hasValidationErrors: invalidProducts > 0,
-        hasMissingImages: missingImagesCount > 0
+        hasMissingImages: missingImagesCount > 0,
+        // All-or-nothing: any invalid product blocks the entire import.
+        importBlocked: invalidProducts > 0
       },
-      products: products,
+      products: products.map((p) => ({
+        ...p,
+        // Frontend historically reads `variants`; keep full list so every
+        // row-level error is visible (not just the first 5).
+        variants: p.variants
+      })),
+      downloadUrl,
+      errorReportFileName,
       warning: invalidProducts > 0 
-        ? `${invalidProducts} product(s) have validation errors. Please fix before uploading.` 
+        ? `${invalidProducts} product(s) have validation errors. Import is blocked until every row is fixed. Download the error report.` 
         : (missingImagesCount > 0 ? `${missingImagesCount} variant(s) missing images.` : null)
     });
     
