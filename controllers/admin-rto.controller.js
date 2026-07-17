@@ -8,6 +8,7 @@ const { roundMoney2 } = require('../services/checkoutComputation.service');
 const { buildRtoBucketMatch, repairOrderStatusForShiprocketRto } = require('../constants/rtoOrderQuery');
 const {
   resolveDateRange,
+  buildScopedDateMatch,
   buildSearchFilter,
   mapOrderRow
 } = require('../services/adminOrderDashboard.service');
@@ -80,6 +81,30 @@ function mergeRtoFilters(...parts) {
   if (!valid.length) return {};
   if (valid.length === 1) return valid[0];
   return { $and: valid };
+}
+
+/** Safe API dateRange payload — `rangePreset=all` has null from/to. */
+function serializeRtoDateRange(range) {
+  const from = range?.from instanceof Date && !Number.isNaN(range.from.getTime()) ? range.from : null;
+  const to = range?.to instanceof Date && !Number.isNaN(range.to.getTime()) ? range.to : null;
+  return {
+    from: from ? from.toISOString() : null,
+    to: to ? to.toISOString() : null,
+    preset: range?.presetLabel || null
+  };
+}
+
+/**
+ * RTO tab defaults to lifetime (`all`) so older RTOs are not hidden behind Orders' 30d window.
+ * Explicit from/to / last7 / last30 / today still work unchanged.
+ */
+function resolveRtoDateRangeFromQuery(query = {}) {
+  return resolveDateRange({
+    from: query.from,
+    to: query.to,
+    presetDays: query.presetDays,
+    rangePreset: query.rangePreset || query.range || 'all'
+  });
 }
 
 function appendRtoHistory(order, { action, note, performedBy, metadata }) {
@@ -346,12 +371,7 @@ async function findRtoOrderOrThrow(orderId, scopeMatch = {}) {
  */
 exports.getRtoOrders = async (req, res) => {
   try {
-    const range = resolveDateRange({
-      from: req.query.from,
-      to: req.query.to,
-      presetDays: req.query.presetDays,
-      rangePreset: req.query.rangePreset || req.query.range
-    });
+    const range = resolveRtoDateRangeFromQuery(req.query);
 
     const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
@@ -364,13 +384,13 @@ exports.getRtoOrders = async (req, res) => {
     const sort = { [sortBy]: sortOrder };
 
     const scopeMatch = req.adminScope?.orderMatch || {};
-    const dateMatch = { createdAt: { $gte: range.from, $lte: range.to } };
+    const dateScopeMatch = buildScopedDateMatch(range.from, range.to, scopeMatch);
     const search = await buildSearchFilter(req.query.search);
     const sectionMatch = buildRtoSectionMatch(req.query.section);
     const statusMatch = buildRtoStatusFilterMatch(req.query.status);
 
     const filter = mergeRtoFilters(
-      Object.keys(scopeMatch).length ? { $and: [dateMatch, scopeMatch] } : dateMatch,
+      dateScopeMatch,
       buildRtoBucketMatch(),
       search,
       sectionMatch,
@@ -449,11 +469,7 @@ exports.getRtoOrders = async (req, res) => {
     return res.json({
       success: true,
       data: {
-        dateRange: {
-          from: range.from.toISOString(),
-          to: range.to.toISOString(),
-          preset: range.presetLabel
-        },
+        dateRange: serializeRtoDateRange(range),
         scope: req.adminScope?.storefront || 'ecomm',
         orders: rows,
         summaryCounts,
@@ -841,18 +857,11 @@ exports.bulkRtoAction = async (req, res) => {
  */
 exports.getRtoAnalytics = async (req, res) => {
   try {
-    const range = resolveDateRange({
-      from: req.query.from,
-      to: req.query.to,
-      presetDays: req.query.presetDays,
-      rangePreset: req.query.rangePreset || req.query.range || 'last30'
-    });
+    const range = resolveRtoDateRangeFromQuery(req.query);
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const baseFilter = mergeRtoFilters(
-      Object.keys(scopeMatch).length
-        ? { $and: [{ createdAt: { $gte: range.from, $lte: range.to } }, scopeMatch] }
-        : { createdAt: { $gte: range.from, $lte: range.to } },
+      buildScopedDateMatch(range.from, range.to, scopeMatch),
       buildRtoBucketMatch()
     );
 
@@ -901,11 +910,7 @@ exports.getRtoAnalytics = async (req, res) => {
     return res.json({
       success: true,
       data: {
-        dateRange: {
-          from: range.from.toISOString(),
-          to: range.to.toISOString(),
-          preset: range.presetLabel
-        },
+        dateRange: serializeRtoDateRange(range),
         kpis: {
           totalRto: orders.length,
           pending,
@@ -930,18 +935,11 @@ exports.getRtoAnalytics = async (req, res) => {
  */
 exports.exportRtoReport = async (req, res) => {
   try {
-    const range = resolveDateRange({
-      from: req.query.from,
-      to: req.query.to,
-      presetDays: req.query.presetDays,
-      rangePreset: req.query.rangePreset || req.query.range || 'last30'
-    });
+    const range = resolveRtoDateRangeFromQuery(req.query);
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const filter = mergeRtoFilters(
-      Object.keys(scopeMatch).length
-        ? { $and: [{ createdAt: { $gte: range.from, $lte: range.to } }, scopeMatch] }
-        : { createdAt: { $gte: range.from, $lte: range.to } },
+      buildScopedDateMatch(range.from, range.to, scopeMatch),
       buildRtoBucketMatch(),
       buildRtoSectionMatch(req.query.section),
       buildRtoStatusFilterMatch(req.query.status)
@@ -996,7 +994,7 @@ exports.exportRtoReport = async (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="rto-report-${range.presetLabel}-${Date.now()}.csv"`
+      `attachment; filename="rto-report-${range.presetLabel || 'all'}-${Date.now()}.csv"`
     );
     return res.send(csv);
   } catch (err) {
@@ -1015,13 +1013,12 @@ exports.autoSyncRtoStatuses = async (req, res) => {
     if (presetDays == null && String(req.query.preset || '').toLowerCase() === '30d') {
       presetDays = 30;
     }
-    const rangePreset = req.query.rangePreset || req.query.range;
-
+    // Prefer explicit query; otherwise lifetime so older open RTOs still hydrate.
     const range = resolveDateRange({
       from: req.query.from,
       to: req.query.to,
       presetDays,
-      rangePreset
+      rangePreset: req.query.rangePreset || req.query.range || 'all'
     });
 
     const scopeMatch = req.adminScope?.orderMatch || {};
@@ -1051,11 +1048,7 @@ exports.autoSyncRtoStatuses = async (req, res) => {
     return res.json({
       success: true,
       data: {
-        dateRange: {
-          from: range.from.toISOString(),
-          to: range.to.toISOString(),
-          preset: range.presetLabel
-        },
+        dateRange: serializeRtoDateRange(range),
         scope: req.adminScope?.storefront || 'ecomm',
         summary: syncResult.summary,
         results: syncResult.results
