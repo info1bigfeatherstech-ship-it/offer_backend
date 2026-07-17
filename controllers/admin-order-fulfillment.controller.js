@@ -35,6 +35,7 @@ const {
 } = require('../services/shiprocketReconcile.service');
 const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
+const { isCustomerProductReturnRequest } = require('../utils/productReturnRequest');
 const {
   getAdminOrderMatch,
   mergeOrderScopeFilter
@@ -2244,6 +2245,14 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
   try {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
+    if (!isCustomerProductReturnRequest(order)) {
+      return jsonError(
+        res,
+        404,
+        'RETURN_REQUEST_NOT_FOUND',
+        'No customer product return request found for this order'
+      );
+    }
     const st = String(order.returnInfo?.status || '').toLowerCase();
     const hasReverse = Boolean(order.returnInfo?.reverseAwbCode || order.returnInfo?.reverseTrackingNumber);
     const canRetry = st === 'approval_failed' || (st === 'approved' && !hasReverse);
