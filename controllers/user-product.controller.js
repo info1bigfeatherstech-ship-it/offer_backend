@@ -11,9 +11,48 @@ const {
   isProductListedOnStorefront,
   getVariantAvailability
 } = require('../utils/storefrontCatalog');
+const {
+  overlayExternalStockOnProducts,
+  overlayExternalStockOnProduct
+} = require('../services/inventoryStockOverlay.service');
 
 const storefrontFrom = (req) => req.storefront || 'ecomm';
 const useWholesalePricing = (storefront) => storefront === 'wholesale';
+
+/** Deep-clone cached JSON so inventory overlay never mutates Redis/memory cache entries. */
+function cloneCachedPayload(payload) {
+  if (payload == null) return payload;
+  try {
+    if (typeof structuredClone === 'function') return structuredClone(payload);
+  } catch (_) {
+    /* fall through */
+  }
+  return JSON.parse(JSON.stringify(payload));
+}
+
+/**
+ * Apply inventory available qty onto response products (per variant).
+ * Safe no-op when inventory integration is disabled or degraded.
+ */
+async function applyInventoryStockToProducts(products, storefront, logContext) {
+  await overlayExternalStockOnProducts(products, { storefront, logContext });
+  return products;
+}
+
+async function applyInventoryStockToCachedPayload(payload, storefront, logContext) {
+  const data = cloneCachedPayload(payload);
+  if (!data || typeof data !== 'object') return data;
+  if (Array.isArray(data.products)) {
+    await applyInventoryStockToProducts(data.products, storefront, logContext);
+  }
+  if (data.product && typeof data.product === 'object') {
+    await overlayExternalStockOnProduct(data.product, { storefront, logContext });
+  }
+  if (Array.isArray(data.related)) {
+    await applyInventoryStockToProducts(data.related, storefront, logContext);
+  }
+  return data;
+}
 
 // Price resolution is storefront-driven:
 // wholesale storefront => wholesale price for all visitors (logged-in or guest)
@@ -272,7 +311,12 @@ console.table(
     if (cachedData) {
       res.setHeader("X-Cache", "HIT");
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        storefront,
+        'getProducts:cache'
+      );
+      return res.json(withLiveStock);
     }
 
     const projection = req.query.q
@@ -299,7 +343,13 @@ console.table(
       )
     );
 
-    return res.json({
+    await applyInventoryStockToProducts(
+      productsWithData,
+      storefront,
+      'getProducts'
+    );
+
+    const responseData = {
       success: true,
       pagination: {
         total,
@@ -313,8 +363,9 @@ console.table(
       userType: currentUserType,
       storefront,
       appliedTags: tagsFilter,
-    });
+    };
 
+    // Cache catalog payload; stock is re-overlaid on HIT so qty stays fresh.
     await cacheService.set(
       cacheKey,
       responseData,
@@ -351,7 +402,12 @@ const getProductBySlug = async (req, res) => {
     if (cachedData) {
       res.setHeader('X-Cache', 'HIT');
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        storefront,
+        'getProductBySlug:cache'
+      );
+      return res.json(withLiveStock);
     }
     
     const product = await Product.findOne(
@@ -372,6 +428,11 @@ const getProductBySlug = async (req, res) => {
         storefront
       )
     );
+
+    await overlayExternalStockOnProduct(productResponse, {
+      storefront,
+      logContext: 'getProductBySlug'
+    });
 
     const responseData = {
       success: true,
@@ -451,7 +512,12 @@ const searchProducts= async (req, res) => {
     if (cachedData) {
       res.setHeader("X-Cache", "HIT");
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        currentStorefront,
+        'searchProducts:cache'
+      );
+      return res.json(withLiveStock);
     }
 
     // Build search filter.
@@ -536,6 +602,12 @@ const searchProducts= async (req, res) => {
       )
     );
 
+    await applyInventoryStockToProducts(
+      productsWithData,
+      currentStorefront,
+      'searchProducts'
+    );
+
     const responseData = {
       success: true,
       total,
@@ -607,7 +679,12 @@ const getProductsByCategory = async (req, res) => {
     if (cachedData) {
       res.setHeader("X-Cache", "HIT");
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        currentStorefront,
+        'getProductsByCategory:cache'
+      );
+      return res.json(withLiveStock);
     }
 
     const category = await Category.findOne({
@@ -690,6 +767,12 @@ const getProductsByCategory = async (req, res) => {
       )
     );
 
+    await applyInventoryStockToProducts(
+      productsWithData,
+      currentStorefront,
+      'getProductsByCategory'
+    );
+
     const responseData = {
       success: true,
       total,
@@ -749,7 +832,12 @@ const getFeaturedProducts = async (req, res) => {
     if (cachedData && !bypassCache) {
       res.setHeader('X-Cache', 'HIT');
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        storefront,
+        'getFeaturedProducts:cache'
+      );
+      return res.json(withLiveStock);
     }
 
     const filters = mongoCatalogAnd(storefront, { isFeatured: true });
@@ -766,6 +854,12 @@ const getFeaturedProducts = async (req, res) => {
       products.map((product) =>
         decorateProductForStorefront(product, userType, storefront)
       )
+    );
+
+    await applyInventoryStockToProducts(
+      productsWithData,
+      storefront,
+      'getFeaturedProducts'
     );
 
     const responseData = {
@@ -820,7 +914,12 @@ const getRelatedProducts = async (req, res) => {
     if (cachedData) {
       res.setHeader('X-Cache', 'HIT');
       setApiCacheHeaders(res);
-      return res.json(cachedData);
+      const withLiveStock = await applyInventoryStockToCachedPayload(
+        cachedData,
+        storefront,
+        'getRelatedProducts:cache'
+      );
+      return res.json(withLiveStock);
     }
 
     const product = await Product.findOne(
@@ -849,6 +948,12 @@ const getRelatedProducts = async (req, res) => {
       related.map((rel) =>
         decorateProductForStorefront(rel, userType, storefront)
       )
+    );
+
+    await applyInventoryStockToProducts(
+      relatedWithData,
+      storefront,
+      'getRelatedProducts'
     );
 
     const responseData = {
@@ -900,6 +1005,11 @@ const getProductDetails = async (req, res) => {
         storefront
       )
     );
+
+    await overlayExternalStockOnProduct(productResponse, {
+      storefront,
+      logContext: 'getProductDetails'
+    });
 
     res.status(200).json({
       success: true,

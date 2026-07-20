@@ -6,7 +6,7 @@
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
-const { releaseReservedInventoryForOrder } = require('./orderInventory.service');
+const { releaseOrderStockHold } = require('./orderStockBridge.service');
 const { mergeOrderLineItemsIntoUserCart } = require('./restoreCartFromOrder.service');
 
 function getPaymentHoldMs() {
@@ -122,7 +122,8 @@ class PaymentHoldExpiryService {
           order.markModified('paymentInfo');
           await order.save({ session });
 
-          await releaseReservedInventoryForOrder(order, session);
+          await releaseOrderStockHold(order, session);
+          await order.save({ session });
           await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
 
           await session.commitTransaction();

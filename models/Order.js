@@ -6,6 +6,8 @@ const orderItemSchema = new mongoose.Schema(
   {
     productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
     variantId: { type: mongoose.Schema.Types.ObjectId },
+    /** Snapshot of variant.productCode at order time (inventory SSOT key) */
+    productCode: { type: String, trim: true, uppercase: true, default: null },
     quantity: { type: Number, required: true, min: 1 },
     priceSnapshot: {
       base: { type: Number, required: true },
@@ -68,6 +70,25 @@ const orderSchema = new mongoose.Schema(
     paymentInfo: { 
       type: mongoose.Schema.Types.Mixed,
       default: {}
+    },
+
+    /**
+     * External / local stock hold tracking (Phase 2 inventory bridge).
+     * source: inventory | mongo | hybrid
+     * status: none | held | committed | released
+     */
+    inventoryHold: {
+      source: { type: String, default: null }, // inventory | mongo | hybrid
+      status: {
+        type: String,
+        enum: ['none', 'held', 'committed', 'released'],
+        default: 'none'
+      },
+      reservationId: { type: String, default: null },
+      inventoryReserved: { type: Boolean, default: false },
+      mongoReserved: { type: Boolean, default: false },
+      reason: { type: String, default: null },
+      updatedAt: { type: Date, default: null }
     },
 
     refundHistory: {
