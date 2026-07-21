@@ -48,6 +48,17 @@ const outOfStockInquirySchema = new mongoose.Schema(
       index: true,
     },
 
+    /**
+     * Why the customer joined the waitlist.
+     * Legacy rows without this field are treated as out_of_stock.
+     */
+    reason: {
+      type: String,
+      enum: ['out_of_stock', 'moq_unmet'],
+      default: 'out_of_stock',
+      index: true,
+    },
+
     status: {
       type: String,
       enum: STATUS_ENUM,

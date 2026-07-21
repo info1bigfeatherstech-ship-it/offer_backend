@@ -21,6 +21,8 @@ const {
   unitDimsCmFromResolvedShipping,
   shippingDimCm
 } = require('../utils/variantCatalogFields');
+const { overlayExternalStockOnProducts } = require('./inventoryStockOverlay.service');
+const { normalizeProductCode } = require('../utils/productCode');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -138,6 +140,8 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
   let totalWeight = 0;
   const orderItems = [];
 
+  // Pass 1: resolve products/variants (then one inventory batch overlay).
+  const resolved = [];
   for (const cartItem of cart.items) {
     const productId = resolveCartItemProductId(cartItem);
     const variantId = resolveCartItemVariantId(cartItem);
@@ -180,6 +184,16 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
       throw err;
     }
 
+    resolved.push({ cartItem, product, variant });
+  }
+
+  await overlayExternalStockOnProducts(
+    resolved.map((r) => r.product),
+    { storefront, logContext: 'evaluateCartForCheckout' }
+  );
+
+  // Pass 2: stock + price using overlaid quantities.
+  for (const { cartItem, product, variant } of resolved) {
     if (variant.inventory?.trackInventory && variant.inventory.quantity < cartItem.quantity) {
       const err = new Error(`${product.name} has only ${variant.inventory.quantity} in stock`);
       err.statusCode = 400;
@@ -202,6 +216,7 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
     orderItems.push({
       productId: product._id,
       variantId: variant._id,
+      productCode: normalizeProductCode(variant.productCode) || null,
       quantity: cartItem.quantity,
       priceSnapshot: {
         base: price.base,

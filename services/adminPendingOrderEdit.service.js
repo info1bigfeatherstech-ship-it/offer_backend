@@ -20,6 +20,11 @@ const { buildShippingWeightSnapshotFromCheckoutLines } = require('../utils/shipp
 const { resolveVariantShipping } = require('../utils/variantCatalogFields');
 const ShiprocketService = require('../utils/shiprocket');
 const { releaseReservedInventoryForLines } = require('./orderInventory.service');
+const {
+  releaseOrderStockHold,
+  syncHoldAfterPendingOrderEdit,
+  readHold
+} = require('./orderStockBridge.service');
 const { mergeReturnInfo } = require('./rtoRefund.service');
 const { notifyOrderAmended } = require('./orderAmendmentNotification.service');
 
@@ -757,7 +762,13 @@ async function previewOrApplyPendingOrderEdit(opts) {
     order.markModified('adminEditHistory');
 
     await order.save();
-    await releaseReservedInventoryForLines(originalItemsForStock);
+    const hold = readHold(order);
+    if (hold.inventoryReserved || hold.source === 'inventory' || hold.source === 'hybrid') {
+      await releaseOrderStockHold(order);
+      await order.save();
+    } else {
+      await releaseReservedInventoryForLines(originalItemsForStock);
+    }
 
     try {
       await notifyOrderAmended(order, customerNotes[0]?.message, {
@@ -930,7 +941,12 @@ async function previewOrApplyPendingOrderEdit(opts) {
 
   await order.save();
 
-  if (releasedLines.length) {
+  const hold = readHold(order);
+  if (hold.inventoryReserved || hold.source === 'inventory' || hold.source === 'hybrid') {
+    // Inventory API has no partial release — full release + re-reserve remaining lines.
+    await syncHoldAfterPendingOrderEdit(order);
+    await order.save();
+  } else if (releasedLines.length) {
     await releaseReservedInventoryForLines(releasedLines);
   }
 

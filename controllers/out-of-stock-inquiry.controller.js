@@ -7,7 +7,7 @@ const Product = require('../models/Product');
 const logger = require('../utils/logger');
 const {
   validateInquiryContact,
-  isVariantOutOfStock,
+  resolveInquiryWaitlistEligibility,
 } = require('../utils/oosInquiryValidation');
 
 const DUPLICATE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
@@ -93,16 +93,19 @@ exports.submitOutOfStockInquiry = async (req, res) => {
       throw createHttpError(404, 'VARIANT_NOT_FOUND', 'Variant not found on this product');
     }
 
-    if (!isVariantOutOfStock(variant)) {
+    const storefront = req.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+    const eligibility = resolveInquiryWaitlistEligibility(variant, storefront);
+    if (!eligibility.eligible) {
       throw createHttpError(
         409,
         'PRODUCT_IN_STOCK',
-        'This product is currently in stock. You can add it to cart.',
+        storefront === 'wholesale'
+          ? 'This product is currently available for wholesale order. You can add it to cart.'
+          : 'This product is currently in stock. You can add it to cart.',
         'productId'
       );
     }
 
-    const storefront = req.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
     const since = new Date(Date.now() - DUPLICATE_WINDOW_MS);
 
     const contactOr = [];
@@ -148,17 +151,24 @@ exports.submitOutOfStockInquiry = async (req, res) => {
       phone,
       userId,
       storefront,
+      reason: eligibility.reason || 'out_of_stock',
       status: 'pending',
       source: 'pdp',
     });
 
+    const thanksMessage =
+      eligibility.reason === 'moq_unmet'
+        ? 'Thanks! We will notify you when enough stock is available for wholesale order.'
+        : 'Thanks! We will notify you when this product is back in stock.';
+
     return res.status(201).json({
       success: true,
       alreadyRegistered: false,
-      message: 'Thanks! We will notify you when this product is back in stock.',
+      message: thanksMessage,
       data: {
         id: doc._id,
         status: doc.status,
+        reason: doc.reason || 'out_of_stock',
         createdAt: doc.createdAt,
       },
     });
@@ -230,6 +240,7 @@ exports.listOutOfStockInquiries = async (req, res) => {
       phone: row.phone || null,
       status: row.status,
       storefront: row.storefront,
+      reason: row.reason || 'out_of_stock',
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       notifiedAt: row.notifiedAt,

@@ -1,7 +1,14 @@
 /**
  * Production back-in-stock notifier for OutOfStockInquiry waitlist.
  *
- * Trigger: variant inventory transitions from <=0 → >0.
+ * Trigger:
+ * - Classic: qty <=0 → >0 (ecomm + wholesale true OOS)
+ * - Wholesale MOQ: was below MOQ with stock >0 → next >= MOQ
+ *
+ * Delivery filter (per inquiry):
+ * - ecomm / out_of_stock: notify when qty > 0
+ * - wholesale moq_unmet: notify when qty >= MOQ
+ *
  * Safety: atomic claim pending → notifying, then notified / reclaim on failure.
  * Channels: email (marketing) + in-app website notifications (UserNotification).
  * Never blocks the inventory write path — callers should fire-and-forget.
@@ -105,13 +112,62 @@ function fillTemplate(str, map) {
   );
 }
 
-function isRestockTransition(prevQty, nextQty, trackInventory) {
+function toSafeQty(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function resolveMinimumOrderQuantity(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.floor(n)) : 1;
+}
+
+/**
+ * Inventory transition that may unblock waitlist notifications.
+ * 3-arg call sites stay ecomm-safe (classic <=0 → >0 only when MOQ omitted / 1).
+ *
+ * @param {unknown} prevQty
+ * @param {unknown} nextQty
+ * @param {boolean} trackInventory
+ * @param {{ minimumOrderQuantity?: unknown }} [options]
+ */
+function isRestockTransition(prevQty, nextQty, trackInventory, options = {}) {
   if (trackInventory === false) return false;
-  const prev = Number(prevQty);
-  const next = Number(nextQty);
+  const prev = toSafeQty(prevQty);
+  const next = toSafeQty(nextQty);
   if (!Number.isFinite(next) || next <= 0) return false;
+
+  // Classic true OOS → any positive stock (ecomm + wholesale OOS waitlist)
   const wasOut = !Number.isFinite(prev) || prev <= 0;
-  return wasOut;
+  if (wasOut) return true;
+
+  // Wholesale MOQ path: stock was positive but below MOQ, now meets MOQ
+  const moq = resolveMinimumOrderQuantity(options?.minimumOrderQuantity);
+  if (moq <= 1) return false;
+  return Number.isFinite(prev) && prev > 0 && prev < moq && next >= moq;
+}
+
+/**
+ * Whether this pending inquiry should be notified for the current stock level.
+ * Legacy rows without reason are treated as out_of_stock.
+ *
+ * @param {{ storefront?: string, reason?: string }} inquiry
+ * @param {{ quantity: number, minimumOrderQuantity: number, trackInventory: boolean }} stock
+ */
+function shouldNotifyInquiryForStock(inquiry, stock) {
+  if (!stock || stock.trackInventory === false) return false;
+  const qty = toSafeQty(stock.quantity);
+  if (!Number.isFinite(qty) || qty <= 0) return false;
+
+  const reason = inquiry?.reason === 'moq_unmet' ? 'moq_unmet' : 'out_of_stock';
+  const storefront = inquiry?.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+
+  if (storefront === 'wholesale' && reason === 'moq_unmet') {
+    return qty >= resolveMinimumOrderQuantity(stock.minimumOrderQuantity);
+  }
+
+  // ecomm + wholesale true OOS waitlist
+  return qty > 0;
 }
 
 /**
@@ -122,34 +178,28 @@ async function enrichRestockEvent(event) {
   const variantId = event.variantId;
   if (!productId || !variantId) return null;
 
-  let productSlug = event.productSlug || null;
-  let productName = event.productName || null;
-  let variantSku = event.variantSku || null;
-  let productImage = event.productImage || null;
+  const product = await Product.findById(productId)
+    .select('name slug variants')
+    .lean();
+  if (!product) return null;
 
-  if (!productSlug || !productName) {
-    const product = await Product.findById(productId)
-      .select('name slug variants')
-      .lean();
-    if (!product) return null;
-    productSlug = product.slug || productSlug;
-    productName = product.name || productName;
-    const variant = (product.variants || []).find((v) => String(v._id) === String(variantId));
-    if (variant) {
-      variantSku = variant.sku || variantSku;
-      const img = Array.isArray(variant.images) && variant.images[0];
-      productImage =
-        (typeof img === 'string' ? img : img?.url) || productImage || null;
-    }
-  }
+  const variant = (product.variants || []).find((v) => String(v._id) === String(variantId));
+  if (!variant) return null;
+
+  const img = Array.isArray(variant.images) && variant.images[0];
+  const productImage =
+    (typeof img === 'string' ? img : img?.url) || event.productImage || null;
 
   return {
     productId,
     variantId,
-    productSlug,
-    productName: productName || 'Product',
-    variantSku,
+    productSlug: event.productSlug || product.slug || null,
+    productName: event.productName || product.name || 'Product',
+    variantSku: event.variantSku || variant.sku || null,
     productImage,
+    quantity: Number(variant.inventory?.quantity || 0),
+    minimumOrderQuantity: resolveMinimumOrderQuantity(variant.minimumOrderQuantity),
+    trackInventory: variant.inventory?.trackInventory !== false,
   };
 }
 
@@ -201,6 +251,10 @@ async function releaseClaim(inquiryId, errorMessage) {
   );
 }
 
+function isMoqUnmetInquiry(inquiry) {
+  return inquiry?.reason === 'moq_unmet' && inquiry?.storefront === 'wholesale';
+}
+
 async function sendRestockEmail(inquiry, ctx) {
   if (!inquiry.email) {
     const err = new Error('No email on inquiry');
@@ -213,17 +267,41 @@ async function sendRestockEmail(inquiry, ctx) {
     ...(inquiry.toObject?.() || inquiry),
     productSlug: ctx.productSlug || inquiry.productSlug,
   });
+  const moqCopy = isMoqUnmetInquiry(inquiry);
+  const copy = moqCopy
+    ? {
+        subject: template.moqSubject || template.subject,
+        greeting: template.moqGreeting || template.greeting,
+        intro: template.moqIntro || template.intro,
+        stockLine: template.moqStockLine || '<strong>{{productName}}</strong> is now available for wholesale order.',
+        ctaLabel: template.moqCtaLabel || template.ctaLabel,
+        footer: template.moqFooter || template.footer,
+        textBody:
+          template.moqTextBody ||
+          `${productName} is now available for wholesale order.\n${template.moqIntro || template.intro}`,
+      }
+    : {
+        subject: template.subject,
+        greeting: template.greeting,
+        intro: template.intro,
+        stockLine: '<strong>{{productName}}</strong> is back in stock.',
+        ctaLabel: template.ctaLabel,
+        footer: template.footer,
+        textBody: `${productName} is back in stock.\n${template.intro}`,
+      };
+
   const map = {
     productName: escapeHtml(productName),
     productUrl,
-    greeting: template.greeting,
-    intro: template.intro,
-    ctaLabel: template.ctaLabel,
-    footer: template.footer,
+    greeting: copy.greeting,
+    intro: copy.intro,
+    stockLine: fillTemplate(copy.stockLine, { productName: escapeHtml(productName) }),
+    ctaLabel: copy.ctaLabel,
+    footer: copy.footer,
   };
-  const subject = fillTemplate(template.subject, { productName });
+  const subject = fillTemplate(copy.subject, { productName });
   const html = fillTemplate(template.htmlLayout, map);
-  const text = `${template.greeting}\n\n${productName} is back in stock.\n${template.intro}\n\n${productUrl}\n`;
+  const text = `${copy.greeting}\n\n${fillTemplate(copy.textBody, { productName })}\n\n${productUrl}\n`;
 
   await transporter.sendMail({
     from: getMarketingFromAddress(),
@@ -273,8 +351,11 @@ async function sendInAppRestockNotification(inquiry, ctx) {
   const productSlug = ctx.productSlug || inquiry.productSlug || null;
   const inquiryId = String(inquiry._id);
   const syntheticOrderId = `oos:${inquiryId}`;
-  const title = 'Back in stock';
-  const body = `${productName} is available again. Tap to view the product and order before it sells out.`;
+  const moqCopy = isMoqUnmetInquiry(inquiry);
+  const title = moqCopy ? 'Now available for wholesale' : 'Back in stock';
+  const body = moqCopy
+    ? `${productName} now has enough stock for wholesale order. Tap to view and order.`
+    : `${productName} is available again. Tap to view the product and order before it sells out.`;
 
   try {
     await UserNotification.findOneAndUpdate(
@@ -289,7 +370,7 @@ async function sendInAppRestockNotification(inquiry, ctx) {
           read: false,
           sentAt: new Date(),
           metadata: {
-            reason: 'back_in_stock',
+            reason: moqCopy ? 'moq_unmet' : 'back_in_stock',
             refundAmount: null,
             orderTotal: null,
             policyUrl: null,
@@ -353,7 +434,7 @@ async function deliverInquiry(inquiry, ctx) {
 }
 
 /**
- * Process pending waitlist for a restocked variant.
+ * Process pending waitlist for a restocked / now-purchasable variant.
  * @param {{ productId: unknown, variantId: unknown, productSlug?: string, productName?: string }} event
  */
 async function notifyPendingInquiriesForRestock(event) {
@@ -368,6 +449,11 @@ async function notifyPendingInquiriesForRestock(event) {
 
   const productId = enriched.productId;
   const variantId = enriched.variantId;
+  const stock = {
+    quantity: enriched.quantity,
+    minimumOrderQuantity: enriched.minimumOrderQuantity,
+    trackInventory: enriched.trackInventory,
+  };
 
   const pending = await OutOfStockInquiry.find({
     productId,
@@ -382,17 +468,25 @@ async function notifyPendingInquiriesForRestock(event) {
   })
     .sort({ createdAt: 1 })
     .limit(MAX_PER_VARIANT)
-    .select('_id')
+    .select('_id storefront reason')
     .lean();
 
   if (!pending.length) {
-    return { attempted: 0, notified: 0, failed: 0 };
+    return { attempted: 0, notified: 0, failed: 0, deferred: 0 };
   }
 
   let notified = 0;
   let failed = 0;
+  let deferred = 0;
+  let attempted = 0;
 
   for (const row of pending) {
+    if (!shouldNotifyInquiryForStock(row, stock)) {
+      deferred += 1;
+      continue;
+    }
+
+    attempted += 1;
     const claimed = await claimInquiry(row._id);
     if (!claimed) continue;
 
@@ -411,12 +505,16 @@ async function notifyPendingInquiriesForRestock(event) {
   logger.info('[oosRestockNotify] variant batch complete', {
     productId: String(productId),
     variantId: String(variantId),
-    attempted: pending.length,
+    quantity: stock.quantity,
+    minimumOrderQuantity: stock.minimumOrderQuantity,
+    pending: pending.length,
+    attempted,
     notified,
     failed,
+    deferred,
   });
 
-  return { attempted: pending.length, notified, failed };
+  return { attempted, notified, failed, deferred };
 }
 
 /**
@@ -461,6 +559,7 @@ function scheduleRestockNotifications(eventsOrOne) {
 
 module.exports = {
   isRestockTransition,
+  shouldNotifyInquiryForStock,
   notifyPendingInquiriesForRestock,
   notifyPendingInquiriesForRestocks,
   scheduleRestockNotifications,

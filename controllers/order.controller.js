@@ -17,9 +17,13 @@ const {
     roundMoney2
 } = require('../services/checkoutComputation.service');
 const {
-    releaseReservedInventoryForOrder,
-    reserveInventoryForOrder
-} = require('../services/orderInventory.service');
+    reserveCheckoutStock,
+    releaseOrderStockHold,
+    releaseInventoryHoldByOrderId,
+    commitOrderStockHold,
+    rereserveOrderStockHold,
+    attachProductCodesToOrderItems
+} = require('../services/orderStockBridge.service');
 const { mergeOrderLineItemsIntoUserCart } = require('../services/restoreCartFromOrder.service');
 const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
@@ -120,21 +124,23 @@ async function applySuccessfulOnlineCaptureSideEffects(order, trigger) {
 
         if (recovery.previousOrderStatus === 'payment_failed') {
             try {
-                const inv = await reserveInventoryForOrder(order);
+                const inv = await rereserveOrderStockHold(order);
                 order.paymentInfo = order.paymentInfo || {};
                 order.paymentInfo.inventoryReReserve = {
                     at: new Date(),
-                    reserved: inv.reserved,
-                    shortages: inv.shortages || []
+                    ok: Boolean(inv.ok),
+                    source: inv.source || null,
+                    shortages: inv.summary?.shortages || [],
+                    code: inv.code || null
                 };
                 if (typeof order.markModified === 'function') {
                     order.markModified('paymentInfo');
                 }
                 dirty = true;
-                if ((inv.shortages || []).length > 0) {
+                if (!inv.ok) {
                     logger.error('[paymentState] Inventory shortage while recovering paid order', {
                         orderId: order.orderId,
-                        shortages: inv.shortages
+                        result: inv
                     });
                 }
             } catch (invErr) {
@@ -145,6 +151,27 @@ async function applySuccessfulOnlineCaptureSideEffects(order, trigger) {
             }
         }
     }
+
+    // First successful money capture → commit inventory hold (idempotent).
+    try {
+        const commitRes = await commitOrderStockHold(order);
+        if (commitRes && commitRes.ok && !commitRes.skipped) {
+            dirty = true;
+        } else if (commitRes && !commitRes.ok && !commitRes.skipped) {
+            logger.error('[paymentState] Inventory commit failed after capture', {
+                orderId: order.orderId,
+                trigger,
+                result: commitRes
+            });
+        }
+    } catch (commitErr) {
+        logger.error('[paymentState] Inventory commit threw after capture', {
+            orderId: order.orderId,
+            trigger,
+            message: commitErr?.message || String(commitErr)
+        });
+    }
+
     return { dirty, recovery: recovery.changed ? recovery : null };
 }
 
@@ -295,63 +322,6 @@ function isOrderIdDuplicateError(error) {
     if (!error || error.code !== 11000) return false;
     const dup = error.keyPattern?.orderId || error.keyValue?.orderId;
     return Boolean(dup);
-}
-
-async function reserveInventoryAtomically(lines, session) {
-    for (const line of lines) {
-        const variant = line?.variant;
-        const product = line?.product;
-
-        if (!product?._id || !variant?._id) {
-            throw createCheckoutFlowError({
-                statusCode: 500,
-                code: 'ORDER_LINE_INVALID',
-                message: 'Order line is missing product or variant information'
-            });
-        }
-
-        if (variant.inventory?.trackInventory === false) {
-            continue;
-        }
-
-        const requestedQty = Number(line.quantity);
-        if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
-            throw createCheckoutFlowError({
-                statusCode: 400,
-                code: 'ORDER_LINE_QUANTITY_INVALID',
-                message: 'Order line quantity must be greater than 0'
-            });
-        }
-
-        const reserveResult = await Product.updateOne(
-            {
-                _id: product._id,
-                variants: {
-                    $elemMatch: {
-                        _id: variant._id,
-                        'inventory.trackInventory': true,
-                        'inventory.quantity': { $gte: requestedQty }
-                    }
-                }
-            },
-            {
-                $inc: { 'variants.$.inventory.quantity': -requestedQty }
-            }
-        ).session(session);
-
-        if (reserveResult.modifiedCount !== 1) {
-            throw createCheckoutFlowError({
-                statusCode: 409,
-                code: 'INSUFFICIENT_STOCK_RACE',
-                message: `${product.name || 'Product'} stock changed during checkout. Please refresh your cart and try again.`,
-                details: {
-                    productId: String(product._id),
-                    variantId: String(variant._id),
-                    requestedQuantity: requestedQty
-                }
-            });
-        }
-    }
 }
 
 function buildUnauthorizedOrderResponse(res) {
@@ -1303,6 +1273,7 @@ exports.createOrder = async (req, res) => {
         }
 
         const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const orderItemsWithCodes = attachProductCodesToOrderItems(orderItems, lines);
         const shippingWeightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
             lines: priced.lines,
             totalWeightKg: priced.totalWeight,
@@ -1339,7 +1310,38 @@ exports.createOrder = async (req, res) => {
             });
         }
 
-        await reserveInventoryAtomically(lines, session);
+        // Allocate orderId before stock reserve (inventory API keys holds by orderId).
+        let candidateOrderId = null;
+        for (let idAttempt = 0; idAttempt < 8; idAttempt++) {
+            const candidate = generateOrderId({
+                storefront,
+                userType: finalUserType
+            });
+            const exists = await Order.exists({ orderId: candidate }).session(session);
+            if (!exists) {
+                candidateOrderId = candidate;
+                break;
+            }
+        }
+        if (!candidateOrderId) {
+            throw createCheckoutFlowError({
+                statusCode: 503,
+                code: 'ORDER_ID_GENERATION_FAILED',
+                message: 'Could not allocate a unique order ID. Please retry checkout.'
+            });
+        }
+
+        // Inventory reserve (preferred) or Mongo fallback. True OOS from inventory fails checkout.
+        const inventoryHold = await reserveCheckoutStock({
+            orderId: candidateOrderId,
+            storefront,
+            lines,
+            session
+        });
+        // If inventory hold succeeded but later steps fail, release in catch.
+        req._pendingInventoryReleaseOrderId = inventoryHold.inventoryReserved
+            ? candidateOrderId
+            : null;
 
         let razorpayChargePaise = Math.round(roundMoney2(totalAmount) * 100);
         let splitMode = 'full';
@@ -1359,7 +1361,7 @@ exports.createOrder = async (req, res) => {
 
         const orderPayload = {
             userId: userId,
-            items: orderItems,
+            items: orderItemsWithCodes,
             subtotal: subtotal,
             deliveryCharges: deliveryCharges,
             tax: tax,
@@ -1369,6 +1371,7 @@ exports.createOrder = async (req, res) => {
             addressSnapshot: address.toObject(),
             userType: finalUserType,
             storefront,
+            inventoryHold,
             orderStatus:
                 isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
             paymentStatus: normalizedPaymentMethod === 'cod' ? 'pending' : 'pending',
@@ -1397,35 +1400,22 @@ exports.createOrder = async (req, res) => {
             shippingWeightSnapshot
         };
 
-        // 9. Create order with collision-safe orderId retries.
-        let order = null;
-        let orderSaved = false;
-        for (let attempt = 0; attempt < 5; attempt++) {
-            const candidateOrderId = generateOrderId({
-                storefront,
-                userType: finalUserType
-            });
-            order = new Order({
-                orderId: candidateOrderId,
-                ...orderPayload
-            });
-            try {
-                await order.save({ session });
-                orderSaved = true;
-                break;
-            } catch (saveError) {
-                if (isOrderIdDuplicateError(saveError)) {
-                    continue;
-                }
-                throw saveError;
+        // 9. Persist order under pre-allocated orderId.
+        let order = new Order({
+            orderId: candidateOrderId,
+            ...orderPayload
+        });
+        try {
+            await order.save({ session });
+        } catch (saveError) {
+            if (isOrderIdDuplicateError(saveError)) {
+                throw createCheckoutFlowError({
+                    statusCode: 503,
+                    code: 'ORDER_ID_GENERATION_FAILED',
+                    message: 'Could not allocate a unique order ID. Please retry checkout.'
+                });
             }
-        }
-        if (!orderSaved || !order) {
-            throw createCheckoutFlowError({
-                statusCode: 503,
-                code: 'ORDER_ID_GENERATION_FAILED',
-                message: 'Could not allocate a unique order ID. Please retry checkout.'
-            });
+            throw saveError;
         }
 
         if (normalizedPaymentMethod === 'online') {
@@ -1444,6 +1434,7 @@ exports.createOrder = async (req, res) => {
 
         await session.commitTransaction();
         session.endSession();
+        req._pendingInventoryReleaseOrderId = null;
 
         if (idempotency.enabled) {
             await OrderIdempotencyKey.updateOne(
@@ -1537,6 +1528,17 @@ exports.createOrder = async (req, res) => {
         }
 
         if (isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod') {
+            try {
+                const commitRes = await commitOrderStockHold(order);
+                if (commitRes?.ok) {
+                    await order.save();
+                }
+            } catch (codCommitErr) {
+                logger.error('COD auto-confirm inventory commit failed', buildRequestLogContext(req, {
+                    orderId: order.orderId,
+                    error: codCommitErr?.message || String(codCommitErr)
+                }));
+            }
             ensureShipmentForOrder({
                 order,
                 trigger: 'cod_order_created'
@@ -1568,6 +1570,20 @@ exports.createOrder = async (req, res) => {
     } catch (error) {
         await abortTransactionSafely(session);
         session.endSession();
+        const pendingReleaseId = req._pendingInventoryReleaseOrderId;
+        if (pendingReleaseId) {
+            try {
+                await releaseInventoryHoldByOrderId(pendingReleaseId, {
+                    trigger: 'createOrder_rollback'
+                });
+            } catch (releaseErr) {
+                logger.error('Failed to release inventory hold after createOrder rollback', {
+                    orderId: pendingReleaseId,
+                    message: releaseErr?.message || String(releaseErr)
+                });
+            }
+            req._pendingInventoryReleaseOrderId = null;
+        }
         const idempotencyKey = normalizeIdempotencyKey(req.headers['idempotency-key']);
         if (idempotencyKey) {
             try {
@@ -2583,7 +2599,8 @@ exports.abandonOnlineCheckout = async (req, res) => {
             normalizeTerminalUnpaidFinancials(order);
 
             await order.save({ session });
-            await releaseReservedInventoryForOrder(order, session);
+            await releaseOrderStockHold(order, session);
+            await order.save({ session });
             await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
 
             await session.commitTransaction();
@@ -2928,7 +2945,8 @@ exports.cancelOrder = async (req, res) => {
         order.markModified('returnInfo');
 
         await order.save({ session });
-        await releaseReservedInventoryForOrder(order, session);
+        await releaseOrderStockHold(order, session);
+        await order.save({ session });
 
         await session.commitTransaction();
         session.endSession();

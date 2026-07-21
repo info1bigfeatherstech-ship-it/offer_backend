@@ -1,13 +1,11 @@
 /**
- * Courier allow/block policy — mirrors couriers marked inactive in Shiprocket / admin config.
+ * Courier allow/block policy — optional env-driven only.
  * Inactive couriers are excluded from checkout quotes; Ship Now falls back to next cheapest active courier.
+ *
+ * No hardcoded courier blocks. Set explicitly if needed:
+ *   SHIPROCKET_INACTIVE_COURIER_IDS=12,34
+ *   SHIPROCKET_INACTIVE_COURIER_NAME_PATTERNS=Amazon Prepaid Surface|Amazon.*Surface
  */
-
-const DEFAULT_INACTIVE_NAME_PATTERNS = [
-  /amazon\s+prepaid\s+surface/i,
-  /amazon\s+.*\s+surface/i,
-  /amazon\s+surface/i
-];
 
 let cachedInactiveIds = null;
 let cachedNamePatterns = null;
@@ -33,21 +31,21 @@ function getInactiveCourierCompanyIds() {
 function getInactiveCourierNamePatterns() {
   if (cachedNamePatterns) return cachedNamePatterns;
   const raw = String(process.env.SHIPROCKET_INACTIVE_COURIER_NAME_PATTERNS || '').trim();
-  if (raw) {
-    cachedNamePatterns = raw
-      .split('|')
-      .map((part) => String(part || '').trim())
-      .filter(Boolean)
-      .map((part) => {
-        try {
-          return new RegExp(part, 'i');
-        } catch {
-          return new RegExp(part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        }
-      });
-  } else {
-    cachedNamePatterns = DEFAULT_INACTIVE_NAME_PATTERNS;
+  if (!raw) {
+    cachedNamePatterns = [];
+    return cachedNamePatterns;
   }
+  cachedNamePatterns = raw
+    .split('|')
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .map((part) => {
+      try {
+        return new RegExp(part, 'i');
+      } catch {
+        return new RegExp(part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      }
+    });
   return cachedNamePatterns;
 }
 

@@ -10,11 +10,32 @@ const {
 } = require('../utils/storefrontCatalog');
 const { sanitizeCartItems } = require('../services/cartSanitize.service');
 const { findCartForStorefront, findOrCreateCartForStorefront } = require('../services/cartStorefront.service');
+const {
+  overlayExternalStockOnProduct,
+  overlayExternalStockOnProducts
+} = require('../services/inventoryStockOverlay.service');
 
 const CART_PRODUCT_SELECT =
   'name slug title description brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt variants';
 
 const storefrontOrDefault = (req) => req.storefront || 'ecomm';
+
+/** Unique populated products from cart lines → overlay inventory qty (in-memory). */
+async function overlayCartProductsStock(products, storefront, logContext) {
+  const list = [];
+  const seen = new Set();
+  for (const product of products || []) {
+    if (!product) continue;
+    const id = product._id != null ? String(product._id) : null;
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    list.push(product);
+  }
+  if (!list.length) return;
+  await overlayExternalStockOnProducts(list, { storefront, logContext });
+}
 
 
 function firstListedVariant(product, storefront) {
@@ -179,6 +200,12 @@ const getcart = async (req, res) => {
       });
     }
 
+    await overlayCartProductsStock(
+      cart.items.map((it) => it.productId),
+      storefront,
+      'getcart'
+    );
+
     //  Format each item with full data
     const itemsWithFullData = [];
     
@@ -287,6 +314,12 @@ const addTocart = async (req, res) => {
       });
     }
 
+    // Live inventory qty (fallback Mongo if missing/degraded)
+    await overlayExternalStockOnProduct(product, {
+      storefront,
+      logContext: 'addTocart'
+    });
+
     // Find variant
     let variant = null;
     
@@ -387,6 +420,12 @@ const addTocart = async (req, res) => {
         path: 'items.productId',
         select: CART_PRODUCT_SELECT
       });
+
+    await overlayCartProductsStock(
+      updatedcart.items.map((it) => it.productId),
+      storefront,
+      'addTocart:response'
+    );
 
     // Format response
     const formattedItems = [];
@@ -496,6 +535,12 @@ const updatecartItem = async (req, res) => {
           select: CART_PRODUCT_SELECT
         });
       
+      await overlayCartProductsStock(
+        updatedcart.items.map((it) => it.productId),
+        storefront,
+        'updateCartItem:remove'
+      );
+
       // Format response
       const formattedItems = [];
       for (const it of updatedcart.items) {
@@ -537,6 +582,11 @@ const updatecartItem = async (req, res) => {
         message: 'Variant not found' 
       });
     }
+
+    await overlayExternalStockOnProduct(product, {
+      storefront,
+      logContext: 'updateCartItem'
+    });
 
     // Check MOQ for wholesale storefront cart operations
     if (storefront === 'wholesale') {
@@ -581,6 +631,12 @@ const updatecartItem = async (req, res) => {
         path: 'items.productId', 
         select: CART_PRODUCT_SELECT
       });
+
+    await overlayCartProductsStock(
+      populatedcart.items.map((it) => it.productId),
+      storefront,
+      'updateCartItem:response'
+    );
 
     // Format response
     const formattedItems = [];

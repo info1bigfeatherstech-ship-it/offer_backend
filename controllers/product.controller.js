@@ -4775,7 +4775,9 @@ const updateProduct = async (req, res) => {
             : variant.inventory?.trackInventory;
           try {
             const { isRestockTransition } = require('../services/oosRestockNotify.service');
-            if (isRestockTransition(prevQty, nextQty, trackInventory !== false)) {
+            if (isRestockTransition(prevQty, nextQty, trackInventory !== false, {
+              minimumOrderQuantity: variant.minimumOrderQuantity
+            })) {
               restockNotifyEvents.push({
                 productId: doc._id,
                 variantId: variant._id,

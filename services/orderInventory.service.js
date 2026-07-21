@@ -102,7 +102,9 @@ async function releaseReservedInventoryForLines(lines, session = null) {
             isRestockTransition,
             scheduleRestockNotifications
           } = require('./oosRestockNotify.service');
-          if (isRestockTransition(prevQty, prevQty + qty, trackInventory)) {
+          if (isRestockTransition(prevQty, prevQty + qty, trackInventory, {
+            minimumOrderQuantity: variant.minimumOrderQuantity
+          })) {
             scheduleRestockNotifications({
               productId: pid,
               variantId: vid,

@@ -2,10 +2,18 @@
  * Email / phone validation for out-of-stock inquiries (server).
  * Mirrors frontend/offer/src/utils/oosInquiryValidation.js
  * Both email and phone are required.
+ *
+ * Waitlist eligibility:
+ * - ecomm: true OOS only (qty <= 0)
+ * - wholesale: OUT_OF_STOCK or MOQ_UNMET (same as storefrontCatalog availability)
  */
+
+const { getVariantAvailability } = require('./storefrontCatalog');
 
 const EMAIL_RE =
   /^[a-zA-Z0-9](?:[a-zA-Z0-9._%+-]{0,62}[a-zA-Z0-9])?@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z]{2,})+$/;
+
+const INQUIRY_REASONS = ['out_of_stock', 'moq_unmet'];
 
 function normalizeInquiryPhone(raw) {
   let digits = String(raw || '').replace(/\D/g, '');
@@ -81,10 +89,40 @@ function isVariantOutOfStock(variant) {
   return Number(inv.quantity || 0) <= 0;
 }
 
+/**
+ * Whether a customer may join the OOS / MOQ waitlist for this storefront.
+ * Ecomm behaviour unchanged: only true out-of-stock (qty <= 0).
+ *
+ * @param {object|null|undefined} variant
+ * @param {'ecomm'|'wholesale'|string} storefront
+ * @returns {{ eligible: boolean, reason: 'out_of_stock'|'moq_unmet'|null }}
+ */
+function resolveInquiryWaitlistEligibility(variant, storefront) {
+  const sf = String(storefront || '').toLowerCase().trim() === 'wholesale' ? 'wholesale' : 'ecomm';
+
+  if (sf === 'ecomm') {
+    if (!isVariantOutOfStock(variant)) {
+      return { eligible: false, reason: null };
+    }
+    return { eligible: true, reason: 'out_of_stock' };
+  }
+
+  const avail = getVariantAvailability(variant, 'wholesale');
+  if (avail.status === 'OUT_OF_STOCK') {
+    return { eligible: true, reason: 'out_of_stock' };
+  }
+  if (avail.status === 'MOQ_UNMET') {
+    return { eligible: true, reason: 'moq_unmet' };
+  }
+  return { eligible: false, reason: null };
+}
+
 module.exports = {
+  INQUIRY_REASONS,
   normalizeInquiryPhone,
   isValidInquiryEmail,
   isValidInquiryPhone,
   validateInquiryContact,
   isVariantOutOfStock,
+  resolveInquiryWaitlistEligibility,
 };

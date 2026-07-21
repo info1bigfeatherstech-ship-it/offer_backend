@@ -1,13 +1,14 @@
 /**
- * Admin approval workflow (Phase 2): confirm pending orders for fulfilment, or cancel and restore stock.
- * Inventory is adjusted only at checkout (reserve) and on admin cancel (release) — never on confirm.
+ * Admin approval workflow: confirm pending orders for fulfilment, or cancel and restore stock.
+ * Stock: reserve @ checkout; commit @ confirm (COD) or @ payment capture (online);
+ * release @ admin cancel while still held.
  */
 
 const mongoose = require('mongoose');
 const Razorpay = require('razorpay');
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
-const { releaseReservedInventoryForOrder } = require('./orderInventory.service');
+const { releaseOrderStockHold, commitOrderStockHold } = require('./orderStockBridge.service');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { ensureShipmentForOrderExport } = require('../controllers/order.controller');
 const { mergeReturnInfo } = require('./rtoRefund.service');
@@ -163,6 +164,23 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
     order.paymentInfo = order.paymentInfo || {};
     order.paymentInfo.adminConfirmedAt = new Date();
     order.markModified('paymentInfo');
+
+    // COD (and any still-held) stock: convert inventory hold → sold on admin confirm.
+    try {
+      const commitRes = await commitOrderStockHold(order);
+      if (!commitRes.ok && !commitRes.skipped) {
+        logger.error('[adminOrderApproval] inventory commit failed on confirm', {
+          orderId: order.orderId,
+          result: commitRes
+        });
+      }
+    } catch (commitErr) {
+      logger.error('[adminOrderApproval] inventory commit threw on confirm', {
+        orderId: order.orderId,
+        message: commitErr?.message || String(commitErr)
+      });
+    }
+
     await order.save();
 
     const shipmentResult = await ensureShipmentForOrderExport({
@@ -300,7 +318,8 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
     order.markModified('returnInfo');
 
     await order.save({ session });
-    await releaseReservedInventoryForOrder(order, session);
+    await releaseOrderStockHold(order, session);
+    await order.save({ session });
 
     await session.commitTransaction();
     session.endSession();
