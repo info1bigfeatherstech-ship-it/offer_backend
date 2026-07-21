@@ -30,14 +30,30 @@ function withEnv(vars, fn) {
   }
 }
 
-function testAmazonSurfaceInactiveByDefault() {
+function testNoDefaultNameBlocksWhenEnvUnset() {
   withEnv({ SHIPROCKET_INACTIVE_COURIER_NAME_PATTERNS: null, SHIPROCKET_INACTIVE_COURIER_IDS: '' }, () => {
     assert.strictEqual(
-      isCourierInactive({ courier_name: 'Amazon Prepaid Surface 500g', courier_company_id: 999 }),
-      true
+      isCourierInactive({ courier_name: 'Amazon Shipping Surface 5kg', courier_company_id: 4 }),
+      false
     );
     assert.strictEqual(isCourierInactive({ courier_name: 'Delhivery Surface', courier_company_id: 1 }), false);
   });
+}
+
+function testNamePatternBlockOnlyWhenEnvSet() {
+  withEnv(
+    {
+      SHIPROCKET_INACTIVE_COURIER_NAME_PATTERNS: 'Amazon Prepaid Surface|Amazon.*Surface',
+      SHIPROCKET_INACTIVE_COURIER_IDS: ''
+    },
+    () => {
+      assert.strictEqual(
+        isCourierInactive({ courier_name: 'Amazon Prepaid Surface 500g', courier_company_id: 999 }),
+        true
+      );
+      assert.strictEqual(isCourierInactive({ courier_name: 'Delhivery Surface', courier_company_id: 1 }), false);
+    }
+  );
 }
 
 function testInactiveById() {
@@ -73,7 +89,8 @@ function testSubstituteNote() {
 }
 
 function run() {
-  testAmazonSurfaceInactiveByDefault();
+  testNoDefaultNameBlocksWhenEnvUnset();
+  testNamePatternBlockOnlyWhenEnvSet();
   testInactiveById();
   testPickCheapestSkipsInactive();
   testSubstituteNote();
