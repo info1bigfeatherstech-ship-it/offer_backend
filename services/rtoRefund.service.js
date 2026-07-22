@@ -351,7 +351,14 @@ function collectRtoStatusTexts(order) {
     push(ev['sr-status']);
     push(ev.activity);
     push(ev.message);
+    push(ev.description);
     push(ev.status_code);
+    const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
+    if (raw) {
+      push(raw.sr_status_label);
+      push(raw.status);
+      push(raw.activity);
+    }
   }
   return texts;
 }
@@ -396,7 +403,78 @@ function ensureRtoWarehouseDeliveredLatch(order) {
 }
 
 /**
- * Admin Reason column — never echo raw Shiprocket status labels.
+ * Logistics / scan noise — not an RTO fault reason (e.g. "Data Received").
+ * @param {string|null|undefined} text
+ */
+function isRtoReasonNoise(text) {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t) return true;
+  if (t.length < 8) return true;
+  if (
+    /^(data received|manifested|shipment created|awb assigned|label generated|out for pickup|picked up|in transit|reached destination hub|bag received|out for delivery|rto initiated|rto acknowledged|rto in[- ]?transit)$/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/data received|item assigned for seller|bag received at|manifested\s*-|pickup scheduled|srpid-/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Prefer real NDR / customer-courier fault copy over scan noise.
+ * @param {string|null|undefined} text
+ */
+function isLikelyNdrFaultReason(text) {
+  const t = String(text || '').trim();
+  if (!t || isLikelyRtoStatusLabel(t) || isRtoReasonNoise(t)) return false;
+  if (CUSTOMER_RTO_REASON_RE.test(t) || COURIER_RTO_REASON_RE.test(t)) return true;
+  // Sentence-like carrier remarks under NDR attempts
+  if (/customer|consignee|address|attempt|refused|unavailable|not reachable|wrong|incomplete/i.test(t) && t.length >= 12) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @param {object} ev
+ * @returns {string[]}
+ */
+function collectEventReasonCandidates(ev) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v || '').trim();
+    if (s) out.push(s);
+  };
+  if (!ev || typeof ev !== 'object') return out;
+  push(ev.reason);
+  push(ev.rto_reason);
+  push(ev.ndr_reason);
+  push(ev.remarks);
+  push(ev.comment);
+  push(ev.status_code_description);
+  push(ev.description);
+  push(ev.activity);
+  push(ev.message);
+  const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
+  if (raw) {
+    push(raw.reason);
+    push(raw.ndr_reason);
+    push(raw.rto_reason);
+    push(raw.remarks);
+    push(raw.comment);
+    push(raw.status_code_description);
+    push(raw.activity);
+    push(raw.message);
+  }
+  return out;
+}
+
+/**
+ * Admin Reason column — prefer Shiprocket NDR / undelivered fault text; never echo
+ * status labels or logistics noise like "Data Received".
  * @param {import('mongoose').Document|object} order
  * @returns {string}
  */
@@ -404,27 +482,42 @@ function resolveRtoDisplayReason(order) {
   const ri = order?.returnInfo || {};
   const providerStatus = order?.shipmentInfo?.providerStatus || null;
 
-  const tryText = (v) => {
+  const tryFault = (v) => {
     const s = String(v || '').trim();
-    if (!s || isLikelyRtoStatusLabel(s)) return null;
+    if (!s || isLikelyRtoStatusLabel(s) || isRtoReasonNoise(s)) return null;
     return s;
   };
 
-  const fromStored = tryText(ri.rtoShiprocketReason);
-  if (fromStored) return fromStored;
+  const fromStored = tryFault(ri.rtoShiprocketReason);
+  if (fromStored && isLikelyNdrFaultReason(fromStored)) return fromStored;
 
   const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+  const ndrFaults = [];
+  const otherFaults = [];
+
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i] || {};
-    const candidate =
-      tryText(ev.reason) ||
-      tryText(ev.rto_reason) ||
-      tryText(ev.remarks) ||
-      tryText(ev.comment) ||
-      tryText(ev.status_code_description) ||
-      tryText(ev.description);
-    if (candidate) return candidate;
+    const statusBlob = [ev.status, ev.description, ev.activity, ev.message, ev.ndrStatus]
+      .map((x) => String(x || ''))
+      .join(' ');
+    const isNdrContext = /ndr|undelivered|rto initiated|delivery failed|attempt/i.test(statusBlob);
+
+    for (const candidate of collectEventReasonCandidates(ev)) {
+      const fault = tryFault(candidate);
+      if (!fault) continue;
+      if (isLikelyNdrFaultReason(fault) || isNdrContext) {
+        if (isLikelyNdrFaultReason(fault)) ndrFaults.push(fault);
+        else if (isNdrContext && fault.length >= 12) ndrFaults.push(fault);
+        else otherFaults.push(fault);
+      } else if (fault.length >= 16 && !isRtoReasonNoise(fault)) {
+        otherFaults.push(fault);
+      }
+    }
   }
+
+  if (ndrFaults.length) return ndrFaults[0];
+  if (fromStored) return fromStored;
+  if (otherFaults.length) return otherFaults[0];
 
   const cat =
     ri.rtoReasonCategory ||
@@ -432,6 +525,49 @@ function resolveRtoDisplayReason(order) {
   if (cat === 'customer') return 'Customer-related RTO';
   if (cat === 'courier') return 'Courier / logistics related RTO';
   return 'Reason not provided by carrier';
+}
+
+/**
+ * After Shiprocket tracking sync: latch warehouse Delivered + persist best NDR reason.
+ * Safe to call on lean or mongoose docs; mutates returnInfo when needed.
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean} whether returnInfo changed
+ */
+function persistRtoTrackingInsights(order) {
+  if (!order) return false;
+  let changed = ensureRtoWarehouseDeliveredLatch(order);
+
+  const display = resolveRtoDisplayReason(order);
+  const usable =
+    display &&
+    display !== 'Reason not provided by carrier' &&
+    display !== 'Customer-related RTO' &&
+    display !== 'Courier / logistics related RTO' &&
+    !isLikelyRtoStatusLabel(display) &&
+    !isRtoReasonNoise(display);
+
+  if (usable) {
+    if (!order.returnInfo) order.returnInfo = {};
+    const prev = String(order.returnInfo.rtoShiprocketReason || '').trim();
+    const shouldReplace =
+      !prev || isLikelyRtoStatusLabel(prev) || isRtoReasonNoise(prev) || !isLikelyNdrFaultReason(prev);
+    if (shouldReplace && prev !== display) {
+      order.returnInfo.rtoShiprocketReason = display;
+      changed = true;
+    }
+    const cat = classifyRtoReasonCategory(
+      shouldReplace && prev !== display ? display : prev || display
+    );
+    if (cat !== 'unknown' && order.returnInfo.rtoReasonCategory !== cat) {
+      order.returnInfo.rtoReasonCategory = cat;
+      changed = true;
+    }
+  }
+
+  if (changed && typeof order.markModified === 'function') {
+    order.markModified('returnInfo');
+  }
+  return changed;
 }
 
 /**
@@ -628,6 +764,7 @@ module.exports = {
   isRtoDeliveredToWarehouse,
   isRtoWarehouseDeliveredForOrder,
   ensureRtoWarehouseDeliveredLatch,
+  persistRtoTrackingInsights,
   resolveRtoDisplayReason,
   isLikelyRtoStatusLabel,
   classifyRtoPaymentType,

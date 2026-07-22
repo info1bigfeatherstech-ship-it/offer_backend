@@ -7,7 +7,7 @@ const Order = require('../models/Order');
 const { buildRtoBucketMatch } = require('../constants/rtoOrderQuery');
 const {
   isRtoWarehouseDeliveredForOrder,
-  ensureRtoWarehouseDeliveredLatch,
+  persistRtoTrackingInsights,
   RTO_WAREHOUSE_DELIVERED_REGEX,
 } = require('./rtoRefund.service');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
@@ -172,7 +172,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
   }
 
   if (isRtoWarehouseDeliveredForOrder(order)) {
-    if (ensureRtoWarehouseDeliveredLatch(order)) {
+    if (persistRtoTrackingInsights(order)) {
       try {
         await order.save();
       } catch (_) {
@@ -191,6 +191,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
 
   const previousProviderStatus = String(order.shipmentInfo?.providerStatus || '');
   const previousOrderStatus = String(order.orderStatus || '').toLowerCase();
+  const previousLatch = Boolean(order.returnInfo?.rtoWarehouseDeliveredAt);
 
   const reconcileResult = await reconcileOrderFromShiprocket(order, {
     source,
@@ -210,29 +211,36 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
   }
 
   const fresh = await Order.findOne({ orderId: id });
-  if (fresh && ensureRtoWarehouseDeliveredLatch(fresh)) {
+  let insightsChanged = false;
+  if (fresh && persistRtoTrackingInsights(fresh)) {
+    insightsChanged = true;
     try {
       await fresh.save();
     } catch (_) {
-      /* non-blocking latch */
+      /* non-blocking latch / reason */
     }
   }
 
   const currentProviderStatus = String(fresh?.shipmentInfo?.providerStatus || '');
   const currentOrderStatus = String(fresh?.orderStatus || '').toLowerCase();
+  const currentLatch = Boolean(fresh?.returnInfo?.rtoWarehouseDeliveredAt);
 
   return {
     orderId: id,
     success: true,
     updated:
       currentProviderStatus !== previousProviderStatus ||
-      currentOrderStatus !== previousOrderStatus,
+      currentOrderStatus !== previousOrderStatus ||
+      insightsChanged ||
+      currentLatch !== previousLatch,
     skipped: false,
     previousProviderStatus,
     currentProviderStatus,
     previousOrderStatus,
     currentOrderStatus,
-    warehouseDelivered: isRtoWarehouseDeliveredForOrder(fresh || { shipmentInfo: { providerStatus: currentProviderStatus } }),
+    warehouseDelivered: isRtoWarehouseDeliveredForOrder(
+      fresh || { shipmentInfo: { providerStatus: currentProviderStatus } }
+    ),
   };
 }
 

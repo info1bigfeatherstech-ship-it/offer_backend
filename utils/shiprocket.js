@@ -679,14 +679,27 @@ class ShiprocketService {
     const shipmentTrackItem = Array.isArray(shipmentTrack) ? shipmentTrack[0] : shipmentTrack;
     const activities = root?.shipment_track_activities || root?.activities || [];
     const events = Array.isArray(activities)
-      ? activities.map((entry) => ({
-          status: entry?.sr_status_label || entry?.status || entry?.activity || entry?.message || null,
-          code: entry?.sr_status || entry?.status_code || null,
-          location: entry?.location || entry?.city || null,
-          description: entry?.activity || entry?.message || entry?.status || null,
-          at: entry?.date || entry?.datetime || entry?.time || null,
-          raw: entry
-        }))
+      ? activities.map((entry) => {
+          const reason =
+            entry?.reason ||
+            entry?.ndr_reason ||
+            entry?.rto_reason ||
+            entry?.status_code_description ||
+            entry?.remarks ||
+            entry?.comment ||
+            null;
+          return {
+            status: entry?.sr_status_label || entry?.status || entry?.activity || entry?.message || null,
+            code: entry?.sr_status || entry?.status_code || null,
+            location: entry?.location || entry?.city || null,
+            description: entry?.activity || entry?.message || entry?.status || null,
+            reason: reason != null ? String(reason).trim() || null : null,
+            remarks: entry?.remarks || entry?.comment || null,
+            ndrStatus: entry?.ndr_status || entry?.ndrStatus || null,
+            at: entry?.date || entry?.datetime || entry?.time || null,
+            raw: entry
+          };
+        })
       : [];
 
     return {

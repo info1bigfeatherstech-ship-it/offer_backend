@@ -464,6 +464,24 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
     await evaluateAndPersistShipmentOps(order, { source });
   }
 
+  order = await Order.findOne({ orderId: order.orderId });
+  if (order) {
+    const ps = String(order.shipmentInfo?.providerStatus || '');
+    const isRtoish =
+      String(order.orderStatus || '').toLowerCase() === 'rto' ||
+      /\brto\b|return to origin/i.test(ps);
+    if (isRtoish) {
+      const { persistRtoTrackingInsights } = require('./rtoRefund.service');
+      if (persistRtoTrackingInsights(order)) {
+        try {
+          await order.save();
+        } catch (_) {
+          /* non-blocking RTO insights */
+        }
+      }
+    }
+  }
+
   const ops = order ? buildShipmentOpsView(order, { source }) : null;
 
   return {
