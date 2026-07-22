@@ -10,21 +10,19 @@ const userSchema = new mongoose.Schema(
       trim: true
     },
     
+    /**
+     * Unique via partial index below — NOT field-level unique/sparse.
+     * Sparse unique still indexes `null` and allows only one phone-only user.
+     */
     email: {
       type: String,
       lowercase: true,
-      trim: true,
-      index: true,
-      unique: true,
-      sparse: true
+      trim: true
     },
 
     phone: {
       type: String,
-      trim: true,
-      index: true,
-      unique: true,
-      sparse: true
+      trim: true
     },
 
     // ===== PASSWORD =====
@@ -35,10 +33,9 @@ const userSchema = new mongoose.Schema(
     },
 
     // ===== GOOGLE AUTH =====
+    /** Unique via partial index — omit when unset (never store null). */
     googleId: {
-      type: String,
-      index: true,
-      sparse: true
+      type: String
     },
 
     // =====  REFRESH TOKEN STORAGE =====
@@ -201,8 +198,49 @@ const userSchema = new mongoose.Schema(
 );
 
 // ================= INDEXES =================
+// Partial unique: many users may omit email/phone; only real non-empty values collide.
+userSchema.index(
+  { email: 1 },
+  {
+    unique: true,
+    name: 'email_unique_partial',
+    partialFilterExpression: { email: { $type: 'string', $gt: '' } }
+  }
+);
+userSchema.index(
+  { phone: 1 },
+  {
+    unique: true,
+    name: 'phone_unique_partial',
+    partialFilterExpression: { phone: { $type: 'string', $gt: '' } }
+  }
+);
+userSchema.index(
+  { googleId: 1 },
+  {
+    unique: true,
+    name: 'googleId_unique_partial',
+    partialFilterExpression: { googleId: { $type: 'string', $gt: '' } }
+  }
+);
 userSchema.index({ email: 1, phone: 1 }); // Compound index for login lookup
 userSchema.index({ registrationMethod: 1 });
+
+/**
+ * Never persist empty/null on unique contact fields — otherwise a legacy
+ * unique/sparse `email_1` (or BSON null) blocks the 2nd phone-only register.
+ */
+userSchema.pre('save', function clearEmptyUniqueContacts() {
+  for (const path of ['email', 'phone', 'googleId']) {
+    const val = this.get(path);
+    if (val == null || (typeof val === 'string' && !String(val).trim())) {
+      this.set(path, undefined);
+      if (this._doc && Object.prototype.hasOwnProperty.call(this._doc, path)) {
+        delete this._doc[path];
+      }
+    }
+  }
+});
 
 // ================= PASSWORD HASH =================
 userSchema.pre("save", async function () {
