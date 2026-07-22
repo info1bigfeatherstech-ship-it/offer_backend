@@ -2,6 +2,10 @@
  * Admin order storefront scope helpers.
  * Used by admin orders / RTO / returns / fulfillment / pending-edit.
  *
+ * Scope is by **order.storefront** (which store the order was placed on), not by
+ * account userType. Wholesaler accounts can place on ecomm — those orders must
+ * still appear in the ecomm admin Orders panel.
+ *
  * Ecomm safety: legacy orders may omit `storefront` — treat missing/null as ecomm
  * when scope is ecomm. Wholesale always requires explicit storefront=wholesale.
  */
@@ -14,12 +18,13 @@ function buildOrderMatchForStorefront(storefront) {
   const sf = String(storefront || 'ecomm').toLowerCase().trim() === 'wholesale' ? 'wholesale' : 'ecomm';
 
   if (sf === 'wholesale') {
-    return { userType: 'wholesaler', storefront: 'wholesale' };
+    return { storefront: 'wholesale' };
   }
 
   // Ecomm + legacy docs without storefront field (pre-multi-storefront).
+  // Do not require userType=normal — wholesaler accounts shopping ecomm create
+  // storefront=ecomm orders that must remain visible in the ecomm admin panel.
   return {
-    userType: 'normal',
     $or: [{ storefront: 'ecomm' }, { storefront: { $exists: false } }, { storefront: null }]
   };
 }
@@ -79,7 +84,6 @@ function orderMatchesAdminScope(order, reqOrStorefront) {
       ? reqOrStorefront
       : getAdminStorefrontLabel(reqOrStorefront);
 
-  const userType = String(order.userType || '').toLowerCase();
   const orderSfRaw = order.storefront;
   const orderSf =
     orderSfRaw == null || String(orderSfRaw).trim() === ''
@@ -87,11 +91,10 @@ function orderMatchesAdminScope(order, reqOrStorefront) {
       : String(orderSfRaw).toLowerCase().trim();
 
   if (storefront === 'wholesale') {
-    return userType === 'wholesaler' && orderSf === 'wholesale';
+    return orderSf === 'wholesale';
   }
 
-  // ecomm
-  if (userType !== 'normal') return false;
+  // ecomm (incl. legacy missing storefront) — any userType shopping that storefront
   return orderSf === null || orderSf === 'ecomm';
 }
 
