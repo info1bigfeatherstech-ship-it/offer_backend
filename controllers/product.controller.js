@@ -3,7 +3,7 @@ const Category = require('../models/Category');
 const ProductTag = require('../models/ProductTag');
 const mongoose = require('mongoose');
 const slugify = require('slugify');
-const { generateSlug, generateSku } = require('../utils/productUtils');
+const { generateSlug, resolveVariantSku, assertSkuAvailable } = require('../utils/productUtils');
 const {
   uploadToCloudinary,
   deleteFromCloudinary,
@@ -1094,13 +1094,40 @@ const createProduct = async (req, res) => {
     // =============================
     // PROCESS EACH VARIANT
     // =============================
+    const usedSkusInRequest = new Set();
     for (let i = 0; i < variantsInput.length; i++) {
       const v = variantsInput[i];
 
       const productCode = normalizeProductCode(v.productCode);
+      if (!productCode) {
+        return res.status(400).json({
+          success: false,
+          message: `productCode is required for variant ${i}`
+        });
+      }
 
-      // AUTO GENERATE SKU
-      const skuVal = await generateSku();
+      // SKU from productCode (same rule as bulk): SKU-{productCode}
+      let skuVal;
+      try {
+        skuVal = resolveVariantSku({
+          productCode,
+          explicitSku: v.sku
+        });
+        if (usedSkusInRequest.has(skuVal)) {
+          return res.status(400).json({
+            success: false,
+            message: `Duplicate SKU in request: ${skuVal}`
+          });
+        }
+        usedSkusInRequest.add(skuVal);
+        await assertSkuAvailable(skuVal);
+      } catch (skuErr) {
+        return res.status(skuErr.statusCode || 400).json({
+          success: false,
+          code: skuErr.code || 'SKU_ERROR',
+          message: skuErr.message || 'Could not resolve SKU for variant'
+        });
+      }
 
       // Wholesale flag
       const wholesale = !!v.wholesale;
@@ -2352,7 +2379,7 @@ async function buildVariantWithValidation(row, productName, options = {}) {
   const productCode = parsedCode.normalized;
   
   const variantDoc = {
-    sku: row.sku || `SKU-${productCode}`,
+    sku: resolveVariantSku({ productCode, explicitSku: row.sku }),
     productCode,
     wholesale,
     attributes: variantAttributes,
@@ -3110,7 +3137,7 @@ async function buildCompleteVariant(row, productName, images, options = {}) {
   };
   
   const variantAttributes = parseAttributes(row.variantAttributes);
-  const sku = row.sku?.trim() || `SKU-${productCode}`;
+  const sku = resolveVariantSku({ productCode, explicitSku: row.sku });
   const wholesaleEligible = wholesaleCfg.wholesaleEligible;
 
   const variantDoc = {
@@ -6172,9 +6199,22 @@ const addVariant = async (req, res) => {
     }
 
     // =========================
-    // 🔥 AUTO GENERATE SKU
+    // SKU from productCode (same rule as bulk): SKU-{productCode}
     // =========================
-    const skuVal = await generateSku();
+    let skuVal;
+    try {
+      skuVal = resolveVariantSku({
+        productCode: productCodeNormalized,
+        explicitSku: variant.sku
+      });
+      await assertSkuAvailable(skuVal);
+    } catch (skuErr) {
+      return res.status(skuErr.statusCode || 400).json({
+        success: false,
+        code: skuErr.code || 'SKU_ERROR',
+        message: skuErr.message || 'Could not resolve SKU for variant'
+      });
+    }
 
     // =========================
     // 📸 IMAGE UPLOAD
