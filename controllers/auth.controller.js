@@ -514,6 +514,8 @@ const register = async (req, res) => {
       });
     }
 
+    const { email, password, name, phone } = req.body;
+
     const normalizedEmail = String(email || '').trim().toLowerCase();
     const normalizedPhone = String(phone || '').trim();
 
