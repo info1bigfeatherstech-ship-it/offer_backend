@@ -529,11 +529,21 @@ async function upsertShipmentInfo({
     nextShipmentInfo.lastError = null;
 
     if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'events')) {
-        nextShipmentInfo.rawEvents = Array.isArray(shipmentPayload.events)
-            ? shipmentPayload.events.slice(0, 50)
-            : [];
+        const incoming = Array.isArray(shipmentPayload.events) ? shipmentPayload.events : [];
+        const previous = Array.isArray(order.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+        // Empty tracking payload must not wipe prior RTO Delivered / NDR history.
+        if (incoming.length === 0 && previous.length > 0) {
+            nextShipmentInfo.rawEvents = previous;
+        } else if (shipmentPayload.replaceEvents === true) {
+            nextShipmentInfo.rawEvents = incoming.slice(0, 80);
+        } else {
+            const { mergeShipmentTrackingEvents } = require('../services/shipmentOps/trackingEventsMerge');
+            nextShipmentInfo.rawEvents = mergeShipmentTrackingEvents(previous, incoming, 80);
+        }
     } else if (Array.isArray(shipmentPayload.events) && shipmentPayload.events.length > 0) {
-        nextShipmentInfo.rawEvents = shipmentPayload.events.slice(0, 50);
+        const { mergeShipmentTrackingEvents } = require('../services/shipmentOps/trackingEventsMerge');
+        const previous = Array.isArray(order.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+        nextShipmentInfo.rawEvents = mergeShipmentTrackingEvents(previous, shipmentPayload.events, 80);
     }
 
     if (allowOrderStatusUpdate) {

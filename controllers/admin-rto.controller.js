@@ -18,6 +18,7 @@ const {
   mapShiprocketRtoStage,
   isRtoWarehouseDeliveredForOrder,
   ensureRtoWarehouseDeliveredLatch,
+  persistRtoTrackingInsights,
   resolveRtoDisplayReason,
   classifyRtoPaymentType,
   deriveRefundTrackStatus,
@@ -420,6 +421,7 @@ exports.getRtoOrders = async (req, res) => {
     const repairIds = [];
     const syncSets = [];
     const pendingInitIds = [];
+    const insightSets = [];
 
     for (const doc of orders) {
       if (repairOrderStatusForShiprocketRto(doc)) repairIds.push(doc._id);
@@ -434,6 +436,23 @@ exports.getRtoOrders = async (req, res) => {
         if (Object.keys($set).length) syncSets.push({ _id: doc._id, $set });
       }
 
+      // Latch Delivered from tracking history + persist NDR reason (no Shiprocket call here).
+      const insightLive = { ...doc, returnInfo: { ...(doc.returnInfo || {}) }, shipmentInfo: doc.shipmentInfo };
+      if (persistRtoTrackingInsights(insightLive)) {
+        doc.returnInfo = insightLive.returnInfo;
+        const $set = {};
+        if (insightLive.returnInfo.rtoWarehouseDeliveredAt) {
+          $set['returnInfo.rtoWarehouseDeliveredAt'] = insightLive.returnInfo.rtoWarehouseDeliveredAt;
+        }
+        if (insightLive.returnInfo.rtoShiprocketReason != null) {
+          $set['returnInfo.rtoShiprocketReason'] = insightLive.returnInfo.rtoShiprocketReason;
+        }
+        if (insightLive.returnInfo.rtoReasonCategory != null) {
+          $set['returnInfo.rtoReasonCategory'] = insightLive.returnInfo.rtoReasonCategory;
+        }
+        if (Object.keys($set).length) insightSets.push({ _id: doc._id, $set });
+      }
+
       if (!doc.returnInfo?.rtoStatus) {
         doc.returnInfo = { ...(doc.returnInfo || {}), rtoStatus: 'pending' };
         if (!beforeStatus) pendingInitIds.push(doc._id);
@@ -444,6 +463,9 @@ exports.getRtoOrders = async (req, res) => {
       await Order.updateMany({ _id: { $in: repairIds } }, { $set: { orderStatus: 'rto' } });
     }
     for (const row of syncSets) {
+      await Order.updateOne({ _id: row._id }, { $set: row.$set });
+    }
+    for (const row of insightSets) {
       await Order.updateOne({ _id: row._id }, { $set: row.$set });
     }
     if (pendingInitIds.length) {
@@ -551,7 +573,7 @@ exports.processRtoRefund = async (req, res) => {
         'Refund is available only after Shiprocket reports RTO Delivered to warehouse.'
       );
     }
-    ensureRtoWarehouseDeliveredLatch(order);
+    persistRtoTrackingInsights(order);
 
     if (!order.paymentInfo?.razorpayPaymentId) {
       throw createHttpError(400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment on this order');
