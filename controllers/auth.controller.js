@@ -10,6 +10,7 @@ const bcrypt = require('bcrypt');
 const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront-scope.middleware');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
+const { setOrUnsetUniqueString } = require('../utils/optionalUniqueContact');
 
 // Import from OTP service
 const {
@@ -574,7 +575,7 @@ const register = async (req, res) => {
     });
 
     user.name = name;
-    user.email = normalizedEmail || undefined;
+    setOrUnsetUniqueString(user, 'email', normalizedEmail);
     user.phone = normalizedPhone;
     user.password = password;
     user.userType = user.userType || 'user';
