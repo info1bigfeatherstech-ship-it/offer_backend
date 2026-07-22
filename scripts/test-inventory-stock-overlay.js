@@ -96,8 +96,32 @@ function testDegradedKeepsMongo() {
   console.log('✓ degraded keeps Mongo quantity');
 }
 
+function testAnnotatePreservesMongoQuantity() {
+  const product = {
+    variants: [
+      { productCode: '34354-1', inventory: { quantity: 100, trackInventory: true } },
+      { productCode: 'MISSING-1', inventory: { quantity: 7, trackInventory: true } }
+    ]
+  };
+  const result = applyStockMapToProducts(
+    [product],
+    new Map([['34354-1', 3]]),
+    new Set(['MISSING-1']),
+    { mode: 'annotate', degraded: false }
+  );
+  assert.strictEqual(product.variants[0].inventory.quantity, 100, 'Mongo qty unchanged');
+  assert.strictEqual(product.variants[0].inventory.liveQuantity, 3);
+  assert.strictEqual(product.variants[0].inventory.stockSource, 'inventory');
+  assert.strictEqual(product.variants[1].inventory.quantity, 7);
+  assert.strictEqual(product.variants[1].inventory.liveQuantity, null);
+  assert.strictEqual(product.liveTotalStock, 3);
+  assert.strictEqual(result.applied, 1);
+  console.log('✓ annotate mode preserves Mongo + sets liveQuantity');
+}
+
 testNormalize();
 testParseStockMap();
 testOverlayAppliesPerVariant();
 testDegradedKeepsMongo();
+testAnnotatePreservesMongoQuantity();
 console.log('\nAll Phase-1 overlay unit checks passed.');

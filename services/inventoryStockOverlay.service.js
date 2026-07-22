@@ -3,6 +3,10 @@
  * Does NOT persist to Mongo. Missing codes / API degrade → keep Mongo qty.
  *
  * Variant-level only — never sums stocks across variants.
+ *
+ * Modes:
+ * - replace (default): storefront — set inventory.quantity from inventory software
+ * - annotate: admin — keep inventory.quantity (Mongo); set inventory.liveQuantity
  */
 
 const logger = require('../utils/logger');
@@ -67,8 +71,24 @@ function recomputeProductTotalStock(product) {
   }, 0);
 }
 
+function recomputeProductLiveTotalStock(product) {
+  if (!product || typeof product !== 'object') return;
+  const variants = Array.isArray(product.variants) ? product.variants : [];
+  let sum = 0;
+  let any = false;
+  for (const v of variants) {
+    const live = v?.inventory?.liveQuantity;
+    if (live == null || !Number.isFinite(Number(live))) continue;
+    any = true;
+    if (v?.inventory?.trackInventory === false) continue;
+    sum += Number(live);
+  }
+  product.liveTotalStock = any ? sum : null;
+}
+
 /**
  * Apply batch result onto product variants (mutates in place).
+ * @param {'replace'|'annotate'} [meta.mode='replace']
  * @returns {{ applied: number, fallback: number, degraded: boolean, reason: string|null }}
  */
 function applyStockMapToProducts(products, stockMap, missingSet, meta = {}) {
@@ -76,6 +96,7 @@ function applyStockMapToProducts(products, stockMap, missingSet, meta = {}) {
   let fallback = 0;
   const storefront = meta.storefront || null;
   const degraded = Boolean(meta.degraded);
+  const mode = meta.mode === 'annotate' ? 'annotate' : 'replace';
 
   for (const product of asProductList(products)) {
     const variants = Array.isArray(product?.variants) ? product.variants : [];
@@ -85,25 +106,33 @@ function applyStockMapToProducts(products, stockMap, missingSet, meta = {}) {
 
       if (!code) {
         inv.stockSource = 'mongo_fallback';
+        if (mode === 'annotate') inv.liveQuantity = null;
         fallback += 1;
-        recomputeVariantAvailability(variant, storefront);
+        if (mode === 'replace') recomputeVariantAvailability(variant, storefront);
         continue;
       }
 
       if (!degraded && stockMap.has(code)) {
-        inv.quantity = stockMap.get(code);
-        inv.stockSource = 'inventory';
+        const liveQty = stockMap.get(code);
+        if (mode === 'annotate') {
+          // Admin: never overwrite Mongo quantity
+          inv.liveQuantity = liveQty;
+          inv.stockSource = 'inventory';
+        } else {
+          inv.quantity = liveQty;
+          inv.stockSource = 'inventory';
+          recomputeVariantAvailability(variant, storefront);
+        }
         applied += 1;
       } else {
         inv.stockSource = degraded ? 'mongo_fallback_degraded' : 'mongo_fallback';
+        if (mode === 'annotate') inv.liveQuantity = null;
         fallback += 1;
-        if (!degraded && missingSet.has(code)) {
-          // intentional miss — keep quiet at debug; warn once per request via meta
-        }
+        if (mode === 'replace') recomputeVariantAvailability(variant, storefront);
       }
-      recomputeVariantAvailability(variant, storefront);
     }
-    recomputeProductTotalStock(product);
+    if (mode === 'replace') recomputeProductTotalStock(product);
+    if (mode === 'annotate') recomputeProductLiveTotalStock(product);
   }
 
   return {
@@ -119,7 +148,7 @@ function applyStockMapToProducts(products, stockMap, missingSet, meta = {}) {
  * Always safe: never throws; on failure leaves Mongo quantities.
  *
  * @param {object|object[]} products plain objects or mongoose docs with .variants
- * @param {{ storefront?: string, logContext?: string }} [opts]
+ * @param {{ storefront?: string, logContext?: string, mode?: 'replace'|'annotate' }} [opts]
  */
 async function overlayExternalStockOnProducts(products, opts = {}) {
   const list = asProductList(products);
@@ -127,18 +156,32 @@ async function overlayExternalStockOnProducts(products, opts = {}) {
     return { applied: 0, fallback: 0, degraded: false, reason: null };
   }
 
+  const mode = opts.mode === 'annotate' ? 'annotate' : 'replace';
+
   if (!isInventoryStockEnabled()) {
     for (const product of list) {
       const variants = Array.isArray(product?.variants) ? product.variants : [];
       for (const variant of variants) {
-        ensureInventoryObject(variant).stockSource = 'mongo';
+        const inv = ensureInventoryObject(variant);
+        inv.stockSource = 'mongo';
+        if (mode === 'annotate') inv.liveQuantity = null;
       }
+      if (mode === 'annotate') recomputeProductLiveTotalStock(product);
     }
     return { applied: 0, fallback: 0, degraded: false, reason: 'disabled' };
   }
 
   const codes = collectProductCodes(list);
   if (codes.length === 0) {
+    if (mode === 'annotate') {
+      for (const product of list) {
+        const variants = Array.isArray(product?.variants) ? product.variants : [];
+        for (const variant of variants) {
+          ensureInventoryObject(variant).liveQuantity = null;
+        }
+        recomputeProductLiveTotalStock(product);
+      }
+    }
     return { applied: 0, fallback: 0, degraded: false, reason: null };
   }
 
@@ -149,21 +192,31 @@ async function overlayExternalStockOnProducts(products, opts = {}) {
     logger.warn('[inventoryOverlay] degraded — using Mongo stock', {
       reason: batch.reason,
       codes: codes.length,
-      context: opts.logContext || null
+      context: opts.logContext || null,
+      mode
     });
   } else if (missingSet.size > 0) {
     logger.warn('[inventoryOverlay] productCodes missing in inventory — Mongo fallback', {
       missing: [...missingSet].slice(0, 20),
       missingCount: missingSet.size,
-      context: opts.logContext || null
+      context: opts.logContext || null,
+      mode
     });
   }
 
   return applyStockMapToProducts(list, batch.stock, missingSet, {
     storefront: opts.storefront,
     degraded: batch.degraded,
-    reason: batch.reason
+    reason: batch.reason,
+    mode
   });
+}
+
+/**
+ * Admin-safe: attach liveQuantity without changing Mongo quantity.
+ */
+async function annotateExternalStockOnProducts(products, opts = {}) {
+  return overlayExternalStockOnProducts(products, { ...opts, mode: 'annotate' });
 }
 
 /**
@@ -178,6 +231,7 @@ async function overlayExternalStockOnProduct(product, opts = {}) {
 module.exports = {
   overlayExternalStockOnProducts,
   overlayExternalStockOnProduct,
+  annotateExternalStockOnProducts,
   collectProductCodes,
   applyStockMapToProducts
 };

@@ -5993,6 +5993,17 @@ const getAllProductsAdmin = async (req, res) => {
       };
     });
 
+    // Admin: attach live inventory qty without overwriting Mongo quantity (production-safe).
+    try {
+      const { annotateExternalStockOnProducts } = require('../services/inventoryStockOverlay.service');
+      await annotateExternalStockOnProducts(finalProducts, {
+        storefront: 'ecomm',
+        logContext: 'getAllProductsAdmin'
+      });
+    } catch (overlayErr) {
+      console.warn('[getAllProductsAdmin] inventory annotate skipped', overlayErr?.message);
+    }
+
     return res.status(200).json({
       success: true,
       totalProducts,
