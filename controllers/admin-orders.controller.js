@@ -78,23 +78,33 @@ exports.getDashboardSummary = async (req, res) => {
 
 /**
  * GET /api/admin/orders
- * Query: from, to, presetDays, bucket, search, page, limit, sortBy, sortOrder
+ * Query: from, to, rangePreset, presetDays, bucket, search, page, limit, sortBy, sortOrder
+ *
+ * When `search` is non-empty: date window is ignored (all-time) and status bucket is skipped
+ * so order ID / AWB / name / phone can match any age or status. Browse without search keeps
+ * the requested date range (default last 30 days).
  */
 exports.getOrdersList = async (req, res) => {
   try {
+    const searchRaw = String(req.query.search || '').trim();
+    /** Non-empty search → all-time; do not AND with Last 30d / custom range. */
+    const searchIgnoresDateRange = Boolean(searchRaw);
+
     let presetDays = req.query.presetDays;
     if (presetDays == null && String(req.query.preset || '').toLowerCase() === '30d') {
       presetDays = 30;
     }
 
-    const rangePreset = req.query.rangePreset || req.query.range;
-
-    const range = resolveDateRange({
-      from: req.query.from,
-      to: req.query.to,
-      presetDays,
-      rangePreset
-    });
+    const range = resolveDateRange(
+      searchIgnoresDateRange
+        ? { rangePreset: 'all' }
+        : {
+            from: req.query.from,
+            to: req.query.to,
+            presetDays,
+            rangePreset: req.query.rangePreset || req.query.range
+          }
+    );
 
     const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
@@ -108,7 +118,7 @@ exports.getOrdersList = async (req, res) => {
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const dateScopeMatch = buildScopedDateMatch(range.from, range.to, scopeMatch);
-    const search = await buildSearchFilter(req.query.search);
+    const search = await buildSearchFilter(searchRaw);
     /** Global search: skip status bucket so order ID / phone matches any tab (incl. cancelled). */
     const bucket = search ? {} : buildBucketMatch(req.query.bucket);
     const filter = mergeFilters(dateScopeMatch, search, bucket);
@@ -168,8 +178,10 @@ exports.getOrdersList = async (req, res) => {
           hasPrevPage: page > 1
         },
         filters: {
-          bucket: String(req.query.bucket || 'all').toLowerCase(),
-          search: req.query.search ? String(req.query.search).trim() : null
+          bucket: search ? null : String(req.query.bucket || 'all').toLowerCase(),
+          search: searchRaw || null,
+          /** True when list ignored from/to / last30 because a search query is active. */
+          searchIgnoresDateRange
         }
       }
     });

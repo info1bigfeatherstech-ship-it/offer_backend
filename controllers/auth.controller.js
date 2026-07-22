@@ -82,6 +82,12 @@ const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
 // in lockstep. Change via OTP_EXPIRY_MINUTES env.
 const CONTACT_CHANGE_OTP_TTL_MS = getOtpExpiryMs();
 const CONTACT_CHANGE_MAX_ATTEMPTS = 5;
+const PASSWORD_RESET_TOKEN_EXPIRES = '10m';
+const PASSWORD_RESET_TOKEN_TTL_SECONDS = 10 * 60;
+const PASSWORD_RESET_FIND_MAX_ATTEMPTS = 3;
+const PASSWORD_RESET_FIND_WINDOW_SECONDS = 24 * 60 * 60;
+const PASSWORD_RESET_FIND_GENERIC_MESSAGE =
+  'If this phone number is registered with us, you can continue to reset your password.';
 const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
 const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
 const respondAuthError = (res, statusCode, code, message, extras = {}) =>
@@ -115,6 +121,139 @@ const generateRefreshToken = (userId) => {
 };
 
 const hashToken = refreshTokenSession.hashRefreshToken;
+
+const getPasswordResetFindKey = (phone) => `pwd_reset_find:${phone}`;
+const getPasswordResetTokenKey = (jti) => `pwd_reset_token:${jti}`;
+
+/**
+ * Phone-scoped daily attempt counter for Option D forgot-password find-user.
+ * Fail-closed when Redis is unavailable so abuse cannot bypass the limit.
+ */
+const consumePasswordResetFindAttempt = async (phone) => {
+  if (!redisManager.isReady()) {
+    const err = new Error('Password reset rate-limit service unavailable');
+    err.code = 'RATE_LIMIT_UNAVAILABLE';
+    throw err;
+  }
+
+  const redis = redisManager.getClient();
+  const key = getPasswordResetFindKey(phone);
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, PASSWORD_RESET_FIND_WINDOW_SECONDS);
+  }
+
+  return {
+    allowed: count <= PASSWORD_RESET_FIND_MAX_ATTEMPTS,
+    count,
+    maxAttempts: PASSWORD_RESET_FIND_MAX_ATTEMPTS
+  };
+};
+
+const clearPasswordResetFindAttempts = async (phone) => {
+  if (!phone || !redisManager.isReady()) return;
+  try {
+    await redisManager.getClient().del(getPasswordResetFindKey(phone));
+  } catch (err) {
+    console.error('[ForgotPassword] Failed clearing find-user rate limit:', err?.message || err);
+  }
+};
+
+const issuePasswordResetToken = async (userId) => {
+  if (!redisManager.isReady()) {
+    const err = new Error('Password reset token service unavailable');
+    err.code = 'RESET_TOKEN_STORE_UNAVAILABLE';
+    throw err;
+  }
+
+  const jti = crypto.randomUUID();
+  const resetToken = jwt.sign(
+    { id: userId, type: 'password_reset', jti },
+    process.env.JWT_SECRET,
+    { expiresIn: PASSWORD_RESET_TOKEN_EXPIRES }
+  );
+
+  await redisManager.getClient().setEx(
+    getPasswordResetTokenKey(jti),
+    PASSWORD_RESET_TOKEN_TTL_SECONDS,
+    String(userId)
+  );
+
+  return resetToken;
+};
+
+const consumePasswordResetToken = async (resetToken) => {
+  let decoded;
+  try {
+    decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+  } catch (err) {
+    if (err?.name === 'TokenExpiredError') {
+      const expiredErr = new Error('Reset token has expired. Please start again.');
+      expiredErr.code = 'RESET_TOKEN_EXPIRED';
+      throw expiredErr;
+    }
+    const invalidErr = new Error('Reset token is invalid. Please start again.');
+    invalidErr.code = 'RESET_TOKEN_INVALID';
+    throw invalidErr;
+  }
+
+  if (!decoded || decoded.type !== 'password_reset' || !decoded.id || !decoded.jti) {
+    const invalidErr = new Error('Reset token is invalid. Please start again.');
+    invalidErr.code = 'RESET_TOKEN_INVALID';
+    throw invalidErr;
+  }
+
+  if (!redisManager.isReady()) {
+    const err = new Error('Password reset token service unavailable');
+    err.code = 'RESET_TOKEN_STORE_UNAVAILABLE';
+    throw err;
+  }
+
+  const redis = redisManager.getClient();
+  const key = getPasswordResetTokenKey(decoded.jti);
+  const storedUserId = await redis.get(key);
+  if (!storedUserId || String(storedUserId) !== String(decoded.id)) {
+    const invalidErr = new Error('Reset token is invalid or already used. Please start again.');
+    invalidErr.code = 'RESET_TOKEN_INVALID';
+    throw invalidErr;
+  }
+
+  await redis.del(key);
+  return decoded;
+};
+
+/**
+ * Fire-and-forget informational email after a successful password change.
+ * Never throws to the caller — email failure must not block password reset.
+ */
+const sendPasswordChangedNotificationEmail = async (user) => {
+  const email = String(user?.email || '').trim().toLowerCase();
+  if (!email) return;
+
+  try {
+    await transporter.sendMail({
+      from: `"OfferWaleBaba" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: 'Your password was changed — OfferWaleBaba',
+      text:
+        `Hi ${user.name || 'there'},\n\n` +
+        'Your OfferWaleBaba account password was changed successfully.\n\n' +
+        'If you made this change, no further action is needed.\n' +
+        'If you did not change your password, please change your password immediately or contact Support Team.\n\n' +
+        '— OfferWaleBaba',
+      html:
+        `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #eee;border-radius:8px;">` +
+        `<h2 style="margin:0 0 8px 0;color:#222;">Password changed</h2>` +
+        `<p style="color:#555;line-height:1.5;">Hi ${user.name || 'there'},</p>` +
+        `<p style="color:#555;line-height:1.5;">Your OfferWaleBaba account password was changed successfully.</p>` +
+        `<p style="color:#555;line-height:1.5;">If you made this change, no further action is needed. If you did not change your password, please change Password or contact Support Team.</p>` +
+        `<p style="color:#aaa;font-size:12px;margin-top:24px;">— OfferWaleBaba</p>` +
+        `</div>`
+    });
+  } catch (err) {
+    console.error('[ForgotPassword] Password-changed email failed:', err?.message || err);
+  }
+};
 
 const normalizePortal = (rawPortal) => {
   const normalized = String(rawPortal || '').trim().toLowerCase();
@@ -344,6 +483,26 @@ const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID || 'NO_CLIENT_ID_SET'
 );
 
+const isVerifiedUserRecord = (user) => Boolean(user && (user.isPhoneVerified || user.isEmailVerified));
+
+const buildRegisterLoginPayload = (user, accessToken) => ({
+  success: true,
+  message: "Registration successful",
+  accessToken,
+  user: {
+    id: user._id,
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    userType: user.userType,
+    role: user.role,
+    status: user.status,
+    isPhoneVerified: user.isPhoneVerified,
+    isEmailVerified: user.isEmailVerified,
+    isProfileComplete: user.isProfileComplete
+  }
+});
+
 // ========== 1️ REGISTER CONTROLLER ==========
 
 const register = async (req, res) => {
@@ -357,112 +516,94 @@ const register = async (req, res) => {
 
     const { email, password, name, phone } = req.body;
 
-    // Pre-flight: ensure the configured OTP delivery mode has the recipients it needs.
-    // (Both phone + email are collected at registration so this is almost always fine,
-    // but we still guard against malformed payloads / future schema changes.)
-    const recipientCheck = validateRecipientsForMode({ phone, email });
-    if (!recipientCheck.ok) {
-      return respondAuthError(
-        res,
-        400,
-        'OTP_RECIPIENT_MISSING',
-        `OTP delivery mode "${recipientCheck.mode}" requires a ${recipientCheck.missing}.`
-      );
-    }
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const normalizedPhone = String(phone || '').trim();
 
-    // Check if email already exists (any verified user — phone OR email verified)
-    const existingEmailUser = await User.findOne({
-      email,
-      $or: [{ isPhoneVerified: true }, { isEmailVerified: true }]
-    });
-    if (existingEmailUser) {
-      return respondAuthError(res, 409, 'EMAIL_ALREADY_REGISTERED', 'User with this email already exists. Please login.');
-    }
+    /*
+      Legacy OTP registration flow intentionally preserved here for safe rollback:
 
-    // Check if phone already exists (any verified user — phone OR email verified)
-    const existingPhoneUser = await User.findOne({
-      phone,
-      $or: [{ isPhoneVerified: true }, { isEmailVerified: true }]
-    });
-    if (existingPhoneUser) {
+      1. validateRecipientsForMode({ phone, email })
+      2. reject only if an existing VERIFIED email/phone user already existed
+      3. reuse/update one unverified user record
+      4. generate OTP + persist in both email/phone OTP fields
+      5. deliver OTP via configured delivery mode
+      6. return { requiresOTPVerification: true } without access token
+
+      New production flow:
+      - no OTP generation/delivery
+      - register response immediately authenticates the user
+      - legacy abandoned/unverified records are safely upgraded in place
+      - conflicting abandoned records (email hits one orphan, phone hits another)
+        are rejected with ACCOUNT_CONFLICT instead of unsafe auto-merge
+    */
+
+    const [existingPhoneUser, existingEmailUser] = await Promise.all([
+      User.findOne({ phone: normalizedPhone }).select(
+        "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
+      ),
+      normalizedEmail
+        ? User.findOne({ email: normalizedEmail }).select(
+            "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
+          )
+        : Promise.resolve(null)
+    ]);
+
+    if (existingPhoneUser && isVerifiedUserRecord(existingPhoneUser)) {
       return respondAuthError(res, 409, 'PHONE_ALREADY_REGISTERED', 'User with this phone number already exists. Please login.');
     }
 
-    // Check if unverified user exists (neither phone nor email verified yet)
-    const unverifiedUser = await User.findOne({
-      $or: [{ email }, { phone }],
-      isPhoneVerified: false,
-      isEmailVerified: false
-    });
-
-    const otp = generateOTP();
-    const expires = new Date(Date.now() + getOtpExpiryMs());
-
-    // Persist OTP into BOTH fields so verification can match regardless of the
-    // channel the user actually receives it on (SMS/Email/Both). Same code,
-    // same expiry, so this is safe — and keeps the verify path simple.
-    const otpFields = {
-      phoneVerificationOTP: otp,
-      phoneVerificationOTPExpires: expires,
-      emailVerificationOTP: otp,
-      emailVerificationOTPExpires: expires
-    };
-
-    if (unverifiedUser) {
-      // Update existing unverified user
-      unverifiedUser.name = name || unverifiedUser.name;
-      unverifiedUser.email = email;
-      unverifiedUser.phone = phone;
-      unverifiedUser.password = password;
-      unverifiedUser.phoneVerificationOTP = otpFields.phoneVerificationOTP;
-      unverifiedUser.phoneVerificationOTPExpires = otpFields.phoneVerificationOTPExpires;
-      unverifiedUser.emailVerificationOTP = otpFields.emailVerificationOTP;
-      unverifiedUser.emailVerificationOTPExpires = otpFields.emailVerificationOTPExpires;
-      await unverifiedUser.save();
-    } else {
-      // Create new user
-      const user = new User({
-        name,
-        email,
-        phone,
-        password,
-        userType: 'user',
-        status: 'active',
-        isEmailVerified: false,
-        isPhoneVerified: false,
-        isProfileComplete: false,
-        registrationMethod: getDeliveryMode() === OTP_DELIVERY_MODES.EMAIL ? 'email' : 'phone',
-        ...otpFields
-      });
-      await user.save();
+    if (existingEmailUser && isVerifiedUserRecord(existingEmailUser)) {
+      return respondAuthError(res, 409, 'EMAIL_ALREADY_REGISTERED', 'User with this email already exists. Please login.');
     }
 
-    // Deliver OTP via configured channel(s). Throws only if ALL channels fail.
-    let delivery;
-    try {
-      delivery = await deliverOtpFor({ phone, email, otp, purpose: 'registration' });
-    } catch (deliverErr) {
-      console.error('Registration OTP delivery failed:', deliverErr?.message, deliverErr?.details || '');
+    const phoneOrphan = existingPhoneUser && !isVerifiedUserRecord(existingPhoneUser) ? existingPhoneUser : null;
+    const emailOrphan = existingEmailUser && !isVerifiedUserRecord(existingEmailUser) ? existingEmailUser : null;
+
+    if (phoneOrphan && emailOrphan && !phoneOrphan._id.equals(emailOrphan._id)) {
       return respondAuthError(
         res,
-        502,
-        'OTP_DELIVERY_FAILED',
-        'Could not send OTP. Please try again in a moment.'
+        409,
+        'ACCOUNT_CONFLICT',
+        'This email and phone number are associated with different incomplete accounts. Please contact support or use a different email/phone combination.'
       );
     }
 
-    return res.status(200).json({
-      success: true,
-      message: describeOtpDelivery(delivery),
-      // Backward-compatible fields used by existing frontend:
-      phone: phone,
-      requiresOTPVerification: true,
-      // New fields — frontend can adopt progressively:
-      email: email,
-      deliveryMode: delivery.deliveryMode,
-      deliveredVia: delivery.deliveredVia,
-      ...(Object.keys(delivery.errors || {}).length ? { partialErrors: delivery.errors } : {})
+    const user = phoneOrphan || emailOrphan || new User({
+      userType: 'user',
+      role: 'user'
     });
+
+    user.name = name;
+    user.email = normalizedEmail || undefined;
+    user.phone = normalizedPhone;
+    user.password = password;
+    user.userType = user.userType || 'user';
+    user.role = user.role || 'user';
+    user.status = 'active';
+    user.isPhoneVerified = true;
+    user.isEmailVerified = Boolean(normalizedEmail);
+    user.isProfileComplete = true;
+    user.registrationMethod = 'phone';
+    user.phoneVerificationOTP = undefined;
+    user.phoneVerificationOTPExpires = undefined;
+    user.emailVerificationOTP = undefined;
+    user.emailVerificationOTPExpires = undefined;
+
+    await user.save();
+
+    const accessToken = generateAccessToken(user._id, user.userType, user.role, 'ecomm');
+    const refreshToken = generateRefreshToken(user._id);
+    const hashedRefreshToken = hashToken(refreshToken);
+    const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Unknown';
+
+    await refreshTokenSession.appendSession(user._id, {
+      hashedToken: hashedRefreshToken,
+      deviceInfo
+    });
+
+    setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
+
+    return res.status(200).json(buildRegisterLoginPayload(user, accessToken));
 
   } catch (error) {
     console.error('Registration error:', error);
@@ -702,8 +843,165 @@ await refreshTokenSession.appendSession(user._id, {
   }
 };
 
-// ========== 4️ FORGOT PASSWORD - REQUEST OTP ==========
+// ========== 4️ FORGOT PASSWORD - FIND USER (Option D, ecomm) ==========
+//
+// Production note:
+// - Ecomm uses this direct phone + short-lived resetToken flow.
+// - Legacy OTP handlers below are intentionally preserved (commented live wiring
+//   remains active in routes for wholesaleFrontend compatibility + rollback).
 
+const findUserForPasswordReset = async (req, res) => {
+  try {
+    const phone = String(req.body.phone || '').trim();
+
+    if (!phone) {
+      return respondAuthError(res, 400, 'PHONE_REQUIRED', 'Phone number is required');
+    }
+
+    if (!/^[0-9]{10}$/.test(phone)) {
+      return respondAuthError(res, 400, 'INVALID_PHONE', 'Phone number must be exactly 10 digits');
+    }
+
+    let attempt;
+    try {
+      attempt = await consumePasswordResetFindAttempt(phone);
+    } catch (rateErr) {
+      console.error('[ForgotPassword] find-user rate-limit unavailable:', rateErr?.message || rateErr);
+      return respondAuthError(
+        res,
+        503,
+        rateErr?.code || 'RATE_LIMIT_UNAVAILABLE',
+        'Password reset is temporarily unavailable. Please try again in a moment.'
+      );
+    }
+
+    if (!attempt.allowed) {
+      return respondAuthError(
+        res,
+        429,
+        'RESET_ATTEMPTS_EXCEEDED',
+        'Too many password reset attempts for this phone number. Please try again after 24 hours.'
+      );
+    }
+
+    const user = await User.findOne({ phone }).select('_id phone email name status');
+
+    // Generic response whether or not the account exists (anti-enumeration).
+    // resetToken is only returned when a matching account is found.
+    if (!user) {
+      return res.status(200).json({
+        success: true,
+        message: PASSWORD_RESET_FIND_GENERIC_MESSAGE
+      });
+    }
+
+    let resetToken;
+    try {
+      resetToken = await issuePasswordResetToken(user._id);
+    } catch (tokenErr) {
+      console.error('[ForgotPassword] reset token issue failed:', tokenErr?.message || tokenErr);
+      return respondAuthError(
+        res,
+        503,
+        tokenErr?.code || 'RESET_TOKEN_STORE_UNAVAILABLE',
+        'Password reset is temporarily unavailable. Please try again in a moment.'
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: PASSWORD_RESET_FIND_GENERIC_MESSAGE,
+      resetToken,
+      phone: user.phone
+    });
+  } catch (error) {
+    console.error('Find user for password reset error:', error);
+    return respondAuthError(res, 500, 'PASSWORD_RESET_FIND_FAILED', 'Error starting password reset', {
+      error: error.message
+    });
+  }
+};
+
+// ========== 5️ FORGOT PASSWORD - RESET DIRECT (Option D, ecomm) ==========
+
+const resetPasswordDirect = async (req, res) => {
+  try {
+    const resetToken = String(req.body.resetToken || '').trim();
+    const newPassword = String(req.body.newPassword || '');
+    const confirmPassword = String(req.body.confirmPassword || '');
+
+    if (!resetToken || !newPassword || !confirmPassword) {
+      return respondAuthError(
+        res,
+        400,
+        'PASSWORD_RESET_PAYLOAD_INVALID',
+        'Reset token, new password and confirm password are required'
+      );
+    }
+
+    if (newPassword !== confirmPassword) {
+      return respondAuthError(res, 400, 'PASSWORD_MISMATCH', 'Passwords do not match');
+    }
+
+    if (newPassword.length < 6) {
+      return respondAuthError(res, 400, 'PASSWORD_TOO_SHORT', 'Password must be at least 6 characters');
+    }
+
+    let decoded;
+    try {
+      decoded = await consumePasswordResetToken(resetToken);
+    } catch (tokenErr) {
+      const code = tokenErr?.code || 'RESET_TOKEN_INVALID';
+      const status =
+        code === 'RESET_TOKEN_EXPIRED'
+          ? 401
+          : code === 'RESET_TOKEN_STORE_UNAVAILABLE'
+            ? 503
+            : 401;
+      return respondAuthError(res, status, code, tokenErr.message || 'Invalid reset token');
+    }
+
+    const user = await User.findById(decoded.id).select('+password name email phone status');
+    if (!user) {
+      return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
+    }
+
+    // Update password (model pre-save hook hashes it — do not hash manually)
+    user.password = newPassword;
+    // Clear any legacy OTP reset fields if present from older flow
+    user.passwordResetOTP = undefined;
+    user.passwordResetOTPExpires = undefined;
+    await user.save();
+
+    await clearPasswordResetFindAttempts(user.phone);
+
+    // Silent security net — never block the API response on email failure
+    if (user.email) {
+      setImmediate(() => {
+        sendPasswordChangedNotificationEmail(user).catch(() => {});
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password reset successful. You can now login with your new password.',
+      phone: user.phone || null
+    });
+  } catch (error) {
+    console.error('Reset password direct error:', error);
+    return respondAuthError(res, 500, 'PASSWORD_RESET_FAILED', 'Error resetting password', {
+      error: error.message
+    });
+  }
+};
+
+
+// Legacy OTP forgot-password handlers remain LIVE below for wholesaleFrontend
+// compatibility. Ecomm uses findUserForPasswordReset + resetPasswordDirect.
+
+
+// Live wrappers kept so wholesaleFrontend OTP forgot-password continues to work
+// until that app is migrated. Ecomm no longer uses these.
 const sendPasswordResetOTP = async (req, res) => {
   try {
     const { identifier } = req.body;
@@ -735,8 +1033,6 @@ const sendPasswordResetOTP = async (req, res) => {
 
     const isEmail = String(identifier).includes('@');
 
-    // For password-reset the channel is dictated by the identifier the user
-    // typed in, not by OTP_DELIVERY_MODE. So we explicitly force the channel.
     try {
       await deliverOtpFor({
         phone: user.phone,
@@ -766,8 +1062,6 @@ const sendPasswordResetOTP = async (req, res) => {
     return respondAuthError(res, 500, 'PASSWORD_RESET_OTP_SEND_FAILED', 'Error sending OTP', { error: error.message });
   }
 };
-
-// ========== 5️ VERIFY PASSWORD RESET OTP ==========
 
 const verifyPasswordResetOTP = async (req, res) => {
   try {
@@ -800,7 +1094,6 @@ const verifyPasswordResetOTP = async (req, res) => {
       return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
-    // Don't delete OTP yet, will be deleted after password reset
     return res.status(200).json({
       success: true,
       message: "OTP verified successfully"
@@ -811,8 +1104,6 @@ const verifyPasswordResetOTP = async (req, res) => {
     return respondAuthError(res, 500, 'PASSWORD_RESET_OTP_VERIFY_FAILED', 'Error verifying OTP', { error: error.message });
   }
 };
-
-// ========== 6️ RESET PASSWORD WITH OTP ==========
 
 const resetPasswordWithOTP = async (req, res) => {
   try {
@@ -849,7 +1140,6 @@ const resetPasswordWithOTP = async (req, res) => {
       return respondAuthError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
-    // Update password (model will hash it)
     user.password = newPassword;
     user.passwordResetOTP = undefined;
     user.passwordResetOTPExpires = undefined;
@@ -1311,6 +1601,9 @@ module.exports = {
   register,
   verifyOTPAndLogin,
   login,
+  findUserForPasswordReset,
+  resetPasswordDirect,
+  // Legacy OTP forgot-password (kept live for wholesaleFrontend)
   sendPasswordResetOTP,
   verifyPasswordResetOTP,
   resetPasswordWithOTP,

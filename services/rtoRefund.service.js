@@ -253,15 +253,6 @@ function classifyRtoReasonCategory(providerStatus) {
 }
 
 /**
- * Display label — exact Shiprocket text when available.
- * @param {string|null|undefined} providerStatus
- */
-function classifyRtoReasonLabel(providerStatus) {
-  const ps = String(providerStatus || '').trim();
-  return ps || 'RTO';
-}
-
-/**
  * Mongo filter: customer-fault RTO (Shiprocket providerStatus).
  */
 function buildCustomerRtoSectionMatch() {
@@ -287,21 +278,24 @@ function buildCourierRtoSectionMatch() {
 }
 
 /**
- * Shiprocket-driven RTO workflow stage (display only).
- * Refund is allowed only when stage === rto_delivered_to_warehouse.
+ * True warehouse-delivered / received-at-seller status text (NOT "RTO Acknowledged").
+ * Acknowledged can appear earlier in the RTO lifecycle and must not unlock refund alone.
+ */
+const RTO_WAREHOUSE_DELIVERED_STATUS_RE =
+  /rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered/i;
+
+/**
+ * Shiprocket-driven RTO workflow stage (display).
+ * Refund gate uses {@link isRtoWarehouseDeliveredForOrder} (latch + delivered evidence), not Acknowledged alone.
  * @param {string|null|undefined} providerStatus
  */
 function mapShiprocketRtoStage(providerStatus) {
   const ps = String(providerStatus || '').toLowerCase();
   if (!ps) return 'rto_initiated';
-  if (
-    /rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered/.test(
-      ps
-    )
-  ) {
+  if (RTO_WAREHOUSE_DELIVERED_STATUS_RE.test(ps)) {
     return 'rto_delivered_to_warehouse';
   }
-  if (/\brto\b/.test(ps) && /in transit|picked up|out for pickup|reached destination hub/.test(ps)) {
+  if (/\brto\b/.test(ps) && /in transit|picked up|out for pickup|reached destination hub|in\s*intransit/.test(ps)) {
     return 'rto_in_transit';
   }
   if (/\brto\b/.test(ps) || /return to origin/.test(ps)) {
@@ -314,7 +308,140 @@ function mapShiprocketRtoStage(providerStatus) {
  * @param {string|null|undefined} providerStatus
  */
 function isRtoDeliveredToWarehouse(providerStatus) {
-  return mapShiprocketRtoStage(providerStatus) === 'rto_delivered_to_warehouse';
+  return RTO_WAREHOUSE_DELIVERED_STATUS_RE.test(String(providerStatus || ''));
+}
+
+/**
+ * True when text looks like a Shiprocket RTO *status* label (not a fault reason).
+ * @param {string|null|undefined} text
+ */
+function isLikelyRtoStatusLabel(text) {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t) return true;
+  if (
+    /^(rto\s*)?(initiated|in\s*transit|in\s*intransit|delivered|acknowledged|out for pickup|picked up)(\s+to\s+warehouse)?$/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  return /rto\s*(initiated|delivered|acknowledged|in\s*transit|in\s*intransit|complete)|return\s*to\s*origin|delivered\s*to\s*(seller|warehouse)/i.test(
+    t
+  );
+}
+
+/**
+ * @param {import('mongoose').Document|object} order
+ * @returns {string[]}
+ */
+function collectRtoStatusTexts(order) {
+  const texts = [];
+  const push = (v) => {
+    const s = String(v || '').trim();
+    if (s) texts.push(s);
+  };
+  push(order?.shipmentInfo?.providerStatus);
+  push(order?.returnInfo?.rtoShiprocketReason);
+  const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue;
+    push(ev.status);
+    push(ev.current_status);
+    push(ev.sr_status);
+    push(ev['sr-status']);
+    push(ev.activity);
+    push(ev.message);
+    push(ev.status_code);
+  }
+  return texts;
+}
+
+/**
+ * True if current status OR tracking history ever showed real warehouse delivery.
+ * "RTO Acknowledged" alone is NOT enough.
+ * @param {import('mongoose').Document|object} order
+ */
+function orderHasRtoWarehouseDeliveredEvidence(order) {
+  return collectRtoStatusTexts(order).some((t) => isRtoDeliveredToWarehouse(t));
+}
+
+/**
+ * Order-level refund warehouse gate:
+ * - latch set after real Delivered once, OR
+ * - Delivered evidence in current status / rawEvents history
+ * Never unlocks on Acknowledged-only.
+ * @param {import('mongoose').Document|object} order
+ */
+function isRtoWarehouseDeliveredForOrder(order) {
+  if (!order) return false;
+  if (order.returnInfo?.rtoWarehouseDeliveredAt) return true;
+  return orderHasRtoWarehouseDeliveredEvidence(order);
+}
+
+/**
+ * Persist latch only when real Delivered evidence exists (not Acknowledged alone).
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean} whether returnInfo was mutated
+ */
+function ensureRtoWarehouseDeliveredLatch(order) {
+  if (!order) return false;
+  if (order.returnInfo?.rtoWarehouseDeliveredAt) return false;
+  if (!orderHasRtoWarehouseDeliveredEvidence(order)) return false;
+  if (!order.returnInfo) order.returnInfo = {};
+  order.returnInfo.rtoWarehouseDeliveredAt = new Date();
+  if (typeof order.markModified === 'function') {
+    order.markModified('returnInfo');
+  }
+  return true;
+}
+
+/**
+ * Admin Reason column — never echo raw Shiprocket status labels.
+ * @param {import('mongoose').Document|object} order
+ * @returns {string}
+ */
+function resolveRtoDisplayReason(order) {
+  const ri = order?.returnInfo || {};
+  const providerStatus = order?.shipmentInfo?.providerStatus || null;
+
+  const tryText = (v) => {
+    const s = String(v || '').trim();
+    if (!s || isLikelyRtoStatusLabel(s)) return null;
+    return s;
+  };
+
+  const fromStored = tryText(ri.rtoShiprocketReason);
+  if (fromStored) return fromStored;
+
+  const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i] || {};
+    const candidate =
+      tryText(ev.reason) ||
+      tryText(ev.rto_reason) ||
+      tryText(ev.remarks) ||
+      tryText(ev.comment) ||
+      tryText(ev.status_code_description) ||
+      tryText(ev.description);
+    if (candidate) return candidate;
+  }
+
+  const cat =
+    ri.rtoReasonCategory ||
+    classifyRtoReasonCategory(ri.rtoShiprocketReason || providerStatus);
+  if (cat === 'customer') return 'Customer-related RTO';
+  if (cat === 'courier') return 'Courier / logistics related RTO';
+  return 'Reason not provided by carrier';
+}
+
+/**
+ * @param {string|null|undefined} providerStatus
+ */
+function classifyRtoReasonLabel(providerStatus) {
+  const ps = String(providerStatus || '').trim();
+  if (!ps) return 'RTO';
+  if (isLikelyRtoStatusLabel(ps)) return 'Reason not provided by carrier';
+  return ps;
 }
 
 /**
@@ -415,7 +542,7 @@ function syncRtoRefundStatusFromOrder(order) {
   return changed;
 }
 
-/** Mongo regex for warehouse-delivered RTO (list filters). */
+/** Mongo regex for true warehouse-delivered RTO (list filters). Acknowledged is excluded. */
 const RTO_WAREHOUSE_DELIVERED_REGEX =
   'rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered';
 
@@ -499,6 +626,10 @@ module.exports = {
   classifyRtoReasonLabel,
   mapShiprocketRtoStage,
   isRtoDeliveredToWarehouse,
+  isRtoWarehouseDeliveredForOrder,
+  ensureRtoWarehouseDeliveredLatch,
+  resolveRtoDisplayReason,
+  isLikelyRtoStatusLabel,
   classifyRtoPaymentType,
   deriveRefundTrackStatus,
   syncRtoRefundStatusFromOrder,

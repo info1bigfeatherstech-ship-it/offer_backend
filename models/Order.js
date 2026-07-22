@@ -230,6 +230,11 @@ const orderSchema = new mongoose.Schema(
         default: null
       },
       rtoRefundError: { type: String, default: null },
+      /**
+       * Latched when Shiprocket first reports RTO delivered to warehouse (or equivalent).
+       * Keeps refund gate open if status later changes to e.g. RTO Acknowledged.
+       */
+      rtoWarehouseDeliveredAt: { type: Date, default: null },
       rtoDeductions: {
         forwardShipping: { type: Number, default: 0 },
         rtoShipping: { type: Number, default: 0 },

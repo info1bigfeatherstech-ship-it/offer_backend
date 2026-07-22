@@ -6,7 +6,8 @@
 const Order = require('../models/Order');
 const { buildRtoBucketMatch } = require('../constants/rtoOrderQuery');
 const {
-  isRtoDeliveredToWarehouse,
+  isRtoWarehouseDeliveredForOrder,
+  ensureRtoWarehouseDeliveredLatch,
   RTO_WAREHOUSE_DELIVERED_REGEX,
 } = require('./rtoRefund.service');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
@@ -54,16 +55,26 @@ function buildRtoAutoSyncCandidateFilter(opts = {}) {
     ],
   });
 
-  // Still in transit / initiated — not yet warehouse-delivered.
+  // Still in transit / initiated — not yet warehouse-delivered (or latched).
   andParts.push({
-    $or: [
-      { 'shipmentInfo.providerStatus': { $exists: false } },
-      { 'shipmentInfo.providerStatus': null },
-      { 'shipmentInfo.providerStatus': '' },
+    $and: [
       {
-        'shipmentInfo.providerStatus': {
-          $not: { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' },
-        },
+        $or: [
+          { 'returnInfo.rtoWarehouseDeliveredAt': { $exists: false } },
+          { 'returnInfo.rtoWarehouseDeliveredAt': null },
+        ],
+      },
+      {
+        $or: [
+          { 'shipmentInfo.providerStatus': { $exists: false } },
+          { 'shipmentInfo.providerStatus': null },
+          { 'shipmentInfo.providerStatus': '' },
+          {
+            'shipmentInfo.providerStatus': {
+              $not: { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' },
+            },
+          },
+        ],
       },
     ],
   });
@@ -160,7 +171,14 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     };
   }
 
-  if (isRtoDeliveredToWarehouse(order.shipmentInfo?.providerStatus)) {
+  if (isRtoWarehouseDeliveredForOrder(order)) {
+    if (ensureRtoWarehouseDeliveredLatch(order)) {
+      try {
+        await order.save();
+      } catch (_) {
+        /* non-blocking */
+      }
+    }
     return {
       orderId: id,
       success: false,
@@ -191,9 +209,15 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     };
   }
 
-  const fresh = await Order.findOne({ orderId: id })
-    .select('orderStatus shipmentInfo.providerStatus')
-    .lean();
+  const fresh = await Order.findOne({ orderId: id });
+  if (fresh && ensureRtoWarehouseDeliveredLatch(fresh)) {
+    try {
+      await fresh.save();
+    } catch (_) {
+      /* non-blocking latch */
+    }
+  }
+
   const currentProviderStatus = String(fresh?.shipmentInfo?.providerStatus || '');
   const currentOrderStatus = String(fresh?.orderStatus || '').toLowerCase();
 
@@ -208,7 +232,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     currentProviderStatus,
     previousOrderStatus,
     currentOrderStatus,
-    warehouseDelivered: isRtoDeliveredToWarehouse(currentProviderStatus),
+    warehouseDelivered: isRtoWarehouseDeliveredForOrder(fresh || { shipmentInfo: { providerStatus: currentProviderStatus } }),
   };
 }
 
