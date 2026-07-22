@@ -15,9 +15,10 @@ const {
 const {
   calculateRtoRefund,
   classifyRtoReasonCategory,
-  classifyRtoReasonLabel,
   mapShiprocketRtoStage,
-  isRtoDeliveredToWarehouse,
+  isRtoWarehouseDeliveredForOrder,
+  ensureRtoWarehouseDeliveredLatch,
+  resolveRtoDisplayReason,
   classifyRtoPaymentType,
   deriveRefundTrackStatus,
   syncRtoRefundStatusFromOrder,
@@ -228,7 +229,10 @@ function buildRtoSectionMatch(section) {
           ]
         }
       ],
-      'shipmentInfo.providerStatus': { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' }
+      $or: [
+        { 'shipmentInfo.providerStatus': { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' } },
+        { 'returnInfo.rtoWarehouseDeliveredAt': { $exists: true, $ne: null } }
+      ]
     };
   }
   if (key === 'refund_processed') {
@@ -271,13 +275,15 @@ function mapRtoOrderRow(order) {
   const ri = o.returnInfo || {};
   const calc = calculateRtoRefund(o);
   const providerStatus = o.shipmentInfo?.providerStatus || null;
-  const reasonCategory = classifyRtoReasonCategory(providerStatus);
+  const reasonCategory =
+    o.returnInfo?.rtoReasonCategory || classifyRtoReasonCategory(providerStatus);
   const rtoStage = mapShiprocketRtoStage(providerStatus);
   const rtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus || 'pending');
   const refundTrack = deriveRefundTrackStatus(o);
-  const warehouseDelivered = isRtoDeliveredToWarehouse(providerStatus);
+  const warehouseDelivered = isRtoWarehouseDeliveredForOrder(o);
   const paymentType = classifyRtoPaymentType(o);
   const adminActionRequired = warehouseDelivered && rtoStatus === 'pending' && paymentType.refundAllowed;
+  const displayReason = resolveRtoDisplayReason(o);
 
   const customerName =
     o.addressSnapshot?.name ||
@@ -293,14 +299,14 @@ function mapRtoOrderRow(order) {
     rtoStatus,
     rtoStage,
     rtoStageLabel:
-      rtoStage === 'rto_in_transit'
-        ? 'RTO In Transit'
-        : rtoStage === 'rto_delivered_to_warehouse'
-          ? 'RTO Delivered to Warehouse'
+      warehouseDelivered || rtoStage === 'rto_delivered_to_warehouse'
+        ? 'RTO Delivered to Warehouse'
+        : rtoStage === 'rto_in_transit'
+          ? 'RTO In Transit'
           : 'RTO Initiated',
     adminActionRequired,
     shiprocketReason: providerStatus,
-    rtoReason: classifyRtoReasonLabel(providerStatus),
+    rtoReason: displayReason,
     rtoReasonCategory: reasonCategory,
     rtoReasonCategoryLabel:
       reasonCategory === 'customer'
@@ -538,14 +544,14 @@ exports.processRtoRefund = async (req, res) => {
       );
     }
 
-    const providerStatus = order.shipmentInfo?.providerStatus;
-    if (!isRtoDeliveredToWarehouse(providerStatus)) {
+    if (!isRtoWarehouseDeliveredForOrder(order)) {
       throw createHttpError(
         403,
         'RTO_WAREHOUSE_PENDING',
         'Refund is available only after Shiprocket reports RTO Delivered to warehouse.'
       );
     }
+    ensureRtoWarehouseDeliveredLatch(order);
 
     if (!order.paymentInfo?.razorpayPaymentId) {
       throw createHttpError(400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment on this order');
@@ -785,7 +791,7 @@ exports.bulkRtoAction = async (req, res) => {
             });
             continue;
           }
-          if (!isRtoDeliveredToWarehouse(order.shipmentInfo?.providerStatus)) {
+          if (!isRtoWarehouseDeliveredForOrder(order)) {
             results.push({
               orderId,
               success: false,
@@ -794,6 +800,7 @@ exports.bulkRtoAction = async (req, res) => {
             });
             continue;
           }
+          ensureRtoWarehouseDeliveredLatch(order);
           if (!order.paymentInfo?.razorpayPaymentId) {
             results.push({ orderId, success: false, code: 'RAZORPAY_PAYMENT_MISSING', message: 'No Razorpay payment' });
             continue;
