@@ -505,7 +505,8 @@ app.use('/api/coupons', limiters.couponWrite);
 
 app.use('/api/auth/login', limiters.sensitive);
 app.use('/api/auth/register', limiters.sensitive);
-app.use('/api/auth/otp-verify-login', limiters.sensitive);
+// Legacy registration-OTP endpoint limiter kept commented for rollback reference.
+// app.use('/api/auth/otp-verify-login', limiters.sensitive);
 app.use('/api/auth/forgot-password', limiters.sensitive);
 app.use('/api/auth/change-password', limiters.sensitive);
 app.use('/api/wholesaler/request', limiters.sensitive);

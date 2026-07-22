@@ -105,6 +105,8 @@ const userSchema = new mongoose.Schema(
     },
 
     // ===== PASSWORD RESET OTP =====
+    // Kept for wholesaleFrontend legacy OTP forgot-password flow.
+    // Ecomm Option D uses Redis-backed short-lived reset tokens instead.
     passwordResetOTP: {
       type: String,
       select: false
