@@ -2460,6 +2460,179 @@ class ShiprocketService {
   }
 
   /**
+   * Read-only: extract RTO reverse freight (₹) from Shiprocket order/shipment JSON.
+   * Prefers RTO-specific keys only — never treats forward freight / COD as RTO.
+   * Does not call any write APIs.
+   * @param {object|null|undefined} payload
+   * @returns {number|null}
+   */
+  static extractRtoFreightInrFromPayload(payload) {
+    try {
+      if (!payload || typeof payload !== 'object') return null;
+
+      const pickMoney = (v) => {
+        if (v == null || v === '') return null;
+        if (typeof v === 'object' && !Array.isArray(v)) {
+          const nested =
+            v.rto_amount ??
+            v.rto_charge ??
+            v.amount ??
+            v.value ??
+            v.charge ??
+            v.charges;
+          return pickMoney(nested);
+        }
+        const n = Number(String(v).replace(/,/g, '').replace(/[^\d.-]/g, ''));
+        if (!Number.isFinite(n) || n < 0.01) return null;
+        return roundMoney2(n);
+      };
+
+      const EXACT_KEYS = new Set([
+        'rto_amount',
+        'rto_charge',
+        'rto_charges',
+        'rto_freight',
+        'rto_freight_charge',
+        'rto_freight_charges',
+        'charged_weight_amount_rto',
+        'rtofreightcharge',
+        'freight_charge_rto',
+        'rto_applied_amount',
+        'applied_rto_charge',
+        'rto_shipping_charge',
+        'rto_shipping_charges'
+      ]);
+
+      const isExcludedKey = (lk) =>
+        /risk|score|predict|awb|status|reason|address|cod|wallet|on_hold|onhold|excess_weight|forward|fwd/.test(
+          lk
+        );
+
+      const looksLikeRtoFreightKey = (key) => {
+        const lk = String(key || '')
+          .toLowerCase()
+          .replace(/[\s-]+/g, '_');
+        if (!lk || isExcludedKey(lk)) return false;
+        if (EXACT_KEYS.has(lk)) return true;
+        if (/rto/.test(lk) && /(amount|charge|freight|shipping)/.test(lk)) return true;
+        return false;
+      };
+
+      const queue = [payload];
+      const seen = new Set();
+      let steps = 0;
+      while (queue.length && steps < 60) {
+        steps += 1;
+        const node = queue.shift();
+        if (!node || typeof node !== 'object') continue;
+        if (seen.has(node)) continue;
+        seen.add(node);
+
+        if (Array.isArray(node)) {
+          for (const item of node.slice(0, 30)) {
+            if (item && typeof item === 'object') queue.push(item);
+          }
+          continue;
+        }
+
+        for (const [key, val] of Object.entries(node)) {
+          if (looksLikeRtoFreightKey(key)) {
+            const money = pickMoney(val);
+            if (money != null) return money;
+          }
+          if (val && typeof val === 'object' && seen.size < 100) {
+            queue.push(val);
+          }
+        }
+      }
+      return null;
+    } catch (err) {
+      logger.warn('[Shiprocket] extractRtoFreightInrFromPayload failed', { message: err?.message });
+      return null;
+    }
+  }
+
+  /**
+   * Read-only GET: resolve RTO reverse freight for an existing shipment/order.
+   * Uses shipments/{id} then orders/show — never mutates Shiprocket state.
+   * @param {{ shipmentId?: string|number|null, shiprocketOrderId?: string|number|null, channelOrderId?: string|null }} refs
+   * @returns {Promise<{ success: boolean, rtoFreightInr: number|null, source?: string|null, code?: string, message?: string }>}
+   */
+  async fetchRtoFreightCharge(refs = {}) {
+    try {
+      if (!this.enabled) {
+        return {
+          success: false,
+          rtoFreightInr: null,
+          code: 'SHIPROCKET_DISABLED',
+          message: 'Shiprocket is disabled'
+        };
+      }
+
+      const shipmentId = this.parseNumericShipmentId(refs.shipmentId);
+      const orderIds = [refs.shiprocketOrderId, refs.channelOrderId]
+        .map((x) => (x != null ? String(x).trim() : ''))
+        .filter(Boolean);
+
+      if (shipmentId) {
+        try {
+          const data = await this.requestWithAuth({
+            method: 'get',
+            url: `${this.baseURL}/external/shipments/${encodeURIComponent(shipmentId)}`,
+            timeout: 15000
+          });
+          const amount = ShiprocketService.extractRtoFreightInrFromPayload(data);
+          if (amount != null) {
+            return { success: true, rtoFreightInr: amount, source: 'shipments_show' };
+          }
+        } catch (err) {
+          logger.warn('[Shiprocket] fetchRtoFreightCharge shipments failed', {
+            shipmentId,
+            status: err.response?.status,
+            message: err?.message
+          });
+        }
+      }
+
+      for (const id of [...new Set(orderIds)]) {
+        try {
+          const data = await this.requestWithAuth({
+            method: 'get',
+            url: `${this.baseURL}/external/orders/show/${encodeURIComponent(id)}`,
+            timeout: 15000
+          });
+          const root = ShiprocketService.normalizeForwardOrderRoot(data);
+          const amount = ShiprocketService.extractRtoFreightInrFromPayload(root || data);
+          if (amount != null) {
+            return { success: true, rtoFreightInr: amount, source: 'orders_show' };
+          }
+        } catch (err) {
+          logger.warn('[Shiprocket] fetchRtoFreightCharge orders/show failed', {
+            id,
+            status: err.response?.status,
+            message: err?.message
+          });
+        }
+      }
+
+      return {
+        success: false,
+        rtoFreightInr: null,
+        code: 'RTO_FREIGHT_NOT_FOUND',
+        message: 'RTO freight amount not present in Shiprocket response yet'
+      };
+    } catch (err) {
+      logger.warn('[Shiprocket] fetchRtoFreightCharge unexpected error', { message: err?.message });
+      return {
+        success: false,
+        rtoFreightInr: null,
+        code: 'RTO_FREIGHT_LOOKUP_FAILED',
+        message: err?.message || 'Failed to fetch RTO freight'
+      };
+    }
+  }
+
+  /**
    * POST /external/orders/cancel — cancel before dispatch (Shiprocket-side).
    * @param {{ ids: (string|number)[] }} shiprocketIds — Shiprocket order ids (numeric) as returned by create/adhoc.
    */

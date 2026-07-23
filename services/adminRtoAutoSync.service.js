@@ -8,6 +8,8 @@ const { buildRtoBucketMatch } = require('../constants/rtoOrderQuery');
 const {
   isRtoWarehouseDeliveredForOrder,
   persistRtoTrackingInsights,
+  syncRtoFreightChargeFromShiprocket,
+  orderNeedsRtoFreightSync,
   RTO_WAREHOUSE_DELIVERED_REGEX,
 } = require('./rtoRefund.service');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
@@ -55,24 +57,58 @@ function buildRtoAutoSyncCandidateFilter(opts = {}) {
     ],
   });
 
-  // Still in transit / initiated — not yet warehouse-delivered (or latched).
+  // Still in transit / initiated — not yet warehouse-delivered (or latched),
+  // OR warehouse-delivered but RTO reverse freight still missing (read-only enrich).
   andParts.push({
-    $and: [
+    $or: [
       {
-        $or: [
-          { 'returnInfo.rtoWarehouseDeliveredAt': { $exists: false } },
-          { 'returnInfo.rtoWarehouseDeliveredAt': null },
+        $and: [
+          {
+            $or: [
+              { 'returnInfo.rtoWarehouseDeliveredAt': { $exists: false } },
+              { 'returnInfo.rtoWarehouseDeliveredAt': null },
+            ],
+          },
+          {
+            $or: [
+              { 'shipmentInfo.providerStatus': { $exists: false } },
+              { 'shipmentInfo.providerStatus': null },
+              { 'shipmentInfo.providerStatus': '' },
+              {
+                'shipmentInfo.providerStatus': {
+                  $not: { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' },
+                },
+              },
+            ],
+          },
         ],
       },
       {
-        $or: [
-          { 'shipmentInfo.providerStatus': { $exists: false } },
-          { 'shipmentInfo.providerStatus': null },
-          { 'shipmentInfo.providerStatus': '' },
+        $and: [
           {
-            'shipmentInfo.providerStatus': {
-              $not: { $regex: RTO_WAREHOUSE_DELIVERED_REGEX, $options: 'i' },
-            },
+            $or: [
+              { 'returnInfo.rtoShippingCharges': { $exists: false } },
+              { 'returnInfo.rtoShippingCharges': null },
+              { 'returnInfo.rtoShippingCharges': { $lte: 0 } },
+            ],
+          },
+          {
+            $or: [
+              { 'shipmentInfo.rtoFreightCharge': { $exists: false } },
+              { 'shipmentInfo.rtoFreightCharge': null },
+              { 'shipmentInfo.rtoFreightCharge': { $lte: 0 } },
+            ],
+          },
+          {
+            $or: [
+              { 'returnInfo.rtoFreightSyncedAt': { $exists: false } },
+              { 'returnInfo.rtoFreightSyncedAt': null },
+              {
+                'returnInfo.rtoFreightSyncedAt': {
+                  $lt: new Date(Date.now() - 24 * 60 * 60 * 1000),
+                },
+              },
+            ],
           },
         ],
       },
@@ -172,7 +208,16 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
   }
 
   if (isRtoWarehouseDeliveredForOrder(order)) {
-    if (persistRtoTrackingInsights(order)) {
+    let freightUpdated = false;
+    try {
+      if (orderNeedsRtoFreightSync(order)) {
+        const freight = await syncRtoFreightChargeFromShiprocket(order, { persist: false });
+        freightUpdated = Boolean(freight?.updated);
+      }
+    } catch (_) {
+      /* non-blocking */
+    }
+    if (persistRtoTrackingInsights(order) || freightUpdated) {
       try {
         await order.save();
       } catch (_) {
@@ -182,7 +227,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     return {
       orderId: id,
       success: false,
-      updated: false,
+      updated: freightUpdated,
       skipped: true,
       code: 'ALREADY_WAREHOUSE_DELIVERED',
       message: 'Already RTO delivered to warehouse',
@@ -214,10 +259,23 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
   let insightsChanged = false;
   if (fresh && persistRtoTrackingInsights(fresh)) {
     insightsChanged = true;
+  }
+  let freightUpdated = false;
+  if (fresh) {
+    try {
+      if (orderNeedsRtoFreightSync(fresh)) {
+        const freight = await syncRtoFreightChargeFromShiprocket(fresh, { persist: false });
+        freightUpdated = Boolean(freight?.updated);
+      }
+    } catch (_) {
+      /* non-blocking */
+    }
+  }
+  if (fresh && (insightsChanged || freightUpdated)) {
     try {
       await fresh.save();
     } catch (_) {
-      /* non-blocking latch / reason */
+      /* non-blocking latch / reason / freight */
     }
   }
 
@@ -232,6 +290,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
       currentProviderStatus !== previousProviderStatus ||
       currentOrderStatus !== previousOrderStatus ||
       insightsChanged ||
+      freightUpdated ||
       currentLatch !== previousLatch,
     skipped: false,
     previousProviderStatus,

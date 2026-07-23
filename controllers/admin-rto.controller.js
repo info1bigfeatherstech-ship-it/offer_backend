@@ -23,6 +23,8 @@ const {
   classifyRtoPaymentType,
   deriveRefundTrackStatus,
   syncRtoRefundStatusFromOrder,
+  enrichRtoOrdersFreightCharges,
+  syncRtoFreightChargeFromShiprocket,
   mergeReturnInfo,
   hasRtoRefundBeenInitiated,
   RTO_WAREHOUSE_DELIVERED_REGEX,
@@ -502,6 +504,13 @@ exports.getRtoOrders = async (req, res) => {
       );
     }
 
+    // Read-only Shiprocket freight enrich for this page (missing RTO reverse charges only).
+    try {
+      await enrichRtoOrdersFreightCharges(orders, { concurrency: 3, maxOrders: 8 });
+    } catch (enrichErr) {
+      logger.warn('[admin-rto] freight enrich skipped', { message: enrichErr?.message });
+    }
+
     const rows = orders.map((doc) => mapRtoOrderRow(doc));
 
     const summaryCounts = {
@@ -574,6 +583,12 @@ exports.processRtoRefund = async (req, res) => {
     }
     if (hasRtoRefundBeenInitiated(order)) {
       throw createHttpError(400, 'RTO_REFUND_ALREADY_INITIATED', 'RTO refund already initiated for this order');
+    }
+
+    try {
+      await syncRtoFreightChargeFromShiprocket(order, { persist: true });
+    } catch (_) {
+      /* non-blocking — calc still uses whatever is on the order */
     }
 
     const calc = calculateRtoRefund(order, { rtoShippingOverride });
@@ -829,6 +844,11 @@ exports.bulkRtoAction = async (req, res) => {
           if (currentRtoStatus === 'refunded' || currentRtoStatus === 'closed') {
             results.push({ orderId, success: false, code: 'RTO_NOT_REFUNDABLE', message: 'Already refunded or resolved' });
             continue;
+          }
+          try {
+            await syncRtoFreightChargeFromShiprocket(order, { persist: true });
+          } catch (_) {
+            /* non-blocking */
           }
           const calc = calculateRtoRefund(order);
           if (!calc.eligible || calc.maxRefundableInr <= 0) {

@@ -148,7 +148,10 @@ const orderSchema = new mongoose.Schema(
       addressCategory: { type: String, default: null },
       addressRisk: { type: String, default: null },
       rtoRisk: { type: String, default: null },
-      addressScoreSyncedAt: { type: Date, default: null }
+      addressScoreSyncedAt: { type: Date, default: null },
+      /** Shiprocket RTO reverse freight (₹), when known from billing/shipment APIs */
+      rtoFreightCharge: { type: Number, default: null },
+      rtoFreightSyncedAt: { type: Date, default: null }
     },
 
     /** Cached shipment ops view (list/detail actions + provider state classification) */
@@ -244,6 +247,8 @@ const orderSchema = new mongoose.Schema(
         cartValue: { type: Number, default: 0 }
       },
       rtoShippingCharges: { type: Number, default: null },
+      /** Last attempt to pull RTO reverse freight from Shiprocket (even if amount still unknown). */
+      rtoFreightSyncedAt: { type: Date, default: null },
       rtoHistory: {
         type: [
           {
