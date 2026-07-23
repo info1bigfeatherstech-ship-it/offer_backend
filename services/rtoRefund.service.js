@@ -57,6 +57,20 @@ function getRtoOrderTotal(order) {
 }
 
 /**
+ * Amount used for the ₹100 minimum RTO refund gate.
+ * Full order value = items (cart) + forward shipping. Never items-only.
+ * Also considers totalAmount / amountPaid when those are higher (partial+COD total).
+ * @param {import('mongoose').Document|object} order
+ * @returns {number}
+ */
+function getOrderAmountForRtoMinGate(order) {
+  const withShipping = getRtoOrderTotal(order);
+  const totalAmount = roundMoney2(Number(order?.totalAmount) || 0);
+  const paid = roundMoney2(Number(order?.amountPaidInr) || 0);
+  return roundMoney2(Math.max(withShipping, totalAmount, paid));
+}
+
+/**
  * @param {import('mongoose').Document|object} order
  * @returns {number}
  */
@@ -160,6 +174,7 @@ function calculateRtoRefund(order, options = {}) {
   const cartValue = roundMoney2(Number(order?.subtotal) || 0);
   const forwardShipping = getForwardShippingFromOrder(order);
   const orderTotal = getRtoOrderTotal(order);
+  const minGateAmount = getOrderAmountForRtoMinGate(order);
   const rtoShipping =
     options.rtoShippingOverride != null && Number.isFinite(Number(options.rtoShippingOverride))
       ? roundMoney2(Number(options.rtoShippingOverride))
@@ -184,6 +199,7 @@ function calculateRtoRefund(order, options = {}) {
     reason,
     cartValue,
     orderTotal,
+    minGateAmount,
     deductions,
     totalDeductions,
     netRefund: 0,
@@ -197,8 +213,11 @@ function calculateRtoRefund(order, options = {}) {
     return buildBlocked(eligibility.reason);
   }
 
-  if (orderTotal + 0.005 < minOrderValue) {
-    return buildBlocked('order_below_min_value', { orderTotalBelowMin: true });
+  // ₹100 gate: items + shipping (full order value), not cart/items alone.
+  if (minGateAmount + 0.005 < minOrderValue) {
+    return buildBlocked('order_below_min_value', {
+      orderTotalBelowMin: true
+    });
   }
 
   const rawNet = roundMoney2(orderTotal - totalDeductions);
@@ -227,6 +246,7 @@ function calculateRtoRefund(order, options = {}) {
           : 'refund_below_min_threshold',
     cartValue,
     orderTotal,
+    minGateAmount,
     deductions,
     totalDeductions,
     netRefund,
@@ -755,6 +775,7 @@ module.exports = {
   calculatePlatformFee,
   calculateRtoRefund,
   getRtoOrderTotal,
+  getOrderAmountForRtoMinGate,
   getMinOrderValueForRefund,
   getMinRefundThreshold,
   classifyRtoRefundEligibility,
