@@ -299,10 +299,19 @@ function buildCourierRtoSectionMatch() {
 
 /**
  * True warehouse-delivered / received-at-seller status text (NOT "RTO Acknowledged").
- * Acknowledged can appear earlier in the RTO lifecycle and must not unlock refund alone.
+ * Covers Shiprocket English labels + courier codes like `rts_d`
+ * ("Item Return To Seller Delivered").
+ * Acknowledged alone must never unlock refund.
  */
 const RTO_WAREHOUSE_DELIVERED_STATUS_RE =
-  /rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered/i;
+  /rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered|return to seller delivered|item return to seller delivered|rts delivered|\brts[\s_-]?d\b/i;
+
+/**
+ * Explicit non-delivered RTS / RTO codes (must not unlock refund).
+ * e.g. rts_ofd = return out for delivery, not delivered to seller WH.
+ */
+const RTO_NOT_WAREHOUSE_DELIVERED_CODE_RE =
+  /^(rto[\s_-]?acknowledged|acknowledged|rts[\s_-]?ofd|rts[\s_-]?in[\s_-]?process|rts[\s_-]?otp|received[\s_-]?at[\s_-]?rts[\s_-]?hub|rts)$/i;
 
 /**
  * Shiprocket-driven RTO workflow stage (display).
@@ -310,25 +319,54 @@ const RTO_WAREHOUSE_DELIVERED_STATUS_RE =
  * @param {string|null|undefined} providerStatus
  */
 function mapShiprocketRtoStage(providerStatus) {
-  const ps = String(providerStatus || '').toLowerCase();
-  if (!ps) return 'rto_initiated';
-  if (RTO_WAREHOUSE_DELIVERED_STATUS_RE.test(ps)) {
-    return 'rto_delivered_to_warehouse';
-  }
-  if (/\brto\b/.test(ps) && /in transit|picked up|out for pickup|reached destination hub|in\s*intransit/.test(ps)) {
-    return 'rto_in_transit';
-  }
-  if (/\brto\b/.test(ps) || /return to origin/.test(ps)) {
+  try {
+    const ps = String(providerStatus || '').toLowerCase();
+    if (!ps) return 'rto_initiated';
+    if (isRtoDeliveredToWarehouse(ps)) {
+      return 'rto_delivered_to_warehouse';
+    }
+    if (
+      (/\brto\b/.test(ps) || /\brts\b/.test(ps) || /return to seller|return to origin/.test(ps)) &&
+      /in transit|picked up|out for (pickup|delivery)|reached destination hub|in\s*intransit|rts_ofd|received_at_rts_hub|rts_in_process/.test(
+        ps
+      )
+    ) {
+      return 'rto_in_transit';
+    }
+    if (/\brto\b/.test(ps) || /\brts\b/.test(ps) || /return to origin|return to seller/.test(ps)) {
+      return 'rto_initiated';
+    }
+    return 'rto_initiated';
+  } catch {
     return 'rto_initiated';
   }
-  return 'rto_initiated';
 }
 
 /**
+ * True when status / activity text means parcel delivered back to seller warehouse.
+ * Safe for Shiprocket labels, courier codes (`rts_d`), and free-text activity lines.
+ * Never true for Acknowledged-only or RTS in-transit codes.
  * @param {string|null|undefined} providerStatus
  */
 function isRtoDeliveredToWarehouse(providerStatus) {
-  return RTO_WAREHOUSE_DELIVERED_STATUS_RE.test(String(providerStatus || ''));
+  try {
+    const raw = String(providerStatus ?? '').trim();
+    if (!raw) return false;
+
+    const compact = raw.toLowerCase().replace(/[\s-]+/g, '_');
+    if (RTO_NOT_WAREHOUSE_DELIVERED_CODE_RE.test(compact) || RTO_NOT_WAREHOUSE_DELIVERED_CODE_RE.test(raw)) {
+      return false;
+    }
+
+    // Exact / bounded courier delivered codes (Orders tab: rts_d)
+    if (/^rts_d$/i.test(compact) || /^rtsd$/i.test(compact)) {
+      return true;
+    }
+
+    return RTO_WAREHOUSE_DELIVERED_STATUS_RE.test(raw);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -351,34 +389,49 @@ function isLikelyRtoStatusLabel(text) {
 }
 
 /**
+ * Collect status / activity strings used for warehouse-delivered evidence.
+ * Includes normalized tracking `code` (Shiprocket stores sr_status as `code`, not only status_code).
  * @param {import('mongoose').Document|object} order
  * @returns {string[]}
  */
 function collectRtoStatusTexts(order) {
   const texts = [];
   const push = (v) => {
-    const s = String(v || '').trim();
-    if (s) texts.push(s);
-  };
-  push(order?.shipmentInfo?.providerStatus);
-  push(order?.returnInfo?.rtoShiprocketReason);
-  const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
-  for (const ev of events) {
-    if (!ev || typeof ev !== 'object') continue;
-    push(ev.status);
-    push(ev.current_status);
-    push(ev.sr_status);
-    push(ev['sr-status']);
-    push(ev.activity);
-    push(ev.message);
-    push(ev.description);
-    push(ev.status_code);
-    const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
-    if (raw) {
-      push(raw.sr_status_label);
-      push(raw.status);
-      push(raw.activity);
+    try {
+      if (v == null) return;
+      const s = String(v).trim();
+      if (s) texts.push(s);
+    } catch {
+      /* ignore bad event field */
     }
+  };
+  try {
+    push(order?.shipmentInfo?.providerStatus);
+    push(order?.returnInfo?.rtoShiprocketReason);
+    const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object') continue;
+      push(ev.status);
+      push(ev.current_status);
+      push(ev.sr_status);
+      push(ev['sr-status']);
+      push(ev.code);
+      push(ev.activity);
+      push(ev.message);
+      push(ev.description);
+      push(ev.status_code);
+      const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
+      if (raw) {
+        push(raw.sr_status_label);
+        push(raw.sr_status);
+        push(raw.status);
+        push(raw.status_code);
+        push(raw.activity);
+        push(raw.message);
+      }
+    }
+  } catch {
+    /* return whatever we collected */
   }
   return texts;
 }
@@ -389,7 +442,12 @@ function collectRtoStatusTexts(order) {
  * @param {import('mongoose').Document|object} order
  */
 function orderHasRtoWarehouseDeliveredEvidence(order) {
-  return collectRtoStatusTexts(order).some((t) => isRtoDeliveredToWarehouse(t));
+  try {
+    if (!order) return false;
+    return collectRtoStatusTexts(order).some((t) => isRtoDeliveredToWarehouse(t));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -400,9 +458,13 @@ function orderHasRtoWarehouseDeliveredEvidence(order) {
  * @param {import('mongoose').Document|object} order
  */
 function isRtoWarehouseDeliveredForOrder(order) {
-  if (!order) return false;
-  if (order.returnInfo?.rtoWarehouseDeliveredAt) return true;
-  return orderHasRtoWarehouseDeliveredEvidence(order);
+  try {
+    if (!order) return false;
+    if (order.returnInfo?.rtoWarehouseDeliveredAt) return true;
+    return orderHasRtoWarehouseDeliveredEvidence(order);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -411,15 +473,19 @@ function isRtoWarehouseDeliveredForOrder(order) {
  * @returns {boolean} whether returnInfo was mutated
  */
 function ensureRtoWarehouseDeliveredLatch(order) {
-  if (!order) return false;
-  if (order.returnInfo?.rtoWarehouseDeliveredAt) return false;
-  if (!orderHasRtoWarehouseDeliveredEvidence(order)) return false;
-  if (!order.returnInfo) order.returnInfo = {};
-  order.returnInfo.rtoWarehouseDeliveredAt = new Date();
-  if (typeof order.markModified === 'function') {
-    order.markModified('returnInfo');
+  try {
+    if (!order) return false;
+    if (order.returnInfo?.rtoWarehouseDeliveredAt) return false;
+    if (!orderHasRtoWarehouseDeliveredEvidence(order)) return false;
+    if (!order.returnInfo) order.returnInfo = {};
+    order.returnInfo.rtoWarehouseDeliveredAt = new Date();
+    if (typeof order.markModified === 'function') {
+      order.markModified('returnInfo');
+    }
+    return true;
+  } catch {
+    return false;
   }
-  return true;
 }
 
 /**
@@ -698,9 +764,12 @@ function syncRtoRefundStatusFromOrder(order) {
   return changed;
 }
 
-/** Mongo regex for true warehouse-delivered RTO (list filters). Acknowledged is excluded. */
+/**
+ * Mongo regex for true warehouse-delivered RTO (list filters).
+ * Acknowledged / rts_ofd / hub-only codes are excluded from this pattern.
+ */
 const RTO_WAREHOUSE_DELIVERED_REGEX =
-  'rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered';
+  'rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered|return to seller delivered|item return to seller delivered|rts delivered|rts_d|rts-d';
 
 /**
  * @param {object|null|undefined} ri
