@@ -209,16 +209,88 @@ function markRtoFreightSyncAttempted(order) {
 }
 
 /**
+ * True when admin RTO should backfill delivery freight vs COD fee split.
+ * @param {import('mongoose').Document|object} order
+ */
+function orderNeedsDeliverySplitBackfill(order) {
+  try {
+    if (!order) return false;
+    if (Number(order.deliveryCodFeeInr) > 0.005) return false;
+    const delivery = Number(order.deliveryCharges) || 0;
+    if (delivery < 0.01) return false;
+    const status = String(order.paymentStatus || '').toLowerCase();
+    const method = String(order.paymentInfo?.method || '').toLowerCase();
+    const balance = Number(order.balanceDueInr) || 0;
+    const likelyCodBundle =
+      status === 'partially_paid' || method === 'cod' || balance > 0.01;
+    if (!likelyCodBundle) return false;
+    const si = order.shipmentInfo || {};
+    const hasRef = Boolean(
+      (si.shipmentId && String(si.shipmentId).trim()) ||
+        (si.shiprocketOrderId && String(si.shiprocketOrderId).trim()) ||
+        (order.orderId && String(order.orderId).trim())
+    );
+    if (!hasRef) return false;
+    const syncedAt = order.returnInfo?.rtoFreightSyncedAt || si.rtoFreightSyncedAt;
+    if (syncedAt) {
+      const age = Date.now() - new Date(syncedAt).getTime();
+      if (Number.isFinite(age) && age >= 0 && age < RTO_FREIGHT_RESYNC_MS) {
+        // recently attempted; only retry if we never stored a freight split field
+        if (order.deliveryFreightInr != null) return false;
+      }
+    }
+    return order.deliveryFreightInr == null || order.deliveryCodFeeInr == null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Apply admin-only delivery freight / COD fee split onto the order (in-memory).
+ * Does not change deliveryCharges / customer totals.
+ * @param {import('mongoose').Document|object} order
+ * @param {{ freightInr?: number|null, codFeeInr?: number|null }} split
+ * @returns {boolean}
+ */
+function applyDeliveryChargeSplitToOrder(order, split = {}) {
+  try {
+    if (!order) return false;
+    let changed = false;
+    const freight =
+      split.freightInr != null && Number.isFinite(Number(split.freightInr))
+        ? roundMoney2(Number(split.freightInr))
+        : null;
+    const codFee =
+      split.codFeeInr != null && Number.isFinite(Number(split.codFeeInr))
+        ? roundMoney2(Number(split.codFeeInr))
+        : null;
+    if (freight != null && freight >= 0 && order.deliveryFreightInr == null) {
+      order.deliveryFreightInr = freight;
+      changed = true;
+    }
+    if (codFee != null && codFee >= 0 && !(Number(order.deliveryCodFeeInr) > 0.005)) {
+      order.deliveryCodFeeInr = codFee;
+      changed = true;
+    }
+    return changed;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Read-only Shiprocket lookup → persist RTO reverse freight on the order when found.
  * Never creates/assigns/cancels shipments. Safe to call from RTO admin paths only.
  * @param {import('mongoose').Document|object} order
  * @param {{ force?: boolean, persist?: boolean }} [options]
- * @returns {Promise<{ updated: boolean, amountInr: number, code?: string|null }>}
+ * @returns {Promise<{ updated: boolean, amountInr: number, code?: string|null, deliverySplitUpdated?: boolean }>}
  */
 async function syncRtoFreightChargeFromShiprocket(order, options = {}) {
   try {
     if (!order) return { updated: false, amountInr: 0, code: 'NO_ORDER' };
-    if (!options.force && !orderNeedsRtoFreightSync(order)) {
+    const needsFreight = options.force || orderNeedsRtoFreightSync(order);
+    const needsSplit = options.force || orderNeedsDeliverySplitBackfill(order);
+    if (!needsFreight && !needsSplit) {
       return { updated: false, amountInr: getRtoShippingFromOrder(order), code: 'SKIPPED' };
     }
 
@@ -230,34 +302,42 @@ async function syncRtoFreightChargeFromShiprocket(order, options = {}) {
       channelOrderId: order.orderId
     });
 
-    if (result?.success && result.rtoFreightInr != null && Number(result.rtoFreightInr) > 0.005) {
-      const applied = applyRtoFreightChargeToOrder(order, result.rtoFreightInr);
-      if (applied && options.persist !== false && typeof order.save === 'function') {
-        try {
-          await order.save();
-        } catch (_) {
-          /* caller may persist lean updates separately */
-        }
-      }
-      return {
-        updated: applied,
-        amountInr: roundMoney2(Number(result.rtoFreightInr)),
-        code: result.source || 'OK'
-      };
+    let updated = false;
+    let deliverySplitUpdated = false;
+    if (result?.deliveryFreightInr != null || result?.deliveryCodFeeInr != null) {
+      deliverySplitUpdated = applyDeliveryChargeSplitToOrder(order, {
+        freightInr: result.deliveryFreightInr,
+        codFeeInr: result.deliveryCodFeeInr
+      });
     }
 
-    markRtoFreightSyncAttempted(order);
-    if (options.persist !== false && typeof order.save === 'function') {
+    if (result?.rtoFreightInr != null && Number(result.rtoFreightInr) > 0.005) {
+      updated = applyRtoFreightChargeToOrder(order, result.rtoFreightInr) || updated;
+    } else {
+      markRtoFreightSyncAttempted(order);
+    }
+
+    if ((updated || deliverySplitUpdated) && options.persist !== false && typeof order.save === 'function') {
+      try {
+        await order.save();
+      } catch (_) {
+        /* caller may persist lean updates separately */
+      }
+    } else if (!updated && !deliverySplitUpdated && options.persist !== false && typeof order.save === 'function') {
       try {
         await order.save();
       } catch (_) {
         /* non-blocking */
       }
     }
+
     return {
-      updated: false,
-      amountInr: 0,
-      code: result?.code || 'RTO_FREIGHT_NOT_FOUND'
+      updated: updated || deliverySplitUpdated,
+      amountInr: updated ? roundMoney2(Number(result.rtoFreightInr) || 0) : getRtoShippingFromOrder(order),
+      deliverySplitUpdated,
+      code: result?.source || result?.code || 'OK',
+      deliveryFreightInr: order.deliveryFreightInr ?? null,
+      deliveryCodFeeInr: order.deliveryCodFeeInr ?? null
     };
   } catch (err) {
     try {
@@ -280,7 +360,9 @@ async function enrichRtoOrdersFreightCharges(orders, options = {}) {
   const list = Array.isArray(orders) ? orders : [];
   const concurrency = Math.min(4, Math.max(1, Number(options.concurrency) || 3));
   const maxOrders = Math.min(list.length, Math.max(1, Number(options.maxOrders) || 8));
-  const targets = list.filter((o) => orderNeedsRtoFreightSync(o)).slice(0, maxOrders);
+  const targets = list
+    .filter((o) => orderNeedsRtoFreightSync(o) || orderNeedsDeliverySplitBackfill(o))
+    .slice(0, maxOrders);
   if (!targets.length) return 0;
 
   const Order = require('../models/Order');
@@ -293,24 +375,29 @@ async function enrichRtoOrdersFreightCharges(orders, options = {}) {
       idx += 1;
       try {
         const result = await syncRtoFreightChargeFromShiprocket(current, { persist: false });
-        if (result.updated && result.amountInr > 0.005 && current?._id) {
-          await Order.updateOne(
-            { _id: current._id },
-            {
-              $set: {
-                'returnInfo.rtoShippingCharges': result.amountInr,
-                'returnInfo.rtoFreightSyncedAt': new Date(),
-                'shipmentInfo.rtoFreightCharge': result.amountInr,
-                'shipmentInfo.rtoFreightSyncedAt': new Date()
-              }
-            }
-          );
+        if (result.updated && current?._id) {
+          const $set = {
+            'returnInfo.rtoFreightSyncedAt': new Date(),
+            'shipmentInfo.rtoFreightSyncedAt': new Date()
+          };
+          if (result.amountInr > 0.005) {
+            $set['returnInfo.rtoShippingCharges'] = result.amountInr;
+            $set['shipmentInfo.rtoFreightCharge'] = result.amountInr;
+          }
+          if (current.deliveryFreightInr != null) {
+            $set.deliveryFreightInr = current.deliveryFreightInr;
+          }
+          if (current.deliveryCodFeeInr != null) {
+            $set.deliveryCodFeeInr = current.deliveryCodFeeInr;
+          }
+          await Order.updateOne({ _id: current._id }, { $set });
           if (!current.returnInfo) current.returnInfo = {};
           if (!current.shipmentInfo) current.shipmentInfo = {};
-          current.returnInfo.rtoShippingCharges = result.amountInr;
           current.returnInfo.rtoFreightSyncedAt = new Date();
-          current.shipmentInfo.rtoFreightCharge = result.amountInr;
-          current.shipmentInfo.rtoFreightSyncedAt = new Date();
+          if (result.amountInr > 0.005) {
+            current.returnInfo.rtoShippingCharges = result.amountInr;
+            current.shipmentInfo.rtoFreightCharge = result.amountInr;
+          }
           updatedCount += 1;
         } else if (current?._id) {
           await Order.updateOne(
@@ -1087,7 +1174,9 @@ module.exports = {
   getForwardShippingFromOrder,
   getRtoShippingFromOrder,
   orderNeedsRtoFreightSync,
+  orderNeedsDeliverySplitBackfill,
   applyRtoFreightChargeToOrder,
+  applyDeliveryChargeSplitToOrder,
   syncRtoFreightChargeFromShiprocket,
   enrichRtoOrdersFreightCharges,
   toPlainReturnInfo,

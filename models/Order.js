@@ -36,6 +36,12 @@ const orderSchema = new mongoose.Schema(
     // Price breakdown (calculated on server)
     subtotal: { type: Number, required: true },
     deliveryCharges: { type: Number, required: true, default: 0 },
+    /**
+     * Admin/RTO clarity only: Shiprocket quote split when COD fee was bundled into deliveryCharges.
+     * Customer totals still use deliveryCharges; do not surface these on storefront UI.
+     */
+    deliveryFreightInr: { type: Number, default: null },
+    deliveryCodFeeInr: { type: Number, default: null },
     tax: { type: Number, required: true, default: 0 },
     discount: { type: Number, default: 0 },
     totalAmount: { type: Number, required: true },

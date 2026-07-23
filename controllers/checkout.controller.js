@@ -378,7 +378,16 @@ exports.quoteCheckout = async (req, res) => {
         courierCompanyId: finalTotals.deliveryMeta?.courierCompanyId || null,
         codAvailable: finalTotals.deliveryMeta?.codAvailable !== false,
         message: 'Delivery available',
-        mock: Boolean(finalTotals.deliveryMeta?.mock)
+        mock: Boolean(finalTotals.deliveryMeta?.mock),
+        // Stored on quote for order create / admin RTO only — not returned to storefront UI below.
+        freightInr:
+          finalTotals.deliveryMeta?.freightInr != null
+            ? roundMoney2(Number(finalTotals.deliveryMeta.freightInr))
+            : null,
+        codFeeInr:
+          finalTotals.deliveryMeta?.codFeeInr != null
+            ? roundMoney2(Number(finalTotals.deliveryMeta.codFeeInr))
+            : null
       },
       totalWeightKg: finalTotals.totalWeight,
       dims: finalTotals.dims,

@@ -58,6 +58,8 @@ class ShiprocketService {
     return {
       isDeliverable: true,
       deliveryCharges: base,
+      freightInr: base,
+      codFeeInr: 0,
       estimatedDays: '3–5',
       courierName: 'Standard (mock)',
       message: 'Shiprocket disabled — using internal mock tariff',
@@ -156,6 +158,122 @@ class ShiprocketService {
   }
 
   /**
+   * Split Shiprocket courier quote into forward freight vs COD collection fee.
+   * `rate` is often freight+COD when COD is enabled; customer totals keep using deliveryCharges (= rate).
+   * @param {object|null|undefined} courier
+   * @param {number} [fallbackTotal]
+   * @returns {{ deliveryCharges: number, freightInr: number, codFeeInr: number }}
+   */
+  static extractShippingChargeSplit(courier, fallbackTotal = 0) {
+    try {
+      const rate = roundMoney2(
+        Number(courier?.rate ?? courier?.total_rate ?? fallbackTotal) || 0
+      );
+      const freightRaw = Number(
+        courier?.freight_charge ?? courier?.freight_charges ?? courier?.freight ?? NaN
+      );
+      const codRaw = Number(
+        courier?.cod_charges ?? courier?.cod_charge ?? courier?.cod_fee ?? NaN
+      );
+
+      if (Number.isFinite(freightRaw) && freightRaw >= 0 && Number.isFinite(codRaw) && codRaw >= 0) {
+        const freightInr = roundMoney2(freightRaw);
+        const codFeeInr = roundMoney2(codRaw);
+        const deliveryCharges =
+          rate > 0.005 ? rate : roundMoney2(freightInr + codFeeInr);
+        return { deliveryCharges, freightInr, codFeeInr };
+      }
+
+      if (Number.isFinite(freightRaw) && freightRaw >= 0 && rate > freightRaw + 0.005) {
+        return {
+          deliveryCharges: rate,
+          freightInr: roundMoney2(freightRaw),
+          codFeeInr: roundMoney2(rate - freightRaw)
+        };
+      }
+
+      if (Number.isFinite(codRaw) && codRaw >= 0.01 && rate > codRaw + 0.005) {
+        return {
+          deliveryCharges: rate,
+          freightInr: roundMoney2(rate - codRaw),
+          codFeeInr: roundMoney2(codRaw)
+        };
+      }
+
+      return {
+        deliveryCharges: Math.max(0, rate),
+        freightInr: Math.max(0, rate),
+        codFeeInr: 0
+      };
+    } catch {
+      const rate = roundMoney2(Number(fallbackTotal) || 0);
+      return { deliveryCharges: rate, freightInr: rate, codFeeInr: 0 };
+    }
+  }
+
+  /**
+   * Best-effort extract of forward freight + COD fee from Shiprocket JSON (admin RTO backfill only).
+   * @param {object|null|undefined} payload
+   * @returns {{ freightInr: number|null, codFeeInr: number|null }}
+   */
+  static extractDeliveryChargeSplitFromPayload(payload) {
+    try {
+      if (!payload || typeof payload !== 'object') {
+        return { freightInr: null, codFeeInr: null };
+      }
+
+      const pickMoney = (v) => {
+        if (v == null || v === '') return null;
+        if (typeof v === 'object' && !Array.isArray(v)) {
+          return pickMoney(v.amount ?? v.value ?? v.charge ?? v.charges);
+        }
+        const n = Number(String(v).replace(/,/g, '').replace(/[^\d.-]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return null;
+        return roundMoney2(n);
+      };
+
+      let freightInr = null;
+      let codFeeInr = null;
+      const queue = [payload];
+      const seen = new Set();
+      let steps = 0;
+      while (queue.length && steps < 50) {
+        steps += 1;
+        const node = queue.shift();
+        if (!node || typeof node !== 'object' || seen.has(node)) continue;
+        seen.add(node);
+        if (Array.isArray(node)) {
+          for (const item of node.slice(0, 25)) {
+            if (item && typeof item === 'object') queue.push(item);
+          }
+          continue;
+        }
+        for (const [key, val] of Object.entries(node)) {
+          const lk = String(key || '')
+            .toLowerCase()
+            .replace(/[\s-]+/g, '_');
+          if (
+            freightInr == null &&
+            /^(fwd_amount|forward_amount|freight_charge|freight_charges)$/.test(lk)
+          ) {
+            const m = pickMoney(val);
+            if (m != null) freightInr = m;
+          }
+          if (codFeeInr == null && /^(cod_charges|cod_charge|cod_fee)$/.test(lk)) {
+            const m = pickMoney(val);
+            if (m != null) codFeeInr = m;
+          }
+          if (val && typeof val === 'object' && seen.size < 90) queue.push(val);
+        }
+        if (freightInr != null && codFeeInr != null) break;
+      }
+      return { freightInr, codFeeInr };
+    } catch {
+      return { freightInr: null, codFeeInr: null };
+    }
+  }
+
+  /**
    * @param {string} deliveryPincode
    * @param {object} opts
    * @param {number} opts.weightKg
@@ -247,7 +365,7 @@ class ShiprocketService {
       }
       const best = picked.courier;
 
-      const rate = Number(best.rate ?? best.freight_charge ?? best.estimated_delivery_days) || 0;
+      const split = ShiprocketService.extractShippingChargeSplit(best, Number(best.rate ?? best.freight_charge) || 0);
       const days =
         best.estimated_delivery_days != null
           ? String(best.estimated_delivery_days)
@@ -257,7 +375,9 @@ class ShiprocketService {
 
       return {
         isDeliverable: true,
-        deliveryCharges: Math.max(0, rate),
+        deliveryCharges: Math.max(0, split.deliveryCharges),
+        freightInr: Math.max(0, split.freightInr),
+        codFeeInr: Math.max(0, split.codFeeInr),
         estimatedDays: days,
         courierName: picked.courierName,
         courierCompanyId: companyId,
@@ -285,6 +405,8 @@ class ShiprocketService {
     });
     return {
       deliveryCharges: r.deliveryCharges,
+      freightInr: r.freightInr != null ? r.freightInr : r.deliveryCharges,
+      codFeeInr: Number(r.codFeeInr) || 0,
       isDeliverable: r.isDeliverable,
       estimatedDays: r.estimatedDays,
       courierName: r.courierName,
@@ -2564,6 +2686,8 @@ class ShiprocketService {
         return {
           success: false,
           rtoFreightInr: null,
+          deliveryFreightInr: null,
+          deliveryCodFeeInr: null,
           code: 'SHIPROCKET_DISABLED',
           message: 'Shiprocket is disabled'
         };
@@ -2574,6 +2698,18 @@ class ShiprocketService {
         .map((x) => (x != null ? String(x).trim() : ''))
         .filter(Boolean);
 
+      const pack = (data, source) => {
+        const rtoFreightInr = ShiprocketService.extractRtoFreightInrFromPayload(data);
+        const split = ShiprocketService.extractDeliveryChargeSplitFromPayload(data);
+        return {
+          success: rtoFreightInr != null || split.freightInr != null || split.codFeeInr != null,
+          rtoFreightInr,
+          deliveryFreightInr: split.freightInr,
+          deliveryCodFeeInr: split.codFeeInr,
+          source
+        };
+      };
+
       if (shipmentId) {
         try {
           const data = await this.requestWithAuth({
@@ -2581,10 +2717,8 @@ class ShiprocketService {
             url: `${this.baseURL}/external/shipments/${encodeURIComponent(shipmentId)}`,
             timeout: 15000
           });
-          const amount = ShiprocketService.extractRtoFreightInrFromPayload(data);
-          if (amount != null) {
-            return { success: true, rtoFreightInr: amount, source: 'shipments_show' };
-          }
+          const packed = pack(data, 'shipments_show');
+          if (packed.success) return packed;
         } catch (err) {
           logger.warn('[Shiprocket] fetchRtoFreightCharge shipments failed', {
             shipmentId,
@@ -2602,10 +2736,8 @@ class ShiprocketService {
             timeout: 15000
           });
           const root = ShiprocketService.normalizeForwardOrderRoot(data);
-          const amount = ShiprocketService.extractRtoFreightInrFromPayload(root || data);
-          if (amount != null) {
-            return { success: true, rtoFreightInr: amount, source: 'orders_show' };
-          }
+          const packed = pack(root || data, 'orders_show');
+          if (packed.success) return packed;
         } catch (err) {
           logger.warn('[Shiprocket] fetchRtoFreightCharge orders/show failed', {
             id,
@@ -2618,6 +2750,8 @@ class ShiprocketService {
       return {
         success: false,
         rtoFreightInr: null,
+        deliveryFreightInr: null,
+        deliveryCodFeeInr: null,
         code: 'RTO_FREIGHT_NOT_FOUND',
         message: 'RTO freight amount not present in Shiprocket response yet'
       };
@@ -2626,6 +2760,8 @@ class ShiprocketService {
       return {
         success: false,
         rtoFreightInr: null,
+        deliveryFreightInr: null,
+        deliveryCodFeeInr: null,
         code: 'RTO_FREIGHT_LOOKUP_FAILED',
         message: err?.message || 'Failed to fetch RTO freight'
       };

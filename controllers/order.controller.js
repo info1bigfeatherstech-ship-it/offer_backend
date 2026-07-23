@@ -1224,7 +1224,17 @@ exports.createOrder = async (req, res) => {
                         ? Number(quote.shippingMeta.courierCompanyId)
                         : null,
                 isDeliverable: true,
-                codAvailable: quote.shippingMeta?.codAvailable !== false
+                codAvailable: quote.shippingMeta?.codAvailable !== false,
+                freightInr:
+                    quote.shippingMeta?.freightInr != null &&
+                    Number.isFinite(Number(quote.shippingMeta.freightInr))
+                        ? roundMoney2(Number(quote.shippingMeta.freightInr))
+                        : null,
+                codFeeInr:
+                    quote.shippingMeta?.codFeeInr != null &&
+                    Number.isFinite(Number(quote.shippingMeta.codFeeInr))
+                        ? roundMoney2(Number(quote.shippingMeta.codFeeInr))
+                        : null
             }
         };
 
@@ -1374,6 +1384,22 @@ exports.createOrder = async (req, res) => {
             items: orderItemsWithCodes,
             subtotal: subtotal,
             deliveryCharges: deliveryCharges,
+            deliveryFreightInr:
+                priced.deliveryMeta?.freightInr != null &&
+                Number.isFinite(Number(priced.deliveryMeta.freightInr))
+                    ? roundMoney2(Number(priced.deliveryMeta.freightInr))
+                    : quote.shippingMeta?.freightInr != null &&
+                        Number.isFinite(Number(quote.shippingMeta.freightInr))
+                      ? roundMoney2(Number(quote.shippingMeta.freightInr))
+                      : null,
+            deliveryCodFeeInr:
+                priced.deliveryMeta?.codFeeInr != null &&
+                Number.isFinite(Number(priced.deliveryMeta.codFeeInr))
+                    ? roundMoney2(Number(priced.deliveryMeta.codFeeInr))
+                    : quote.shippingMeta?.codFeeInr != null &&
+                        Number.isFinite(Number(quote.shippingMeta.codFeeInr))
+                      ? roundMoney2(Number(quote.shippingMeta.codFeeInr))
+                      : null,
             tax: tax,
             discount: discount,
             totalAmount: totalAmount,
@@ -2811,6 +2837,9 @@ exports.getOrder = async (req, res) => {
         // Hide internal admin audit from customer responses.
         if (!isOrderStaff) {
             delete transformedOrder.adminEditHistory;
+            // Admin/RTO-only shipping split — never surface on customer order API.
+            delete transformedOrder.deliveryFreightInr;
+            delete transformedOrder.deliveryCodFeeInr;
         }
 
         if (isOrderStaff && transformedOrder.userId && typeof transformedOrder.userId === 'object') {

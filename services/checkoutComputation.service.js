@@ -340,7 +340,15 @@ async function computeCheckoutTotals({
           : null,
       isDeliverable: baseOverride.isDeliverable !== false,
       codAvailable: baseOverride.codAvailable !== false,
-      mock: Boolean(baseOverride.mock)
+      mock: Boolean(baseOverride.mock),
+      freightInr:
+        baseOverride.freightInr != null && Number.isFinite(Number(baseOverride.freightInr))
+          ? roundMoney2(Number(baseOverride.freightInr))
+          : null,
+      codFeeInr:
+        baseOverride.codFeeInr != null && Number.isFinite(Number(baseOverride.codFeeInr))
+          ? roundMoney2(Number(baseOverride.codFeeInr))
+          : null
     };
   } else {
     const ship = await ShiprocketService.checkDeliveryAvailability(postalCode, {
@@ -369,7 +377,15 @@ async function computeCheckoutTotals({
       courierCompanyId: cid,
       isDeliverable: ship.isDeliverable,
       codAvailable: ship.codAvailable !== false,
-      mock: ship.mock
+      mock: ship.mock,
+      freightInr:
+        ship.freightInr != null && Number.isFinite(Number(ship.freightInr))
+          ? roundMoney2(Number(ship.freightInr))
+          : deliveryCharges,
+      codFeeInr:
+        ship.codFeeInr != null && Number.isFinite(Number(ship.codFeeInr))
+          ? roundMoney2(Number(ship.codFeeInr))
+          : 0
     };
   }
 
