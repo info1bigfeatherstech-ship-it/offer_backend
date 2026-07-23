@@ -324,6 +324,15 @@ function mapRtoOrderRow(order) {
     customerName,
     subtotalInr: roundMoney2(Number(o.subtotal) || 0),
     deliveryChargesInr: roundMoney2(Number(o.deliveryCharges) || 0),
+    /** Admin RTO breakdown only — freight vs COD fee when known (customer total still deliveryCharges). */
+    deliveryFreightInr:
+      o.deliveryFreightInr != null && Number.isFinite(Number(o.deliveryFreightInr))
+        ? roundMoney2(Number(o.deliveryFreightInr))
+        : null,
+    deliveryCodFeeInr:
+      o.deliveryCodFeeInr != null && Number.isFinite(Number(o.deliveryCodFeeInr))
+        ? roundMoney2(Number(o.deliveryCodFeeInr))
+        : null,
     rtoStatus,
     rtoStage,
     rtoStageLabel:
