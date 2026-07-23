@@ -79,36 +79,260 @@ function getForwardShippingFromOrder(order) {
 }
 
 /**
- * RTO return freight from Shiprocket payload fields when present.
+ * RTO return freight from persisted Shiprocket fields when present.
+ * Does not call Shiprocket — use {@link syncRtoFreightChargeFromShiprocket} to populate.
  * @param {import('mongoose').Document|object} order
  * @returns {number}
  */
 function getRtoShippingFromOrder(order) {
-  const si = order?.shipmentInfo || {};
-  const stored = order?.returnInfo?.rtoDeductions?.rtoShipping;
-  if (stored != null && Number.isFinite(Number(stored))) {
-    return roundMoney2(Number(stored));
+  try {
+    const si = order?.shipmentInfo || {};
+    const ri = order?.returnInfo || {};
+    const refundLocked =
+      ri.rtoRefundAmount != null ||
+      Boolean(ri.rtoRefundId) ||
+      String(ri.rtoStatus || '').toLowerCase() === 'refunded';
+
+    const storedDeduction = ri.rtoDeductions?.rtoShipping;
+    if (storedDeduction != null && Number.isFinite(Number(storedDeduction))) {
+      const n = roundMoney2(Number(storedDeduction));
+      // Trust saved deductions after refund; otherwise ignore placeholder 0 so live fields can win.
+      if (refundLocked || n > 0.005) return n;
+    }
+
+    const candidates = [
+      ri.rtoShippingCharges,
+      si.rtoFreightCharge,
+      si.rtoShippingCharge,
+      si.rto_charge,
+      si.freight_charge_rto
+    ];
+    for (const c of candidates) {
+      const n = Number(c);
+      if (Number.isFinite(n) && n > 0.005) return roundMoney2(n);
+    }
+
+    const events = Array.isArray(si.rawEvents) ? si.rawEvents : [];
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i] || {};
+      const freight = ev.rto_freight ?? ev.rto_charge ?? ev.rto_amount;
+      const n = Number(freight);
+      if (Number.isFinite(n) && n > 0.005) return roundMoney2(n);
+    }
+
+    const envDefault = Number(process.env.RTO_DEFAULT_SHIPPING_CHARGE);
+    if (Number.isFinite(envDefault) && envDefault >= 0) {
+      return roundMoney2(envDefault);
+    }
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+const RTO_FREIGHT_RESYNC_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * True when we should attempt a read-only Shiprocket freight lookup.
+ * @param {import('mongoose').Document|object} order
+ */
+function orderNeedsRtoFreightSync(order) {
+  try {
+    if (!order) return false;
+    if (getRtoShippingFromOrder(order) > 0.005) return false;
+
+    const si = order.shipmentInfo || {};
+    const ri = order.returnInfo || {};
+    const hasRef = Boolean(
+      (si.shipmentId && String(si.shipmentId).trim()) ||
+        (si.shiprocketOrderId && String(si.shiprocketOrderId).trim()) ||
+        (order.orderId && String(order.orderId).trim())
+    );
+    if (!hasRef) return false;
+
+    const syncedAt = ri.rtoFreightSyncedAt || si.rtoFreightSyncedAt;
+    if (syncedAt) {
+      const age = Date.now() - new Date(syncedAt).getTime();
+      if (Number.isFinite(age) && age >= 0 && age < RTO_FREIGHT_RESYNC_MS) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Apply a positive RTO freight amount onto the order document (in-memory).
+ * @param {import('mongoose').Document|object} order
+ * @param {number} amountInr
+ * @returns {boolean}
+ */
+function applyRtoFreightChargeToOrder(order, amountInr) {
+  try {
+    const n = roundMoney2(Number(amountInr));
+    if (!Number.isFinite(n) || n < 0.01) return false;
+    if (!order.returnInfo) order.returnInfo = {};
+    if (!order.shipmentInfo) order.shipmentInfo = {};
+    order.returnInfo.rtoShippingCharges = n;
+    order.returnInfo.rtoFreightSyncedAt = new Date();
+    order.shipmentInfo.rtoFreightCharge = n;
+    order.shipmentInfo.rtoFreightSyncedAt = new Date();
+    if (typeof order.markModified === 'function') {
+      order.markModified('returnInfo');
+      order.markModified('shipmentInfo');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Mark that we attempted a freight sync (even if amount not found) to avoid API hammering.
+ * @param {import('mongoose').Document|object} order
+ */
+function markRtoFreightSyncAttempted(order) {
+  try {
+    if (!order) return;
+    if (!order.returnInfo) order.returnInfo = {};
+    if (!order.shipmentInfo) order.shipmentInfo = {};
+    const now = new Date();
+    order.returnInfo.rtoFreightSyncedAt = now;
+    order.shipmentInfo.rtoFreightSyncedAt = now;
+    if (typeof order.markModified === 'function') {
+      order.markModified('returnInfo');
+      order.markModified('shipmentInfo');
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Read-only Shiprocket lookup → persist RTO reverse freight on the order when found.
+ * Never creates/assigns/cancels shipments. Safe to call from RTO admin paths only.
+ * @param {import('mongoose').Document|object} order
+ * @param {{ force?: boolean, persist?: boolean }} [options]
+ * @returns {Promise<{ updated: boolean, amountInr: number, code?: string|null }>}
+ */
+async function syncRtoFreightChargeFromShiprocket(order, options = {}) {
+  try {
+    if (!order) return { updated: false, amountInr: 0, code: 'NO_ORDER' };
+    if (!options.force && !orderNeedsRtoFreightSync(order)) {
+      return { updated: false, amountInr: getRtoShippingFromOrder(order), code: 'SKIPPED' };
+    }
+
+    const ShiprocketService = require('../utils/shiprocket');
+    const si = order.shipmentInfo || {};
+    const result = await ShiprocketService.fetchRtoFreightCharge({
+      shipmentId: si.shipmentId,
+      shiprocketOrderId: si.shiprocketOrderId,
+      channelOrderId: order.orderId
+    });
+
+    if (result?.success && result.rtoFreightInr != null && Number(result.rtoFreightInr) > 0.005) {
+      const applied = applyRtoFreightChargeToOrder(order, result.rtoFreightInr);
+      if (applied && options.persist !== false && typeof order.save === 'function') {
+        try {
+          await order.save();
+        } catch (_) {
+          /* caller may persist lean updates separately */
+        }
+      }
+      return {
+        updated: applied,
+        amountInr: roundMoney2(Number(result.rtoFreightInr)),
+        code: result.source || 'OK'
+      };
+    }
+
+    markRtoFreightSyncAttempted(order);
+    if (options.persist !== false && typeof order.save === 'function') {
+      try {
+        await order.save();
+      } catch (_) {
+        /* non-blocking */
+      }
+    }
+    return {
+      updated: false,
+      amountInr: 0,
+      code: result?.code || 'RTO_FREIGHT_NOT_FOUND'
+    };
+  } catch (err) {
+    try {
+      markRtoFreightSyncAttempted(order);
+    } catch (_) {
+      /* ignore */
+    }
+    return { updated: false, amountInr: 0, code: 'RTO_FREIGHT_SYNC_ERROR' };
+  }
+}
+
+/**
+ * Enrich a page of RTO orders with missing reverse freight (bounded concurrency).
+ * Mutates lean docs in place and persists via updateOne — does not throw.
+ * @param {Array<object>} orders
+ * @param {{ concurrency?: number, maxOrders?: number }} [options]
+ * @returns {Promise<number>} number of orders updated with a positive charge
+ */
+async function enrichRtoOrdersFreightCharges(orders, options = {}) {
+  const list = Array.isArray(orders) ? orders : [];
+  const concurrency = Math.min(4, Math.max(1, Number(options.concurrency) || 3));
+  const maxOrders = Math.min(list.length, Math.max(1, Number(options.maxOrders) || 8));
+  const targets = list.filter((o) => orderNeedsRtoFreightSync(o)).slice(0, maxOrders);
+  if (!targets.length) return 0;
+
+  const Order = require('../models/Order');
+  let updatedCount = 0;
+  let idx = 0;
+
+  async function worker() {
+    while (idx < targets.length) {
+      const current = targets[idx];
+      idx += 1;
+      try {
+        const result = await syncRtoFreightChargeFromShiprocket(current, { persist: false });
+        if (result.updated && result.amountInr > 0.005 && current?._id) {
+          await Order.updateOne(
+            { _id: current._id },
+            {
+              $set: {
+                'returnInfo.rtoShippingCharges': result.amountInr,
+                'returnInfo.rtoFreightSyncedAt': new Date(),
+                'shipmentInfo.rtoFreightCharge': result.amountInr,
+                'shipmentInfo.rtoFreightSyncedAt': new Date()
+              }
+            }
+          );
+          if (!current.returnInfo) current.returnInfo = {};
+          if (!current.shipmentInfo) current.shipmentInfo = {};
+          current.returnInfo.rtoShippingCharges = result.amountInr;
+          current.returnInfo.rtoFreightSyncedAt = new Date();
+          current.shipmentInfo.rtoFreightCharge = result.amountInr;
+          current.shipmentInfo.rtoFreightSyncedAt = new Date();
+          updatedCount += 1;
+        } else if (current?._id) {
+          await Order.updateOne(
+            { _id: current._id },
+            {
+              $set: {
+                'returnInfo.rtoFreightSyncedAt': new Date(),
+                'shipmentInfo.rtoFreightSyncedAt': new Date()
+              }
+            }
+          );
+          if (!current.returnInfo) current.returnInfo = {};
+          current.returnInfo.rtoFreightSyncedAt = new Date();
+        }
+      } catch (_) {
+        /* skip this order */
+      }
+    }
   }
 
-  const candidates = [si.rtoFreightCharge, si.rtoShippingCharge, si.rto_charge, si.freight_charge_rto];
-  for (const c of candidates) {
-    const n = Number(c);
-    if (Number.isFinite(n) && n >= 0) return roundMoney2(n);
-  }
-
-  const events = Array.isArray(si.rawEvents) ? si.rawEvents : [];
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const ev = events[i] || {};
-    const freight = ev.rto_freight ?? ev.freight_charge ?? ev.rto_charge;
-    const n = Number(freight);
-    if (Number.isFinite(n) && n >= 0) return roundMoney2(n);
-  }
-
-  const envDefault = Number(process.env.RTO_DEFAULT_SHIPPING_CHARGE);
-  if (Number.isFinite(envDefault) && envDefault >= 0) {
-    return roundMoney2(envDefault);
-  }
-  return 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()));
+  return updatedCount;
 }
 
 /**
@@ -862,6 +1086,10 @@ module.exports = {
   syncRtoRefundStatusFromOrder,
   getForwardShippingFromOrder,
   getRtoShippingFromOrder,
+  orderNeedsRtoFreightSync,
+  applyRtoFreightChargeToOrder,
+  syncRtoFreightChargeFromShiprocket,
+  enrichRtoOrdersFreightCharges,
   toPlainReturnInfo,
   mergeReturnInfo,
   isFullOnlinePaidOrder,
