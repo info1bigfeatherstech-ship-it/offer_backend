@@ -283,7 +283,11 @@ function mapRtoOrderRow(order) {
   const refundTrack = deriveRefundTrackStatus(o);
   const warehouseDelivered = isRtoWarehouseDeliveredForOrder(o);
   const paymentType = classifyRtoPaymentType(o);
-  const adminActionRequired = warehouseDelivered && rtoStatus === 'pending' && paymentType.refundAllowed;
+  const adminActionRequired =
+    warehouseDelivered &&
+    rtoStatus === 'pending' &&
+    paymentType.refundAllowed &&
+    calc.eligible;
   const displayReason = resolveRtoDisplayReason(o);
 
   const customerName =
@@ -292,8 +296,29 @@ function mapRtoOrderRow(order) {
     [o.addressSnapshot?.firstName, o.addressSnapshot?.lastName].filter(Boolean).join(' ') ||
     '—';
 
+  const minGateLabel = roundMoney2(
+    Number(calc.minGateAmount) || Number(calc.orderTotal) || Number(o.totalAmount) || 0
+  );
+  const orderValueInr = roundMoney2(
+    Math.max(
+      Number(calc.orderTotal) || 0,
+      Number(calc.minGateAmount) || 0,
+      Number(o.totalAmount) || 0,
+      roundMoney2((Number(o.subtotal) || 0) + (Number(o.deliveryCharges) || 0))
+    )
+  );
+  const amountPaidInr = roundMoney2(Number(o.amountPaidInr) || 0);
+  const codDueInr =
+    paymentType.key === 'partial_paid' || paymentType.key === 'cod'
+      ? roundMoney2(Math.max(0, orderValueInr - amountPaidInr))
+      : 0;
+
   return {
     ...base,
+    /** Full order value for RTO Amount column (items + shipping), not cart-only. */
+    amountInr: orderValueInr > 0.005 ? orderValueInr : base.amountInr,
+    amountPaidInr,
+    codDueInr,
     customerName,
     subtotalInr: roundMoney2(Number(o.subtotal) || 0),
     deliveryChargesInr: roundMoney2(Number(o.deliveryCharges) || 0),
@@ -334,7 +359,9 @@ function mapRtoOrderRow(order) {
       ['pending', null].includes(rtoStatus) &&
       !ri.rtoRejectedAt &&
       !hasRtoRefundBeenInitiated(o),
+    /** Deny refund only when a Razorpay refund was otherwise possible (eligible). */
     canReject:
+      calc.eligible &&
       paymentType.refundAllowed &&
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
@@ -352,12 +379,12 @@ function mapRtoOrderRow(order) {
             : paymentType.key === 'cod'
               ? 'COD — close case (no Razorpay)'
               : calc.reason === 'order_below_min_value'
-                ? `Order total below ₹${calc.minOrderValue ?? 100} — no refund`
+                ? `Order ₹${minGateLabel} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — no refund`
                 : calc.reason === 'refund_below_min_threshold'
-                  ? `Net refund ₹${calc.netRefund ?? 0} — must exceed ₹${calc.minRefundThreshold ?? 20}`
+                  ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} — no refund`
                   : calc.reason === 'zero_or_negative_net_refund'
                     ? 'Deductions exceed order total — no refund'
-                    : null
+                    : 'Not eligible for RTO refund'
           : null
   };
 }
@@ -559,9 +586,9 @@ exports.processRtoRefund = async (req, res) => {
           : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
             ? 'Partial payment orders are not eligible for refund. Close the case instead.'
             : calc.reason === 'order_below_min_value'
-              ? `Order total is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
+              ? `Order ₹${roundMoney2(Number(calc.minGateAmount) || Number(calc.orderTotal) || 0)} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
               : calc.reason === 'refund_below_min_threshold'
-                ? `Net refund must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
+                ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
                 : 'This order is not eligible for RTO refund.'
       );
     }
