@@ -4,7 +4,9 @@
  * - Rebuild weight snapshot + cheapest courier re-quote
  * - Freeze coupon/discount
  * - Never charge customer more for shipping (cap at previous deliveryCharges)
- * - Full paid → refund excess; partial → reduce COD balanceDue; over-advance → refund excess
+ * - Online/prepaid (captured): item excess refunds on Apply; shipping held until Ship Now
+ *   (actual Shiprocket freight) then excess shipping is refunded — see oosShippingSettlement.service
+ * - COD: immediate shipping reprice + balanceDue update (unchanged)
  * - Empty cart → cancel + refund amount paid
  */
 const Razorpay = require('razorpay');
@@ -27,6 +29,10 @@ const {
 } = require('./orderStockBridge.service');
 const { mergeReturnInfo } = require('./rtoRefund.service');
 const { notifyOrderAmended } = require('./orderAmendmentNotification.service');
+const {
+  shouldDeferShippingSettlement,
+  buildOosShippingSettlementMeta
+} = require('./oosShippingSettlement.service');
 
 const razorpay =
   String(process.env.RAZORPAY_KEY_ID || '').trim() && String(process.env.RAZORPAY_KEY_SECRET || '').trim()
@@ -462,7 +468,14 @@ function settleFinancials(order, newTotal) {
   };
 }
 
-function buildCustomerMessages({ changeSummaries, refundInr, balanceDueInr, cancelledEmpty, newTotal }) {
+function buildCustomerMessages({
+  changeSummaries,
+  refundInr,
+  balanceDueInr,
+  cancelledEmpty,
+  newTotal,
+  shippingSettlementDeferred = false
+}) {
   const notes = [];
   const itemParts = (changeSummaries || []).map((c) => {
     if (c.action === 'removed') {
@@ -496,14 +509,24 @@ function buildCustomerMessages({ changeSummaries, refundInr, balanceDueInr, canc
   if (itemParts.length) {
     let message = `${itemParts.join('. ')}.`;
     if (refundInr > 0.005) {
-      message += ` A refund of ₹${formatInrDisplay(refundInr)} has been processed for the unavailable item(s) and any reduced shipping charges.`;
+      message += shippingSettlementDeferred
+        ? ` A refund of ₹${formatInrDisplay(refundInr)} has been processed for the unavailable item(s). Any unused shipping will be refunded after your shipment is booked with the courier.`
+        : ` A refund of ₹${formatInrDisplay(refundInr)} has been processed for the unavailable item(s) and any reduced shipping charges.`;
       notes.push({
         message,
         kind: 'item_unavailable_refund',
-        metadata: { refundInr, balanceDueInr, newTotal, changes: changeSummaries }
+        metadata: {
+          refundInr,
+          balanceDueInr,
+          newTotal,
+          changes: changeSummaries,
+          shippingSettlementDeferred: Boolean(shippingSettlementDeferred)
+        }
       });
     } else {
-      if (balanceDueInr > 0.005) {
+      if (shippingSettlementDeferred) {
+        message += ` Your updated order total is ₹${formatInrDisplay(newTotal)} (shipping will be finalized when the courier is assigned).`;
+      } else if (balanceDueInr > 0.005) {
         message += ` Your updated order total is ₹${formatInrDisplay(newTotal)}. COD / balance due is now ₹${formatInrDisplay(balanceDueInr)}.`;
       } else {
         message += ` Your updated order total is ₹${formatInrDisplay(newTotal)}.`;
@@ -511,7 +534,13 @@ function buildCustomerMessages({ changeSummaries, refundInr, balanceDueInr, canc
       notes.push({
         message,
         kind: 'order_amended',
-        metadata: { refundInr: 0, balanceDueInr, newTotal, changes: changeSummaries }
+        metadata: {
+          refundInr: 0,
+          balanceDueInr,
+          newTotal,
+          changes: changeSummaries,
+          shippingSettlementDeferred: Boolean(shippingSettlementDeferred)
+        }
       });
     }
   }
@@ -796,14 +825,30 @@ async function previewOrApplyPendingOrderEdit(opts) {
     };
   }
 
-  const priced = await repriceShippingForItems(order, nextItems);
+  const pricedRaw = await repriceShippingForItems(order, nextItems);
+  const deferShipping = shouldDeferShippingSettlement(order, pricedRaw);
+
+  // Online/prepaid: keep prior delivery on the bill until Ship Now reveals actual freight.
+  // Apply refunds only the item (subtotal/tax) excess — not a mock/estimate shipping drop.
+  const priced = deferShipping
+    ? {
+        ...pricedRaw,
+        customerDelivery: pricedRaw.oldDelivery,
+        totalAmount: roundMoney2(
+          pricedRaw.subtotal + pricedRaw.oldDelivery + pricedRaw.tax - pricedRaw.discount
+        ),
+        shippingSettlementDeferred: true
+      }
+    : { ...pricedRaw, shippingSettlementDeferred: false };
+
   const settlement = settleFinancials(order, priced.totalAmount);
   const customerNotes = buildCustomerMessages({
     changeSummaries,
     refundInr: settlement.refundInr,
     balanceDueInr: settlement.balanceDueInr,
     cancelledEmpty: false,
-    newTotal: priced.totalAmount
+    newTotal: priced.totalAmount,
+    shippingSettlementDeferred: deferShipping
   });
 
   const afterPreview = {
@@ -826,14 +871,18 @@ async function previewOrApplyPendingOrderEdit(opts) {
     before,
     after: afterPreview,
     refundInr: settlement.refundInr,
+    shippingSettlementDeferred: deferShipping,
     shipping: {
       oldDelivery: priced.oldDelivery,
       quotedDelivery: priced.quotedDelivery,
       customerDelivery: priced.customerDelivery,
       shippingIncreasedAbsorbed: priced.shippingIncreasedAbsorbed,
+      shippingSettlementDeferred: deferShipping,
+      provisionalEstimateOnly: deferShipping,
       courierName: priced.shippingSnapshot.courierName,
       courierCompanyId: priced.shippingSnapshot.courierCompanyId,
-      estimatedDays: priced.shippingSnapshot.estimatedDays
+      estimatedDays: priced.shippingSnapshot.estimatedDays,
+      quotedMock: Boolean(priced.shipMeta?.mock)
     },
     customerNotes,
     remainingItems: nextItems.map((it) => ({
@@ -874,6 +923,17 @@ async function previewOrApplyPendingOrderEdit(opts) {
   order.shippingWeightSnapshot = priced.weightSnapshot;
   order.paymentInfo = order.paymentInfo || {};
   order.paymentInfo.fullOrderAmountPaise = Math.round(priced.totalAmount * 100);
+  if (deferShipping) {
+    order.paymentInfo.oosShippingSettlement = buildOosShippingSettlementMeta(order, pricedRaw);
+  } else if (order.paymentInfo.oosShippingSettlement?.pending) {
+    // COD / non-deferred path: clear any stale pending flag
+    order.paymentInfo.oosShippingSettlement = {
+      ...order.paymentInfo.oosShippingSettlement,
+      pending: false,
+      clearedAt: new Date().toISOString(),
+      clearReason: 'non_deferred_amendment'
+    };
+  }
   order.markModified('paymentInfo');
   order.markModified('items');
   order.markModified('shippingSnapshot');
@@ -925,7 +985,9 @@ async function previewOrApplyPendingOrderEdit(opts) {
   order.adminEditHistory = order.adminEditHistory || [];
   order.adminEditHistory.push({
     action: 'pending_order_items_edited',
-    note: 'Pending order items amended before accept',
+    note: deferShipping
+      ? 'Pending order items amended before accept (shipping settlement deferred until Ship Now)'
+      : 'Pending order items amended before accept',
     performedBy: adminUserId,
     createdAt: new Date(),
     before,
@@ -934,7 +996,8 @@ async function previewOrApplyPendingOrderEdit(opts) {
       changes: changeSummaries,
       shipping: preview.shipping,
       refundInr: settlement.refundInr,
-      refundWarning: refundOutcome.warning
+      refundWarning: refundOutcome.warning,
+      shippingSettlementDeferred: deferShipping
     }
   });
   order.markModified('adminEditHistory');
@@ -971,6 +1034,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
     refundInr: settlement.refundInr,
     refundWarning: refundOutcome.warning,
     shipping: preview.shipping,
+    shippingSettlementDeferred: deferShipping,
     customerNotes,
     orderStatus: order.orderStatus,
     paymentStatus: order.paymentStatus

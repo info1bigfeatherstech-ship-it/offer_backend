@@ -37,6 +37,10 @@ const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const { isCustomerProductReturnRequest } = require('../utils/productReturnRequest');
 const {
+  resolveActualFreightForCourier,
+  settleOosShippingAfterActualFreight
+} = require('../services/oosShippingSettlement.service');
+const {
   getAdminOrderMatch,
   mergeOrderScopeFilter
 } = require('../utils/adminOrderScope');
@@ -1045,6 +1049,62 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       await evaluateAndPersistShipmentOps(fresh, { source: 'admin_assign_awb_status' });
     }
 
+    // OOS pending-edit: settle held shipping vs actual Shiprocket freight (no-op if flag absent).
+    let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
+    try {
+      fresh = fresh || (await Order.findOne({ orderId: working.orderId }));
+      if (fresh?.paymentInfo?.oosShippingSettlement?.pending === true) {
+        const freightRes = await resolveActualFreightForCourier(fresh, courierId);
+        let actualFreightInr = freightRes.ok ? freightRes.freightInr : null;
+        if (actualFreightInr == null && assign?.raw && typeof assign.raw === 'object') {
+          const nested =
+            assign.raw.response?.data && typeof assign.raw.response.data === 'object'
+              ? assign.raw.response.data
+              : {};
+          const rawRate = Number(
+            assign.raw.rate ??
+              assign.raw.freight_charge ??
+              nested.rate ??
+              nested.freight_charge ??
+              NaN
+          );
+          if (Number.isFinite(rawRate) && rawRate >= 0) {
+            actualFreightInr = rawRate;
+          }
+        }
+        oosShippingSettlement = await settleOosShippingAfterActualFreight(fresh, {
+          actualFreightInr,
+          mock: Boolean(assign.mock) || (Boolean(freightRes.mock) && actualFreightInr == null),
+          courierId,
+          courierName: courierResolve.courierName || assign.courier || null,
+          source: 'admin_assign_awb'
+        });
+        if (oosShippingSettlement.settled) {
+          fresh = await Order.findOne({ orderId: working.orderId });
+          if (fresh) {
+            await evaluateAndPersistShipmentOps(fresh, { source: 'oos_shipping_settled' });
+          }
+        } else if (fresh?.paymentInfo?.oosShippingSettlement?.pending === true) {
+          logger.warn('[oosShippingSettlement] still pending after Ship Now', {
+            orderId: fresh.orderId,
+            reason: oosShippingSettlement.reason || freightRes.message || null,
+            courierId
+          });
+        }
+      }
+    } catch (settleErr) {
+      logger.error('oos shipping settlement after ship now failed', {
+        orderId: working?.orderId,
+        message: settleErr?.message || String(settleErr)
+      });
+      oosShippingSettlement = {
+        settled: false,
+        skipped: false,
+        reason: 'settlement_error',
+        message: settleErr?.message || String(settleErr)
+      };
+    }
+
     return {
       success: true,
       message: courierResolve.substituted
@@ -1054,6 +1114,7 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       courierSubstituted: Boolean(courierResolve.substituted),
       courierAssignNote: courierResolve.courierAssignNote || null,
       shipment: assign,
+      oosShippingSettlement,
       order: fresh
     };
   } catch (err) {
