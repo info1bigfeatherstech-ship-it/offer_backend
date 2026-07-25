@@ -1,33 +1,88 @@
 const { resolveStorefront } = require('../config/storefront.config');
+const { isOrderStaffRequest } = require('../utils/checkoutFlow');
+const logger = require('../utils/logger');
 
 /**
  * Sets req.storefront to 'ecomm' | 'wholesale' for all flows.
  */
 function resolveStorefrontMiddleware(req, res, next) {
-  req.storefront = resolveStorefront(req);
-  next();
+  try {
+    req.storefront = resolveStorefront(req);
+    return next();
+  } catch (err) {
+    logger.error('[storefront] resolveStorefrontMiddleware failed', {
+      message: err?.message || String(err)
+    });
+    return res.status(500).json({
+      success: false,
+      code: 'STOREFRONT_RESOLVE_FAILED',
+      message: 'Could not resolve storefront'
+    });
+  }
 }
 
 /**
- * Option B policy:
- * wholesale storefront transactional APIs are allowed only for wholesaler users.
- * Prevents retail identity from using wholesale cart/checkout/order flows.
+ * Who may use wholesale storefront transactional APIs (cart / checkout / customer order routes).
+ *
+ * - wholesaler customers: yes (buyer flows)
+ * - order staff (admin, order_manager): yes — wholesale admin panel reuses GET order/track
+ * - product_manager / marketing_manager / retail user: no
+ *
+ * Admin-only routes still use authorizeRoles(...); this guard only unblocks shared read paths.
+ *
+ * @param {import('express').Request} req
+ * @returns {{ allowed: boolean, reason: string }}
+ */
+function evaluateWholesaleTransactionalAccess(req) {
+  const userType = String(req?.userType || '').trim().toLowerCase();
+  if (userType === 'wholesaler') {
+    return { allowed: true, reason: 'wholesaler' };
+  }
+  if (isOrderStaffRequest(req)) {
+    return { allowed: true, reason: 'order_staff' };
+  }
+  return { allowed: false, reason: 'denied' };
+}
+
+/**
+ * Option B policy (updated):
+ * Wholesale storefront transactional APIs are for wholesaler buyers OR order staff.
+ * Prevents retail / product_manager identity from using wholesale cart/checkout/order flows.
  */
 function requireWholesaleUserForWholesaleStorefront(req, res, next) {
-  const storefront = req.storefront || resolveStorefront(req);
-  if (storefront !== 'wholesale') return next();
+  try {
+    const storefront = req.storefront || resolveStorefront(req);
+    req.storefront = storefront;
 
-  const normalizedUserType = String(req.userType || '').trim().toLowerCase();
-  if (normalizedUserType === 'wholesaler') return next();
+    if (storefront !== 'wholesale') {
+      return next();
+    }
 
-  return res.status(403).json({
-    success: false,
-    code: 'STOREFRONT_SCOPE_FORBIDDEN',
-    message: 'Wholesale storefront checkout is allowed only for wholesaler accounts.'
-  });
+    const decision = evaluateWholesaleTransactionalAccess(req);
+    if (decision.allowed) {
+      return next();
+    }
+
+    return res.status(403).json({
+      success: false,
+      code: 'STOREFRONT_SCOPE_FORBIDDEN',
+      message: 'Wholesale storefront checkout is allowed only for wholesaler accounts.'
+    });
+  } catch (err) {
+    logger.error('[storefront] requireWholesaleUserForWholesaleStorefront failed', {
+      message: err?.message || String(err),
+      userId: req?.userId || null
+    });
+    return res.status(500).json({
+      success: false,
+      code: 'STOREFRONT_GUARD_ERROR',
+      message: 'Could not authorize wholesale storefront access'
+    });
+  }
 }
 
 module.exports = {
   resolveStorefrontMiddleware,
-  requireWholesaleUserForWholesaleStorefront
+  requireWholesaleUserForWholesaleStorefront,
+  evaluateWholesaleTransactionalAccess
 };
