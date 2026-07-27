@@ -350,7 +350,13 @@ const orderSchema = new mongoose.Schema(
           message: { type: String, required: true, trim: true },
           kind: {
             type: String,
-            enum: ['order_amended', 'item_unavailable_refund', 'order_cancelled_empty', 'info'],
+            enum: [
+              'order_amended',
+              'item_unavailable_refund',
+              'order_cancelled_empty',
+              'oos_shipping_settled',
+              'info'
+            ],
             default: 'info'
           },
           createdAt: { type: Date, default: Date.now },

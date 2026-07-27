@@ -38,7 +38,8 @@ const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const { isCustomerProductReturnRequest } = require('../utils/productReturnRequest');
 const {
   resolveActualFreightForCourier,
-  settleOosShippingAfterActualFreight
+  settleOosShippingAfterActualFreight,
+  trySettlePendingOosOrder
 } = require('../services/oosShippingSettlement.service');
 const {
   getAdminOrderMatch,
@@ -1049,34 +1050,18 @@ async function runAssignShipFromOrder(order, courierIdOverride) {
       await evaluateAndPersistShipmentOps(fresh, { source: 'admin_assign_awb_status' });
     }
 
-    // OOS pending-edit: settle held shipping vs actual Shiprocket freight (no-op if flag absent).
+    // OOS pending-edit: settle with positive freight (actual preferred, held fallback).
     let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
     try {
       fresh = fresh || (await Order.findOne({ orderId: working.orderId }));
       if (fresh?.paymentInfo?.oosShippingSettlement?.pending === true) {
         const freightRes = await resolveActualFreightForCourier(fresh, courierId);
-        let actualFreightInr = freightRes.ok ? freightRes.freightInr : null;
-        if (actualFreightInr == null && assign?.raw && typeof assign.raw === 'object') {
-          const nested =
-            assign.raw.response?.data && typeof assign.raw.response.data === 'object'
-              ? assign.raw.response.data
-              : {};
-          const rawRate = Number(
-            assign.raw.rate ??
-              assign.raw.freight_charge ??
-              nested.rate ??
-              nested.freight_charge ??
-              NaN
-          );
-          if (Number.isFinite(rawRate) && rawRate >= 0) {
-            actualFreightInr = rawRate;
-          }
-        }
         oosShippingSettlement = await settleOosShippingAfterActualFreight(fresh, {
-          actualFreightInr,
-          mock: Boolean(assign.mock) || (Boolean(freightRes.mock) && actualFreightInr == null),
+          actualFreightInr: freightRes.ok ? freightRes.freightInr : null,
+          mock: Boolean(assign.mock) && !freightRes.ok,
           courierId,
           courierName: courierResolve.courierName || assign.courier || null,
+          assignRaw: assign?.raw || null,
           source: 'admin_assign_awb'
         });
         if (oosShippingSettlement.settled) {
@@ -1644,8 +1629,24 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
       await ensureShiprocketPickupId(order.orderId, 'admin_manual_sync_pickup_id');
     }
     const freshOrder = (await Order.findOne({ orderId: order.orderId })) || repaired;
-    const si = freshOrder?.shipmentInfo || {};
-    const shipmentOps = buildShipmentOpsView(freshOrder, { source: 'admin_manual_sync' });
+
+    let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
+    if (freshOrder?.paymentInfo?.oosShippingSettlement?.pending === true) {
+      oosShippingSettlement = await trySettlePendingOosOrder(freshOrder, {
+        source: 'admin_manual_sync'
+      });
+      if (oosShippingSettlement.settled) {
+        const afterSettle = await Order.findOne({ orderId: order.orderId });
+        if (afterSettle) {
+          await evaluateAndPersistShipmentOps(afterSettle, { source: 'oos_shipping_settled_sync' });
+        }
+      }
+    }
+
+    const finalOrder =
+      (await Order.findOne({ orderId: order.orderId })) || freshOrder;
+    const si = finalOrder?.shipmentInfo || {};
+    const shipmentOps = buildShipmentOpsView(finalOrder, { source: 'admin_manual_sync' });
     const pickupMsg = synced.resetApplied
       ? 'Shiprocket reset detected — stale AWB/pickup cleared. Use Ship now to re-book.'
       : si.shiprocketPickupId
@@ -1660,8 +1661,9 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
       pickupDate: si.pickupDate || null,
       shiprocketPickupId: si.shiprocketPickupId || null,
       pickupDateSource: synced.pickupDateSource || null,
+      oosShippingSettlement,
       shipmentOps,
-      order: freshOrder
+      order: finalOrder
     });
   } catch (error) {
     logger.error('adminFulfillmentSyncShiprocket', { message: error.message, stack: error.stack });
