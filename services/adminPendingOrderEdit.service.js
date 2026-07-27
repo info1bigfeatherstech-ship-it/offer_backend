@@ -3,9 +3,9 @@
  * - Remove lines or reduce qty only (no adds / qty increases)
  * - Rebuild weight snapshot + cheapest courier re-quote
  * - Freeze coupon/discount
- * - Never charge customer more for shipping (cap at previous deliveryCharges)
- * - Online/prepaid (captured): item excess refunds on Apply; shipping held until Ship Now
- *   (actual Shiprocket freight) then excess shipping is refunded — see oosShippingSettlement.service
+ * - Online/prepaid (captured): Apply updates items only — NO Razorpay refund yet.
+ *   Shipping held; after Ship Now actual freight → final bill + refund (never raise due/COD).
+ *   See oosShippingSettlement.service (policyVersion 3).
  * - COD: immediate shipping reprice + balanceDue update (unchanged)
  * - Empty cart → cancel + refund amount paid
  */
@@ -31,7 +31,8 @@ const { mergeReturnInfo } = require('./rtoRefund.service');
 const { notifyOrderAmended } = require('./orderAmendmentNotification.service');
 const {
   shouldDeferShippingSettlement,
-  buildOosShippingSettlementMeta
+  buildOosShippingSettlementMeta,
+  computeDeferredApplyFinancials
 } = require('./oosShippingSettlement.service');
 
 const razorpay =
@@ -510,7 +511,7 @@ function buildCustomerMessages({
     let message = `${itemParts.join('. ')}.`;
     if (refundInr > 0.005) {
       message += shippingSettlementDeferred
-        ? ` A refund of ₹${formatInrDisplay(refundInr)} has been processed for the unavailable item(s). Any unused shipping will be refunded after your shipment is booked with the courier.`
+        ? ` A refund of ₹${formatInrDisplay(refundInr)} will be processed after your shipment is booked with the courier (final shipping applied then).`
         : ` A refund of ₹${formatInrDisplay(refundInr)} has been processed for the unavailable item(s) and any reduced shipping charges.`;
       notes.push({
         message,
@@ -525,7 +526,10 @@ function buildCustomerMessages({
       });
     } else {
       if (shippingSettlementDeferred) {
-        message += ` Your updated order total is ₹${formatInrDisplay(newTotal)} (shipping will be finalized when the courier is assigned).`;
+        message += ` Your updated items are saved. Final total and any refund will be calculated after courier assignment (Ship Now).`;
+        if (balanceDueInr > 0.005) {
+          message += ` Current balance due is ₹${formatInrDisplay(balanceDueInr)} (will not increase).`;
+        }
       } else if (balanceDueInr > 0.005) {
         message += ` Your updated order total is ₹${formatInrDisplay(newTotal)}. COD / balance due is now ₹${formatInrDisplay(balanceDueInr)}.`;
       } else {
@@ -828,8 +832,8 @@ async function previewOrApplyPendingOrderEdit(opts) {
   const pricedRaw = await repriceShippingForItems(order, nextItems);
   const deferShipping = shouldDeferShippingSettlement(order, pricedRaw);
 
-  // Online/prepaid: keep prior delivery on the bill until Ship Now reveals actual freight.
-  // Apply refunds only the item (subtotal/tax) excess — not a mock/estimate shipping drop.
+  // Online/prepaid: keep prior delivery until Ship Now; NO Razorpay refund on Apply.
+  // Final bill uses actual Shiprocket freight (held fallback); due/COD never increases (policy v3).
   const priced = deferShipping
     ? {
         ...pricedRaw,
@@ -841,7 +845,10 @@ async function previewOrApplyPendingOrderEdit(opts) {
       }
     : { ...pricedRaw, shippingSettlementDeferred: false };
 
-  const settlement = settleFinancials(order, priced.totalAmount);
+  const settlement = deferShipping
+    ? computeDeferredApplyFinancials(order, priced.totalAmount)
+    : settleFinancials(order, priced.totalAmount);
+
   const customerNotes = buildCustomerMessages({
     changeSummaries,
     refundInr: settlement.refundInr,
@@ -871,6 +878,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
     before,
     after: afterPreview,
     refundInr: settlement.refundInr,
+    refundDeferredUntilShipNow: deferShipping,
     shippingSettlementDeferred: deferShipping,
     shipping: {
       oldDelivery: priced.oldDelivery,
@@ -901,6 +909,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
   // ——— Commit amendment ———
   const priorAmountPaidInr = roundMoney2(Number(order.amountPaidInr) || 0);
   const priorPaymentStatus = order.paymentStatus;
+  const priorBalanceDueInr = roundMoney2(Number(order.balanceDueInr) || 0);
 
   const archiveEntries = buildRemovedArchiveEntries(order, changeSummaries, 'unavailable');
   if (archiveEntries.length) {
@@ -924,9 +933,20 @@ async function previewOrApplyPendingOrderEdit(opts) {
   order.paymentInfo = order.paymentInfo || {};
   order.paymentInfo.fullOrderAmountPaise = Math.round(priced.totalAmount * 100);
   if (deferShipping) {
-    order.paymentInfo.oosShippingSettlement = buildOosShippingSettlementMeta(order, pricedRaw);
+    // Snapshot caps BEFORE mutating due/paid on this save path
+    order.balanceDueInr = priorBalanceDueInr;
+    order.amountPaidInr = priorAmountPaidInr;
+    order.paymentInfo.oosShippingSettlement = buildOosShippingSettlementMeta(
+      {
+        amountPaidInr: priorAmountPaidInr,
+        balanceDueInr: priorBalanceDueInr
+      },
+      pricedRaw
+    );
+    order.amountPaidInr = settlement.amountPaidInr;
+    order.balanceDueInr = settlement.balanceDueInr;
+    order.paymentStatus = settlement.paymentStatus;
   } else if (order.paymentInfo.oosShippingSettlement?.pending) {
-    // COD / non-deferred path: clear any stale pending flag
     order.paymentInfo.oosShippingSettlement = {
       ...order.paymentInfo.oosShippingSettlement,
       pending: false,
@@ -939,36 +959,42 @@ async function previewOrApplyPendingOrderEdit(opts) {
   order.markModified('shippingSnapshot');
   order.markModified('shippingWeightSnapshot');
 
-  const refundOutcome = await attemptAmendmentRefund(
-    order,
-    settlement.refundInr,
-    'order_amended_item_unavailable'
-  );
+  let refundOutcome = { refundAttempted: false, refund: null, warning: null };
 
-  if (settlement.refundInr > 0.005 && refundOutcome.warning) {
-    // Totals updated; keep captured amount until refund can be retried manually.
-    order.amountPaidInr = priorAmountPaidInr;
-    order.balanceDueInr = 0;
-    order.paymentStatus = priorPaymentStatus === 'partially_paid' ? 'partially_paid' : 'paid';
-    order.paymentInfo.amendmentRefundFailureReason = refundOutcome.warning;
-    order.markModified('paymentInfo');
-  } else if (settlement.refundInr > 0.005 && refundOutcome.refund) {
-    order.amountPaidInr = priced.totalAmount;
-    order.balanceDueInr = 0;
-    order.paymentStatus = 'paid';
-    order.returnInfo = mergeReturnInfo(order.returnInfo, {
-      refundContext: 'cancellation',
-      status: 'partially_refunded',
-      refundAmount: roundMoney2(
-        (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
-      ),
-      refundId: refundOutcome.refund.id
-    });
-    order.markModified('returnInfo');
+  if (deferShipping) {
+    // Money settle only after Ship Now (actual freight).
+    refundOutcome = { refundAttempted: false, refund: null, warning: null };
   } else {
-    order.amountPaidInr = settlement.amountPaidInr;
-    order.balanceDueInr = settlement.balanceDueInr;
-    order.paymentStatus = settlement.paymentStatus;
+    refundOutcome = await attemptAmendmentRefund(
+      order,
+      settlement.refundInr,
+      'order_amended_item_unavailable'
+    );
+
+    if (settlement.refundInr > 0.005 && refundOutcome.warning) {
+      order.amountPaidInr = priorAmountPaidInr;
+      order.balanceDueInr = 0;
+      order.paymentStatus = priorPaymentStatus === 'partially_paid' ? 'partially_paid' : 'paid';
+      order.paymentInfo.amendmentRefundFailureReason = refundOutcome.warning;
+      order.markModified('paymentInfo');
+    } else if (settlement.refundInr > 0.005 && refundOutcome.refund) {
+      order.amountPaidInr = priced.totalAmount;
+      order.balanceDueInr = 0;
+      order.paymentStatus = 'paid';
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        refundContext: 'cancellation',
+        status: 'partially_refunded',
+        refundAmount: roundMoney2(
+          (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
+        ),
+        refundId: refundOutcome.refund.id
+      });
+      order.markModified('returnInfo');
+    } else {
+      order.amountPaidInr = settlement.amountPaidInr;
+      order.balanceDueInr = settlement.balanceDueInr;
+      order.paymentStatus = settlement.paymentStatus;
+    }
   }
 
   for (const note of customerNotes) {
@@ -986,7 +1012,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
   order.adminEditHistory.push({
     action: 'pending_order_items_edited',
     note: deferShipping
-      ? 'Pending order items amended before accept (shipping settlement deferred until Ship Now)'
+      ? 'Pending order items amended — money settlement deferred until Ship Now (actual freight)'
       : 'Pending order items amended before accept',
     performedBy: adminUserId,
     createdAt: new Date(),
@@ -997,7 +1023,8 @@ async function previewOrApplyPendingOrderEdit(opts) {
       shipping: preview.shipping,
       refundInr: settlement.refundInr,
       refundWarning: refundOutcome.warning,
-      shippingSettlementDeferred: deferShipping
+      shippingSettlementDeferred: deferShipping,
+      refundDeferredUntilShipNow: deferShipping
     }
   });
   order.markModified('adminEditHistory');
@@ -1006,7 +1033,6 @@ async function previewOrApplyPendingOrderEdit(opts) {
 
   const hold = readHold(order);
   if (hold.inventoryReserved || hold.source === 'inventory' || hold.source === 'hybrid') {
-    // Inventory API has no partial release — full release + re-reserve remaining lines.
     await syncHoldAfterPendingOrderEdit(order);
     await order.save();
   } else if (releasedLines.length) {
@@ -1033,6 +1059,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
     after: snapshotMoney(order),
     refundInr: settlement.refundInr,
     refundWarning: refundOutcome.warning,
+    refundDeferredUntilShipNow: deferShipping,
     shipping: preview.shipping,
     shippingSettlementDeferred: deferShipping,
     customerNotes,
