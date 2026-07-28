@@ -89,6 +89,37 @@ const wholesalerDetailsSchema = new mongoose.Schema(
       index: true
     },
 
+    registrationFeeAmount: {
+      type: Number,
+      default: 1200
+    },
+    registrationPaymentStatus: {
+      type: String,
+      enum: ['not_required', 'pending', 'created', 'paid', 'failed'],
+      default: 'pending',
+      index: true
+    },
+    registrationRazorpayOrderId: {
+      type: String,
+      default: null
+    },
+    registrationRazorpayPaymentId: {
+      type: String,
+      default: null
+    },
+    registrationPaymentInitiatedAt: {
+      type: Date,
+      default: null
+    },
+    registrationPaidAt: {
+      type: Date,
+      default: null
+    },
+    registrationPaymentMeta: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
+
     isApproved: {
       type: Boolean,
       default: false

@@ -11,6 +11,18 @@ function normalizeWholesalerEmail(v) {
   return String(v || '').trim().toLowerCase();
 }
 
+function getWholesalerRegistrationFeeInr() {
+  const raw = Number(process.env.WHOLESALER_REGISTRATION_FEE_INR);
+  if (Number.isFinite(raw) && raw >= 0) return Math.round(raw * 100) / 100;
+  return 1200;
+}
+
+function hasCompletedWholesalerRegistrationPayment(doc) {
+  if (!doc) return false;
+  if (String(doc.status || '').trim().toLowerCase() === 'activated') return true;
+  return String(doc.registrationPaymentStatus || '').trim().toLowerCase() === 'paid';
+}
+
 /**
  * Whether business / KYC fields are present enough to allow activation OTP.
  * @param {object|null|undefined} doc
@@ -84,18 +96,37 @@ function looksLikeFullWholesalerPayload(body, proofs = {}) {
 function wholesalerOnboardingFlags(doc) {
   const status = String(doc?.status || '');
   const detailsComplete = isWholesalerDetailsComplete(doc);
+  const feeAmountInr =
+    Number.isFinite(Number(doc?.registrationFeeAmount))
+      ? Number(doc.registrationFeeAmount)
+      : getWholesalerRegistrationFeeInr();
+  const paymentCompleted = hasCompletedWholesalerRegistrationPayment(doc);
+  const paymentRequired = feeAmountInr > 0;
+  const canPayRegistration =
+    status === 'approved' && detailsComplete && paymentRequired && !paymentCompleted;
   return {
     status,
     detailsComplete,
     canCompleteDetails: status === 'approved' && !detailsComplete,
-    canRequestActivationOtp: status === 'approved' && detailsComplete,
-    onboardingPhase: detailsComplete ? 'details_complete' : 'basic_only'
+    canPayRegistration,
+    canRequestActivationOtp: status === 'approved' && detailsComplete && (!paymentRequired || paymentCompleted),
+    paymentRequired,
+    paymentCompleted,
+    registrationFeeAmount: feeAmountInr,
+    registrationPaymentStatus: String(doc?.registrationPaymentStatus || (paymentRequired ? 'pending' : 'not_required')).trim().toLowerCase(),
+    onboardingPhase: !detailsComplete
+      ? 'basic_only'
+      : paymentRequired && !paymentCompleted
+        ? 'payment_pending'
+        : 'details_complete'
   };
 }
 
 module.exports = {
   normalizeWholesalerPhone,
   normalizeWholesalerEmail,
+  getWholesalerRegistrationFeeInr,
+  hasCompletedWholesalerRegistrationPayment,
   isWholesalerDetailsComplete,
   looksLikeFullWholesalerPayload,
   wholesalerOnboardingFlags
