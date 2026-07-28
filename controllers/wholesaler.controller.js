@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+const Razorpay = require('razorpay');
 const { validationResult } = require('express-validator');
 const path = require('path');
 const WholesalerDetails = require('../models/WholesalerDetails');
@@ -14,6 +15,8 @@ const { deleteFromR2ByUrl } = require('../utils/r2Storage');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
 const {
+  getWholesalerRegistrationFeeInr,
+  hasCompletedWholesalerRegistrationPayment,
   isWholesalerDetailsComplete,
   looksLikeFullWholesalerPayload,
   wholesalerOnboardingFlags
@@ -29,6 +32,10 @@ const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
 const OWNER_REVIEW_PURPOSE = 'wholesaler_owner_review';
 const OWNER_REVIEW_TOKEN_EXPIRES = process.env.OWNER_REVIEW_TOKEN_EXPIRES || '48h';
 const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
+const razorpay = new Razorpay({
+  key_id: String(process.env.RAZORPAY_KEY_ID || '').trim(),
+  key_secret: String(process.env.RAZORPAY_KEY_SECRET || '').trim()
+});
 
 function normalizePhone(v) {
   return String(v || '').replace(/\D/g, '').slice(-10);
@@ -586,6 +593,48 @@ function generateRefreshToken(userId) {
   );
 }
 
+function normalizeRegistrationPaymentStatus(value, fallback = 'pending') {
+  const key = String(value || '').trim().toLowerCase();
+  return ['not_required', 'pending', 'created', 'paid', 'failed'].includes(key) ? key : fallback;
+}
+
+function paymentRequiredForWholesalerDoc(doc) {
+  return Number(getWholesalerRegistrationFeeInr()) > 0;
+}
+
+function applyPendingRegistrationPaymentState(doc) {
+  if (!doc) return;
+  const fee = getWholesalerRegistrationFeeInr();
+  doc.registrationFeeAmount = fee;
+  if (fee <= 0) {
+    doc.registrationPaymentStatus = 'not_required';
+    return;
+  }
+  if (normalizeRegistrationPaymentStatus(doc.registrationPaymentStatus) === 'paid') {
+    return;
+  }
+  doc.registrationPaymentStatus = 'pending';
+  doc.registrationRazorpayOrderId = null;
+  doc.registrationRazorpayPaymentId = null;
+  doc.registrationPaymentInitiatedAt = null;
+  doc.registrationPaidAt = null;
+  doc.registrationPaymentMeta = null;
+}
+
+function requireWholesalerRegistrationPayment(res, doc) {
+  return authContractError(
+    res,
+    409,
+    'WHOLESALER_REGISTRATION_PAYMENT_REQUIRED',
+    'Complete the wholesale registration payment before activation.',
+    {
+      requestId: doc?._id || null,
+      registrationFeeAmount: Number(doc?.registrationFeeAmount || getWholesalerRegistrationFeeInr()),
+      registrationPaymentStatus: normalizeRegistrationPaymentStatus(doc?.registrationPaymentStatus)
+    }
+  );
+}
+
 exports.submitWholesalerRequest = async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -801,39 +850,21 @@ exports.completeWholesalerDetails = async (req, res) => {
     doc.idProofUpload = payload.idProofUpload;
     doc.businessAddressProofUpload = payload.businessAddressProofUpload;
     doc.detailsSubmittedAt = new Date();
-
-    const otp = generateOTP();
-    doc.activationOtpHash = hashString(otp);
-    doc.activationOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
+    applyPendingRegistrationPaymentState(doc);
+    doc.activationOtpHash = null;
+    doc.activationOtpExpiresAt = null;
     doc.activationOtpAttempts = 0;
-    doc.activationOtpSentAt = new Date();
+    doc.activationOtpSentAt = null;
     await doc.save();
-
-    let otpSent = true;
-    try {
-      await deliverOtpFor({
-        phone: doc.mobileNumber,
-        email: doc.email,
-        otp,
-        purpose: 'wholesaler_activation'
-      });
-    } catch (deliverErr) {
-      otpSent = false;
-      console.error(
-        'Wholesaler activation OTP delivery failed after complete-details:',
-        deliverErr?.message,
-        deliverErr?.details || ''
-      );
-    }
 
     const flags = wholesalerOnboardingFlags(doc);
 
     return res.status(200).json({
       success: true,
-      message: otpSent
-        ? 'Business details saved. Activation OTP sent — verify OTP and set your password to activate.'
-        : 'Business details saved, but OTP could not be sent. Use activate/send-otp to resend.',
-      otpSent,
+      message: flags.canPayRegistration
+        ? 'Business details saved. Complete the registration payment to continue activation.'
+        : 'Business details saved successfully.',
+      otpSent: false,
       request: {
         id: doc._id,
         status: doc.status,
@@ -873,7 +904,7 @@ exports.getWholesalerOnboardingStatus = async (req, res) => {
     })
       .sort({ updatedAt: -1 })
       .select(
-        'fullName email mobileNumber whatsappNumber status detailsSubmittedAt permanentAddress businessAddress deliveryAddress sellingPlaceFrom sellingZoneCity productCategory monthlyEstimatedPurchase idProofUpload businessAddressProofUpload createdAt updatedAt'
+        'fullName email mobileNumber whatsappNumber status detailsSubmittedAt permanentAddress businessAddress deliveryAddress sellingPlaceFrom sellingZoneCity productCategory monthlyEstimatedPurchase idProofUpload businessAddressProofUpload registrationFeeAmount registrationPaymentStatus registrationPaidAt createdAt updatedAt'
       )
       .lean();
 
@@ -911,20 +942,186 @@ exports.getWholesalerOnboardingStatus = async (req, res) => {
   }
 };
 
+exports.createWholesalerRegistrationPaymentOrder = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return authContractError(res, 400, 'VALIDATION_FAILED', 'Validation failed', { errors: errors.array() });
+    }
+    const mobileNumber = normalizePhone(req.body.mobileNumber);
+    if (!/^\d{10}$/.test(mobileNumber)) {
+      return authContractError(res, 400, 'INVALID_MOBILE_NUMBER', 'Valid 10-digit mobileNumber is required');
+    }
+    const doc = await WholesalerDetails.findOne({ mobileNumber, status: 'approved' }).sort({ updatedAt: -1 });
+    if (!doc) {
+      return authContractError(res, 404, 'WHOLESALER_APPROVAL_NOT_FOUND', 'No approved wholesaler request found for this mobile number');
+    }
+    if (!isWholesalerDetailsComplete(doc)) {
+      return authContractError(res, 409, 'WHOLESALER_DETAILS_INCOMPLETE', 'Complete business details before payment.', {
+        requestId: doc._id,
+        canCompleteDetails: true
+      });
+    }
+    const feeInr = getWholesalerRegistrationFeeInr();
+    doc.registrationFeeAmount = feeInr;
+    if (feeInr <= 0) {
+      doc.registrationPaymentStatus = 'not_required';
+      await doc.save();
+      return res.status(200).json({
+        success: true,
+        alreadyPaid: true,
+        message: 'Registration payment is not required for this onboarding flow.',
+        request: { id: doc._id, ...wholesalerOnboardingFlags(doc) }
+      });
+    }
+    if (hasCompletedWholesalerRegistrationPayment(doc)) {
+      return res.status(200).json({
+        success: true,
+        alreadyPaid: true,
+        message: 'Registration payment already completed.',
+        request: { id: doc._id, ...wholesalerOnboardingFlags(doc) }
+      });
+    }
+    if (!String(process.env.RAZORPAY_KEY_ID || '').trim() || !String(process.env.RAZORPAY_KEY_SECRET || '').trim()) {
+      return authContractError(res, 503, 'RAZORPAY_NOT_CONFIGURED', 'Registration payment is temporarily unavailable.');
+    }
+    const amountPaise = Math.round(feeInr * 100);
+    const order = await razorpay.orders.create({
+      amount: amountPaise,
+      currency: 'INR',
+      receipt: `whreg-${String(doc._id).slice(-18)}-${Date.now().toString(36)}`.slice(0, 40),
+      payment_capture: 1,
+      notes: {
+        type: 'wholesaler_registration',
+        requestId: String(doc._id),
+        mobileNumber: doc.mobileNumber
+      }
+    });
+    doc.registrationPaymentStatus = 'created';
+    doc.registrationRazorpayOrderId = order.id;
+    doc.registrationPaymentInitiatedAt = new Date();
+    doc.registrationPaymentMeta = {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency
+    };
+    await doc.save();
+    return res.status(200).json({
+      success: true,
+      message: 'Registration payment order created successfully.',
+      amountInr: feeInr,
+      razorpayOrder: {
+        id: order.id,
+        amount: order.amount,
+        currency: order.currency
+      },
+      request: { id: doc._id, ...wholesalerOnboardingFlags(doc) }
+    });
+  } catch (error) {
+    console.error('createWholesalerRegistrationPaymentOrder failed:', error);
+    return authContractError(res, 500, 'WHOLESALER_REGISTRATION_PAYMENT_CREATE_FAILED', 'Error creating registration payment order');
+  }
+};
+
+exports.verifyWholesalerRegistrationPayment = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return authContractError(res, 400, 'VALIDATION_FAILED', 'Validation failed', { errors: errors.array() });
+    }
+    const mobileNumber = normalizePhone(req.body.mobileNumber);
+    const razorpayOrderId = String(req.body.razorpay_order_id || '').trim();
+    const razorpayPaymentId = String(req.body.razorpay_payment_id || '').trim();
+    const razorpaySignature = String(req.body.razorpay_signature || '').trim();
+    if (!/^\d{10}$/.test(mobileNumber) || !razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return authContractError(
+        res,
+        400,
+        'INVALID_PAYMENT_VERIFY_PAYLOAD',
+        'mobileNumber, razorpay_order_id, razorpay_payment_id and razorpay_signature are required'
+      );
+    }
+    const doc = await WholesalerDetails.findOne({ mobileNumber, status: 'approved' }).sort({ updatedAt: -1 });
+    if (!doc) {
+      return authContractError(res, 404, 'WHOLESALER_APPROVAL_NOT_FOUND', 'No approved wholesaler request found for this mobile number');
+    }
+    if (!isWholesalerDetailsComplete(doc)) {
+      return authContractError(res, 409, 'WHOLESALER_DETAILS_INCOMPLETE', 'Complete business details before payment verification.', {
+        requestId: doc._id,
+        canCompleteDetails: true
+      });
+    }
+    if (hasCompletedWholesalerRegistrationPayment(doc)) {
+      return res.status(200).json({
+        success: true,
+        alreadyPaid: true,
+        message: 'Registration payment already verified.',
+        request: { id: doc._id, ...wholesalerOnboardingFlags(doc) }
+      });
+    }
+    if (!String(process.env.RAZORPAY_KEY_SECRET || '').trim()) {
+      return authContractError(res, 503, 'RAZORPAY_NOT_CONFIGURED', 'Registration payment verification is temporarily unavailable.');
+    }
+    if (doc.registrationRazorpayOrderId && doc.registrationRazorpayOrderId !== razorpayOrderId) {
+      return authContractError(res, 409, 'PAYMENT_ORDER_MISMATCH', 'Payment order does not match the latest registration attempt.');
+    }
+    const expectedSignature = crypto
+      .createHmac('sha256', String(process.env.RAZORPAY_KEY_SECRET || '').trim())
+      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+      .digest('hex');
+    if (expectedSignature !== razorpaySignature) {
+      return authContractError(res, 400, 'PAYMENT_SIGNATURE_INVALID', 'Payment signature verification failed.');
+    }
+    const [payment, order] = await Promise.all([
+      razorpay.payments.fetch(razorpayPaymentId),
+      razorpay.orders.fetch(razorpayOrderId)
+    ]);
+    if (!['authorized', 'captured'].includes(String(payment.status || '').toLowerCase())) {
+      return authContractError(res, 409, 'PAYMENT_NOT_CAPTURED', 'Registration payment is not completed yet.');
+    }
+    if (String(payment.order_id || '') !== razorpayOrderId) {
+      return authContractError(res, 409, 'PAYMENT_ORDER_MISMATCH', 'Razorpay payment does not belong to this order.');
+    }
+    const expectedAmountPaise = Math.round(getWholesalerRegistrationFeeInr() * 100);
+    if (Number(order.amount) !== expectedAmountPaise || Number(payment.amount) !== expectedAmountPaise) {
+      return authContractError(res, 409, 'PAYMENT_AMOUNT_MISMATCH', 'Registration payment amount mismatch detected.');
+    }
+    doc.registrationFeeAmount = getWholesalerRegistrationFeeInr();
+    doc.registrationPaymentStatus = 'paid';
+    doc.registrationRazorpayOrderId = razorpayOrderId;
+    doc.registrationRazorpayPaymentId = razorpayPaymentId;
+    doc.registrationPaidAt = new Date();
+    doc.registrationPaymentMeta = {
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      paymentStatus: payment.status,
+      method: payment.method || null,
+      captured: payment.captured === true
+    };
+    await doc.save();
+    return res.status(200).json({
+      success: true,
+      message: 'Registration payment verified successfully.',
+      request: { id: doc._id, ...wholesalerOnboardingFlags(doc) }
+    });
+  } catch (error) {
+    console.error('verifyWholesalerRegistrationPayment failed:', error);
+    return authContractError(res, 500, 'WHOLESALER_REGISTRATION_PAYMENT_VERIFY_FAILED', 'Error verifying registration payment');
+  }
+};
+
 exports.listWholesalerRequests = async (req, res) => {
   try {
     const allowedStatuses = ['pending', 'approved', 'rejected', 'activated'];
     const status = String(req.query.status || 'all').toLowerCase();
+    const paymentStatus = String(req.query.paymentStatus || '').toLowerCase();
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const query =
-      status === 'all'
-        ? {}
-        : allowedStatuses.includes(status)
-          ? { status }
-          : {};
+    const query = {};
+    if (status !== 'all' && allowedStatuses.includes(status)) query.status = status;
+    if (paymentStatus) query.registrationPaymentStatus = paymentStatus;
 
     const total = await WholesalerDetails.countDocuments(query);
     // Full application row for admin (all stored fields). OTP hash stays off via schema select:false.
@@ -950,7 +1147,8 @@ exports.listWholesalerRequests = async (req, res) => {
     return res.status(200).json({
       success: true,
       filters: {
-        status: status === 'all' || allowedStatuses.includes(status) ? status : 'all'
+        status: status === 'all' || allowedStatuses.includes(status) ? status : 'all',
+        paymentStatus: paymentStatus || 'all'
       },
       pagination: {
         page,
@@ -977,11 +1175,17 @@ exports.getWholesalerRequestSummary = async (req, res) => {
     ]);
 
     const summary = {
+      total: 0,
       all: 0,
       pending: 0,
       approved: 0,
       rejected: 0,
-      activated: 0
+      activated: 0,
+      paymentPaid: await WholesalerDetails.countDocuments({ registrationPaymentStatus: 'paid' }),
+      paymentPending: await WholesalerDetails.countDocuments({
+        status: 'approved',
+        registrationPaymentStatus: { $in: ['pending', 'created', 'failed'] }
+      })
     };
 
     for (const row of counts) {
@@ -989,6 +1193,7 @@ exports.getWholesalerRequestSummary = async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(summary, key)) {
         summary[key] = Number(row.count || 0);
         summary.all += Number(row.count || 0);
+        summary.total += Number(row.count || 0);
       }
     }
 
@@ -1551,6 +1756,9 @@ exports.sendWholesalerActivationOtp = async (req, res) => {
         }
       );
     }
+    if (paymentRequiredForWholesalerDoc(doc) && !hasCompletedWholesalerRegistrationPayment(doc)) {
+      return requireWholesalerRegistrationPayment(res, doc);
+    }
 
     const otp = generateOTP();
     doc.activationOtpHash = hashString(otp);
@@ -1630,6 +1838,9 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
           canCompleteDetails: true
         }
       );
+    }
+    if (paymentRequiredForWholesalerDoc(doc) && !hasCompletedWholesalerRegistrationPayment(doc)) {
+      return requireWholesalerRegistrationPayment(res, doc);
     }
 
     if (!doc.activationOtpHash || !doc.activationOtpExpiresAt || new Date() > doc.activationOtpExpiresAt) {

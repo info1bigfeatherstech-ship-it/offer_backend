@@ -10,6 +10,8 @@ const {
   getWholesalerRequestDetails,
   approveWholesalerRequest,
   rejectWholesalerRequest,
+  createWholesalerRegistrationPaymentOrder,
+  verifyWholesalerRegistrationPayment,
   sendWholesalerActivationOtp,
   verifyWholesalerActivationOtp,
   getWholesalerRequestSummary,
@@ -99,6 +101,23 @@ router.get(
   '/onboarding-status',
   [query('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required')],
   getWholesalerOnboardingStatus
+);
+
+router.post(
+  '/activate/payment-order',
+  [body('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required')],
+  createWholesalerRegistrationPaymentOrder
+);
+
+router.post(
+  '/activate/payment-verify',
+  [
+    body('mobileNumber').trim().notEmpty().withMessage('mobileNumber is required'),
+    body('razorpay_order_id').trim().notEmpty().withMessage('razorpay_order_id is required'),
+    body('razorpay_payment_id').trim().notEmpty().withMessage('razorpay_payment_id is required'),
+    body('razorpay_signature').trim().notEmpty().withMessage('razorpay_signature is required')
+  ],
+  verifyWholesalerRegistrationPayment
 );
 
 router.post(
