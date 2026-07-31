@@ -89,7 +89,12 @@ const PASSWORD_RESET_FIND_MAX_ATTEMPTS = 3;
 const PASSWORD_RESET_FIND_WINDOW_SECONDS = 24 * 60 * 60;
 const PASSWORD_RESET_FIND_GENERIC_MESSAGE =
   'If this phone number is registered with us, you can continue to reset your password.';
-const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
+const PRIVILEGED_OPERATIONAL_ROLES = new Set([
+  'admin',
+  'product_manager',
+  'order_manager',
+  'marketing_manager'
+]);
 const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
 const respondAuthError = (res, statusCode, code, message, extras = {}) =>
   res.status(statusCode).json({
@@ -355,6 +360,26 @@ const isPrivilegedAccount = (user) => {
   const userType = String(user.userType || '').trim().toLowerCase();
   if (userType === 'admin') return true;
   return isPrivilegedRole(user.role);
+};
+
+/**
+ * Customer-facing forgot-password (ecomm + wholesale OTP legacy) must NEVER
+ * reset admin/staff passwords. Authorized password changes for staff remain on
+ * /api/admin/staff/* only.
+ */
+const isCustomerPasswordResetBlocked = (user) => isPrivilegedAccount(user);
+
+const logPrivilegedPasswordResetBlocked = (flow, user) => {
+  try {
+    console.warn('[ForgotPassword] blocked privileged account on customer flow', {
+      flow,
+      userId: user?._id ? String(user._id) : null,
+      userType: user?.userType || null,
+      role: user?.role || null
+    });
+  } catch (_) {
+    /* never throw from audit log */
+  }
 };
 
 const buildLoginUserLookup = (identifier, portal) => {
@@ -885,11 +910,15 @@ const findUserForPasswordReset = async (req, res) => {
       );
     }
 
-    const user = await User.findOne({ phone }).select('_id phone email name status');
+    const user = await User.findOne({ phone }).select('_id phone email name status userType role');
 
     // Generic response whether or not the account exists (anti-enumeration).
-    // resetToken is only returned when a matching account is found.
-    if (!user) {
+    // Privileged/staff accounts are treated as "not found" on customer UI —
+    // never issue a resetToken for them.
+    if (!user || isCustomerPasswordResetBlocked(user)) {
+      if (user && isCustomerPasswordResetBlocked(user)) {
+        logPrivilegedPasswordResetBlocked('find-user', user);
+      }
       return res.status(200).json({
         success: true,
         message: PASSWORD_RESET_FIND_GENERIC_MESSAGE
@@ -962,9 +991,21 @@ const resetPasswordDirect = async (req, res) => {
       return respondAuthError(res, status, code, tokenErr.message || 'Invalid reset token');
     }
 
-    const user = await User.findById(decoded.id).select('+password name email phone status');
+    const user = await User.findById(decoded.id).select('+password name email phone status userType role');
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
+    }
+
+    // Defense-in-depth: even if a resetToken was somehow issued for a
+    // privileged account (race / older token), never allow customer UI reset.
+    if (isCustomerPasswordResetBlocked(user)) {
+      logPrivilegedPasswordResetBlocked('reset-direct', user);
+      return respondAuthError(
+        res,
+        403,
+        'PRIVILEGED_PASSWORD_RESET_FORBIDDEN',
+        'This account cannot reset password from the customer portal.'
+      );
     }
 
     // Update password (model pre-save hook hashes it — do not hash manually)
@@ -1016,9 +1057,14 @@ const sendPasswordResetOTP = async (req, res) => {
         { email: identifier },
         { phone: identifier }
       ]
-    });
+    }).select('_id email phone userType role +passwordResetOTP +passwordResetOTPExpires');
 
-    if (!user) {
+    // Generic success whether missing OR privileged — never send OTP to staff
+    // via customer forgot-password UI.
+    if (!user || isCustomerPasswordResetBlocked(user)) {
+      if (user && isCustomerPasswordResetBlocked(user)) {
+        logPrivilegedPasswordResetBlocked('request-otp', user);
+      }
       return res.status(200).json({
         success: true,
         message: "If account exists, OTP will be sent"
@@ -1077,10 +1123,20 @@ const verifyPasswordResetOTP = async (req, res) => {
         { email: identifier },
         { phone: identifier }
       ]
-    }).select("+passwordResetOTP +passwordResetOTPExpires");
+    }).select("+passwordResetOTP +passwordResetOTPExpires userType role");
 
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
+    }
+
+    if (isCustomerPasswordResetBlocked(user)) {
+      logPrivilegedPasswordResetBlocked('verify-otp', user);
+      return respondAuthError(
+        res,
+        403,
+        'PRIVILEGED_PASSWORD_RESET_FORBIDDEN',
+        'This account cannot reset password from the customer portal. Use the admin panel.'
+      );
     }
 
     if (!user.passwordResetOTP || !user.passwordResetOTPExpires) {
@@ -1123,10 +1179,20 @@ const resetPasswordWithOTP = async (req, res) => {
         { email: identifier },
         { phone: identifier }
       ]
-    }).select("+passwordResetOTP +passwordResetOTPExpires");
+    }).select("+passwordResetOTP +passwordResetOTPExpires +password userType role");
 
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
+    }
+
+    if (isCustomerPasswordResetBlocked(user)) {
+      logPrivilegedPasswordResetBlocked('reset-with-otp', user);
+      return respondAuthError(
+        res,
+        403,
+        'PRIVILEGED_PASSWORD_RESET_FORBIDDEN',
+        'This account cannot reset password from the customer portal. Use the admin panel.'
+      );
     }
 
     if (!user.passwordResetOTP || !user.passwordResetOTPExpires) {
