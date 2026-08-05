@@ -158,11 +158,19 @@ function getCustomerTrackingSummary(orderDoc, providerStatus) {
   const provider = normalizeText(providerStatus);
   if (provider) {
     const p = provider.toLowerCase();
-    if (/delivered/.test(p)) headline = ORDER_STATUS_HEADLINES.delivered;
-    else if (/out for delivery|\bofd\b/.test(p)) headline = ORDER_STATUS_HEADLINES.out_for_delivery;
-    else if (/in transit|\bit\b|shipped|manifest/.test(p)) headline = ORDER_STATUS_HEADLINES.shipped;
-    else if (/out for pickup|\bofp\b|picked up|\bpud\b/.test(p)) headline = 'Courier is collecting your package';
-    else if (!isRawCarrierCode(provider)) headline = titleCasePhrase(provider);
+    if (/\bundelivered\b|\bndr\b|delivery failed|failed delivery|not delivered/.test(p)) {
+      headline = ORDER_STATUS_HEADLINES.shipped || 'In transit';
+    } else if (/\bdelivered\b|delivery completed/.test(p)) {
+      headline = ORDER_STATUS_HEADLINES.delivered;
+    } else if (/out for delivery|\bofd\b/.test(p)) {
+      headline = ORDER_STATUS_HEADLINES.out_for_delivery;
+    } else if (/in transit|\bit\b|shipped|manifest/.test(p)) {
+      headline = ORDER_STATUS_HEADLINES.shipped;
+    } else if (/out for pickup|\bofp\b|picked up|\bpud\b/.test(p)) {
+      headline = 'Courier is collecting your package';
+    } else if (!isRawCarrierCode(provider)) {
+      headline = titleCasePhrase(provider);
+    }
   }
 
   return {

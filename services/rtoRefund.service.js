@@ -288,6 +288,14 @@ function applyDeliveryChargeSplitToOrder(order, split = {}) {
 async function syncRtoFreightChargeFromShiprocket(order, options = {}) {
   try {
     if (!order) return { updated: false, amountInr: 0, code: 'NO_ORDER' };
+
+    // Shipmozo: never call Shiprocket billing — env default only (Case-1 parity refund math).
+    const { isShipmozoOrder } = require('../constants/shippingProviders');
+    if (isShipmozoOrder(order)) {
+      const { syncShipmozoRtoFreightDefault } = require('./shipmozoReconcile.service');
+      return syncShipmozoRtoFreightDefault(order, options);
+    }
+
     const needsFreight = options.force || orderNeedsRtoFreightSync(order);
     const needsSplit = options.force || orderNeedsDeliverySplitBackfill(order);
     if (!needsFreight && !needsSplit) {
@@ -360,8 +368,13 @@ async function enrichRtoOrdersFreightCharges(orders, options = {}) {
   const list = Array.isArray(orders) ? orders : [];
   const concurrency = Math.min(4, Math.max(1, Number(options.concurrency) || 3));
   const maxOrders = Math.min(list.length, Math.max(1, Number(options.maxOrders) || 8));
+  const { isShipmozoOrder } = require('../constants/shippingProviders');
   const targets = list
-    .filter((o) => orderNeedsRtoFreightSync(o) || orderNeedsDeliverySplitBackfill(o))
+    .filter((o) => {
+      // Shipmozo: env-default reverse freight only — skip Shiprocket delivery-split backfill loops
+      if (isShipmozoOrder(o)) return orderNeedsRtoFreightSync(o);
+      return orderNeedsRtoFreightSync(o) || orderNeedsDeliverySplitBackfill(o);
+    })
     .slice(0, maxOrders);
   if (!targets.length) return 0;
 

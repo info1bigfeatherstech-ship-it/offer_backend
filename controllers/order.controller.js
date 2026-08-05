@@ -9,6 +9,13 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
 const ShiprocketService = require('../utils/shiprocket');
+const ShipmozoService = require('../utils/shipmozo');
+const shippingProviderSettingsService = require('../services/shippingProviderSettings.service');
+const {
+    SHIPPING_PROVIDERS,
+    resolveOrderShippingProvider,
+    isShipmozoOrder
+} = require('../constants/shippingProviders');
 const logger = require('../utils/logger');
 const { cloudinary } = require('../config/cloudinary.config');
 const {
@@ -385,7 +392,8 @@ function mapExternalShipmentStatusToOrderStatus(rawStatus) {
 
 const {
     canApplyProviderOrderStatus,
-    repairOrderStatusForShiprocketRto
+    repairOrderStatusForShiprocketRto,
+    repairOrderStatusForFalseDeliveredNdr
 } = require('../constants/rtoOrderQuery');
 
 function normalizeShipmentEventTimestamp(value) {
@@ -440,6 +448,24 @@ async function upsertShipmentInfo({
     }
     if (shipmentPayload.shiprocketOrderId != null) {
         nextShipmentInfo.shiprocketOrderId = String(shipmentPayload.shiprocketOrderId);
+    }
+    if (shipmentPayload.shipmozoOrderId != null) {
+        nextShipmentInfo.shipmozoOrderId = String(shipmentPayload.shipmozoOrderId);
+    }
+    if (shipmentPayload.shipmozoReferenceId != null) {
+        nextShipmentInfo.shipmozoReferenceId = String(shipmentPayload.shipmozoReferenceId);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'provider')) {
+        nextShipmentInfo.provider =
+            shipmentPayload.provider == null || shipmentPayload.provider === ''
+                ? null
+                : String(shipmentPayload.provider);
+    }
+    if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'shipmozoNeedsManualPickup')) {
+        nextShipmentInfo.shipmozoNeedsManualPickup =
+            shipmentPayload.shipmozoNeedsManualPickup == null
+                ? null
+                : Boolean(shipmentPayload.shipmozoNeedsManualPickup);
     }
     if (Object.prototype.hasOwnProperty.call(shipmentPayload, 'assignedCourierId')) {
         nextShipmentInfo.assignedCourierId =
@@ -547,8 +573,12 @@ async function upsertShipmentInfo({
     }
 
     if (allowOrderStatusUpdate) {
+        const previousOrderStatus = String(order.orderStatus || '').toLowerCase();
         const mappedOrderStatus = mapExternalShipmentStatusToOrderStatus(providerStatus);
-        if (mappedOrderStatus && canApplyProviderOrderStatus(order.orderStatus, mappedOrderStatus)) {
+        if (
+            mappedOrderStatus &&
+            canApplyProviderOrderStatus(order.orderStatus, mappedOrderStatus, providerStatus)
+        ) {
             order.orderStatus = mappedOrderStatus;
             if (mappedOrderStatus === 'shipped' && !nextShipmentInfo.shippedAt) {
                 nextShipmentInfo.shippedAt = new Date();
@@ -559,8 +589,15 @@ async function upsertShipmentInfo({
             if (mappedOrderStatus === 'delivered' && !nextShipmentInfo.deliveredAt) {
                 nextShipmentInfo.deliveredAt = new Date();
             }
+            // Clear false delivery latch when Shiprocket corrects to NDR / transit / OFD / RTO.
+            if (previousOrderStatus === 'delivered' && mappedOrderStatus !== 'delivered') {
+                nextShipmentInfo.deliveredAt = null;
+            }
         } else {
             repairOrderStatusForShiprocketRto(order);
+            if (repairOrderStatusForFalseDeliveredNdr(order)) {
+                nextShipmentInfo.deliveredAt = null;
+            }
         }
     }
 
@@ -647,7 +684,7 @@ async function ensureShipmentForOrder({ order, trigger }) {
                 success: false,
                 code: 'ORDER_AWAITING_ADMIN_CONFIRMATION',
                 message:
-                    'Shiprocket shipment cannot be created while the order is still pending admin confirmation. After the order is confirmed for fulfilment, retry from the admin panel.'
+                    'Shipment cannot be created while the order is still pending admin confirmation. After the order is confirmed for fulfilment, retry from the admin panel.'
             };
         }
     }
@@ -666,6 +703,49 @@ async function ensureShipmentForOrder({ order, trigger }) {
         return { success: true, alreadyExists: true };
     }
 
+    const provider = resolveOrderShippingProvider(order);
+
+    // ——— Shipmozo path (order stamped at place-order) ———
+    if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {
+        if (order.shipmentInfo?.shipmentId || order.shipmentInfo?.shipmozoOrderId) {
+            return { success: true, alreadyExists: true, pendingAwbAssignment: true };
+        }
+
+        const reloadedSm = await Order.findOne({ orderId: order.orderId }).populate(
+            'items.productId',
+            'name slug variants shipping'
+        );
+        if (reloadedSm) order = reloadedSm;
+
+        const result = await ShipmozoService.createShipment(order);
+        if (!result?.success) {
+            await markShipmentSyncFailure({
+                order,
+                error: result?.error || 'Shipmozo push-order failed',
+                trigger
+            });
+            return {
+                success: false,
+                code: 'SHIPMENT_CREATE_FAILED',
+                message: 'Shipmozo shipment creation failed',
+                details: result?.error || null
+            };
+        }
+
+        await upsertShipmentInfo({
+            order,
+            shipmentPayload: {
+                ...result,
+                provider: SHIPPING_PROVIDERS.SHIPMOZO,
+                providerStatus: result.providerStatus || 'PUSHED'
+            },
+            trigger,
+            allowOrderStatusUpdate: false
+        });
+        return { success: true, shipment: result, provider: SHIPPING_PROVIDERS.SHIPMOZO };
+    }
+
+    // ——— Shiprocket path (unchanged behavior) ———
     if (!order.shipmentInfo?.shipmentId && order.shipmentInfo?.shiprocketOrderId) {
         const lookup = await ShiprocketService.fetchShipmentIdForForwardOrder({
             shiprocketOrderId: order.shipmentInfo.shiprocketOrderId,
@@ -676,7 +756,8 @@ async function ensureShipmentForOrder({ order, trigger }) {
                 order,
                 shipmentPayload: {
                     shipmentId: lookup.shipmentId,
-                    shiprocketOrderId: String(order.shipmentInfo.shiprocketOrderId)
+                    shiprocketOrderId: String(order.shipmentInfo.shiprocketOrderId),
+                    provider: SHIPPING_PROVIDERS.SHIPROCKET
                 },
                 trigger: `${trigger}_resolve_shipment_id`,
                 allowOrderStatusUpdate: false
@@ -741,6 +822,7 @@ async function ensureShipmentForOrder({ order, trigger }) {
         order,
         shipmentPayload: {
             ...result,
+            provider: SHIPPING_PROVIDERS.SHIPROCKET,
             // Do NOT force a "shipped-like" status here; let Shiprocket/tracking drive state.
             providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null)
         },
@@ -748,7 +830,7 @@ async function ensureShipmentForOrder({ order, trigger }) {
         // Advance orderStatus from carrier only when AWB exists (shipment_id alone = still "invoiced").
         allowOrderStatusUpdate: Boolean(result?.awbCode || result?.trackingNumber)
     });
-    return { success: true, shipment: result };
+    return { success: true, shipment: result, provider: SHIPPING_PROVIDERS.SHIPROCKET };
 }
 
 function buildOrderResponsePayload(order, {
@@ -1307,6 +1389,25 @@ exports.createOrder = async (req, res) => {
                 : quoteShip.courierCompanyId != null && Number.isFinite(Number(quoteShip.courierCompanyId))
                   ? Number(quoteShip.courierCompanyId)
                   : null;
+        const resolvedShipmozoCourierId =
+            pricedShip.shipmozoCourierId != null && Number.isFinite(Number(pricedShip.shipmozoCourierId))
+                ? Number(pricedShip.shipmozoCourierId)
+                : quoteShip.shipmozoCourierId != null && Number.isFinite(Number(quoteShip.shipmozoCourierId))
+                  ? Number(quoteShip.shipmozoCourierId)
+                  : pricedShip.shippingProvider === 'shipmozo' || quoteShip.shippingProvider === 'shipmozo'
+                    ? resolvedCourierCompanyId
+                    : null;
+        let orderShippingProvider =
+            pricedShip.shippingProvider ||
+            quoteShip.shippingProvider ||
+            null;
+        if (orderShippingProvider !== 'shipmozo' && orderShippingProvider !== 'shiprocket') {
+            try {
+                orderShippingProvider = await shippingProviderSettingsService.getActiveProviderForNewOrders();
+            } catch (_) {
+                orderShippingProvider = SHIPPING_PROVIDERS.SHIPROCKET;
+            }
+        }
         const quoteTotalsMismatch =
             roundMoney2(quote.itemsSubtotal) !== roundMoney2(subtotal) ||
             roundMoney2(quote.promotionDiscount) !== roundMoney2(discount) ||
@@ -1407,6 +1508,7 @@ exports.createOrder = async (req, res) => {
             addressSnapshot: address.toObject(),
             userType: finalUserType,
             storefront,
+            shippingProvider: orderShippingProvider,
             inventoryHold,
             orderStatus:
                 isLegacyAutoFulfillOnCheckout() && normalizedPaymentMethod === 'cod' ? 'confirmed' : 'pending',
@@ -1431,7 +1533,15 @@ exports.createOrder = async (req, res) => {
             shippingSnapshot: {
                 courierName: pricedShip.courierName || quoteShip.courierName || null,
                 estimatedDays: pricedShip.estimatedDays ?? quoteShip.estimatedDays ?? null,
-                courierCompanyId: resolvedCourierCompanyId
+                courierCompanyId: resolvedCourierCompanyId,
+                shipmozoCourierId: resolvedShipmozoCourierId,
+                provider: orderShippingProvider,
+                pickupsAutomaticallyScheduled:
+                    pricedShip.pickupsAutomaticallyScheduled != null
+                        ? Boolean(pricedShip.pickupsAutomaticallyScheduled)
+                        : quoteShip.pickupsAutomaticallyScheduled != null
+                          ? Boolean(quoteShip.pickupsAutomaticallyScheduled)
+                          : null
             },
             shippingWeightSnapshot
         };
@@ -3398,8 +3508,41 @@ exports.trackOrder = async (req, res) => {
         const shipmentId = orderDoc.shipmentInfo?.shipmentId || null;
         let liveTracking = null;
         let trackingSource = 'internal';
+        const provider = resolveOrderShippingProvider(orderDoc);
 
-        if (awbCode || shipmentId || orderDoc.shipmentInfo?.shiprocketOrderId) {
+        // ——— Shipmozo: on-demand track + Case-1 RTO reconcile (no list polling / no Shiprocket APIs) ———
+        if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {
+            if (awbCode) {
+                const { reconcileOrderFromShipmozo } = require('../services/shipmozoReconcile.service');
+                const reconcileResult = await reconcileOrderFromShipmozo(orderDoc, {
+                    source: isOrderStaffRequest(req) ? 'admin_track_order_shipmozo' : 'track_order_shipmozo',
+                    allowOrderStatusUpdate: true,
+                    notify: true
+                });
+                if (reconcileResult.success) {
+                    orderDoc = reconcileResult.order || (await Order.findOne({ orderId: orderDoc.orderId }));
+                    trackingSource = 'shipmozo';
+                    const trackingResult = reconcileResult.tracking;
+                    if (trackingResult) {
+                        const providerStatus =
+                            orderDoc.shipmentInfo?.providerStatus ||
+                            trackingResult.currentStatus ||
+                            null;
+                        liveTracking = {
+                            ...trackingResult,
+                            events: trackingResult.events || [],
+                            currentStatus: providerStatus || trackingResult.currentStatus
+                        };
+                    }
+                } else if (reconcileResult.message) {
+                    logger.warn('Shipmozo live tracking fallback to internal timeline', {
+                        orderId: orderDoc.orderId,
+                        reason: reconcileResult.message,
+                        code: reconcileResult.code
+                    });
+                }
+            }
+        } else if (awbCode || shipmentId || orderDoc.shipmentInfo?.shiprocketOrderId) {
             const { reconcileOrderFromShiprocket } = require('../services/shiprocketReconcile.service');
             const reconcileResult = await reconcileOrderFromShiprocket(orderDoc, {
                 source: isOrderStaffRequest(req) ? 'admin_track_order' : 'track_order',
@@ -3448,6 +3591,7 @@ exports.trackOrder = async (req, res) => {
             providerStatus: orderDoc.shipmentInfo?.providerStatus || null,
             lastSyncedAt: orderDoc.shipmentInfo?.lastSyncAt || null,
             source: trackingSource,
+            shippingProvider: provider,
             timeline: enrichPreTransitTrackingTimeline(rawTimeline, orderDoc)
         };
 
@@ -3714,7 +3858,12 @@ exports.adminDecideReturnRequest = async (req, res) => {
             return res.json({ success: true, message: 'Return request rejected', orderId: order.orderId });
         }
 
-        const reverse = await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
+        const reverse = isShipmozoOrder(order)
+            ? await ShipmozoService.pushReturnOrder(order, order.returnInfo || {}, {
+                returnReasonId: req.body?.returnReasonId,
+                customerRequest: req.body?.customerRequest || 'REFUND'
+              })
+            : await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
         if (!reverse?.success) {
             order.returnInfo = mergeReturnInfo(order.returnInfo, {
                 status: 'approval_failed',

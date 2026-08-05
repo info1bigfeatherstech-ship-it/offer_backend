@@ -15,7 +15,9 @@ const {
   buildRtoBucketMatch,
   buildRtoExclusionForNonRtoBucket,
   repairOrderStatusForShiprocketRto,
-  isRtoProviderStatus
+  repairOrderStatusForFalseDeliveredNdr,
+  isRtoProviderStatus,
+  NDR_UNDELIVERED_PROVIDER_STATUS_REGEX
 } = require('../constants/rtoOrderQuery');
 const {
   buildPickupExceptionBucketMatch,
@@ -24,6 +26,7 @@ const {
 } = require('../constants/pickupExceptionOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmentUi');
+const { resolveOrderShippingProvider } = require('../constants/shippingProviders');
 
 const MAX_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
 const DEFAULT_RANGE_DAYS = 30;
@@ -215,6 +218,19 @@ function buildBucketMatch(bucket) {
   if (b === 'pickup_exception') {
     return buildPickupExceptionBucketMatch();
   }
+  if (b === 'in_transit') {
+    const ndrProviderMatch = { $regex: NDR_UNDELIVERED_PROVIDER_STATUS_REGEX, $options: 'i' };
+    return andFilters(
+      {
+        $or: [
+          { orderStatus: { $in: ['shipped', 'out_for_delivery'] } },
+          { orderStatus: 'delivered', 'shipmentInfo.providerStatus': ndrProviderMatch }
+        ]
+      },
+      buildRtoExclusionForNonRtoBucket(b),
+      buildPickupExceptionExclusionForNonExceptionBucket(b)
+    );
+  }
   if (b === 'ready_to_pick') {
     const match = {
       orderStatus: 'processing',
@@ -327,8 +343,9 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
   const t = row?.totals?.[0] || {};
   const byStatus = Object.fromEntries((row?.byStatus || []).map((x) => [x._id, x.count]));
 
-  const { RTO_PROVIDER_STATUS_REGEX } = require('../constants/rtoOrderQuery');
+  const { RTO_PROVIDER_STATUS_REGEX, NDR_UNDELIVERED_PROVIDER_STATUS_REGEX } = require('../constants/rtoOrderQuery');
   const rtoProviderMatch = { $regex: RTO_PROVIDER_STATUS_REGEX, $options: 'i' };
+  const ndrProviderMatch = { $regex: NDR_UNDELIVERED_PROVIDER_STATUS_REGEX, $options: 'i' };
 
   const pickupExceptionExclude = buildPickupExceptionExclusionForNonExceptionBucket('ready_to_ship');
   const confirmedPickupExceptionExclude =
@@ -339,6 +356,7 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     pickupExceptionCount,
     legacyRtoInCancelled,
     legacyRtoInDelivered,
+    falseDeliveredNdrCount,
     readyToPickCount,
     readyToShipCount,
     confirmedWithoutPickupExceptionCount
@@ -350,6 +368,9 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': rtoProviderMatch }]
+    }),
+    Order.countDocuments({
+      $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': ndrProviderMatch }]
     }),
     Order.countDocuments(
       andFilters(baseMatch, {
@@ -378,9 +399,11 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     bill_sent: confirmedWithoutPickupExceptionCount,
     ready_to_ship: readyToShipCount,
     ready_to_pick: readyToPickCount,
-    in_transit: (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0),
+    in_transit:
+      (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0) + falseDeliveredNdrCount,
     completed:
-      Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered) + (byStatus.return_requested || 0),
+      Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered - falseDeliveredNdrCount) +
+      (byStatus.return_requested || 0),
     rto: rtoCount,
     pickup_exception: pickupExceptionCount,
     others:
@@ -424,6 +447,7 @@ function normalizeFinancialView(o) {
 function mapOrderRow(order) {
   const o = order && typeof order.toObject === 'function' ? order.toObject() : order;
   repairOrderStatusForShiprocketRto(o);
+  repairOrderStatusForFalseDeliveredNdr(o);
   const phone =
     o.addressSnapshot?.phone ||
     o.addressSnapshot?.mobile ||
@@ -491,6 +515,7 @@ function mapOrderRow(order) {
     amountInr: roundMoney(Number(o.totalAmount) || 0),
     currency: 'INR',
     orderStatus: o.orderStatus,
+    shippingProvider: resolveOrderShippingProvider(o),
     fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey),
     fulfillmentBucket: bucketKey,
     itemCount,

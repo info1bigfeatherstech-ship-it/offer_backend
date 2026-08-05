@@ -132,7 +132,10 @@ exports.getOrdersList = async (req, res) => {
     const { OPS_STATES } = require('../services/shipmentOps/constants');
     const { evaluateAndPersistShipmentOps } = require('../services/shipmentOps');
     const { backfillShiprocketPickupIdsForListPage } = require('../services/shiprocketReconcile.service');
-    const { repairOrderStatusForShiprocketRto } = require('../constants/rtoOrderQuery');
+    const {
+      repairOrderStatusForShiprocketRto,
+      repairOrderStatusForFalseDeliveredNdr
+    } = require('../constants/rtoOrderQuery');
 
     for (const doc of orders) {
       const st = String(doc.orderStatus || '').toLowerCase();
@@ -153,6 +156,16 @@ exports.getOrdersList = async (req, res) => {
     const rtoRepairIds = orders.filter((doc) => repairOrderStatusForShiprocketRto(doc)).map((doc) => doc._id);
     if (rtoRepairIds.length) {
       await Order.updateMany({ _id: { $in: rtoRepairIds } }, { $set: { orderStatus: 'rto' } });
+    }
+
+    const ndrFalseDeliveredIds = orders
+      .filter((doc) => repairOrderStatusForFalseDeliveredNdr(doc))
+      .map((doc) => doc._id);
+    if (ndrFalseDeliveredIds.length) {
+      await Order.updateMany(
+        { _id: { $in: ndrFalseDeliveredIds } },
+        { $set: { orderStatus: 'shipped' }, $unset: { 'shipmentInfo.deliveredAt': '' } }
+      );
     }
 
     await backfillShiprocketPickupIdsForListPage(orders, { max: 20 });

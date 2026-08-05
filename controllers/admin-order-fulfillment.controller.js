@@ -7,6 +7,13 @@ const axios = require('axios');
 const AdmZip = require('adm-zip');
 const Order = require('../models/Order');
 const ShiprocketService = require('../utils/shiprocket');
+const ShipmozoService = require('../utils/shipmozo');
+const { runShipmozoAssignShip } = require('../services/shipmozoFulfillment.service');
+const {
+  SHIPPING_PROVIDERS,
+  resolveOrderShippingProvider,
+  isShipmozoOrder
+} = require('../constants/shippingProviders');
 const logger = require('../utils/logger');
 const { isOrderStaffRequest } = require('../utils/checkoutFlow');
 const { buildGstInvoiceHtml, buildGstInvoiceViewModel } = require('../utils/gstInvoice');
@@ -883,9 +890,20 @@ async function resolveCourierForShipNow(order, courierIdOverride) {
 /**
  * @param {import('mongoose').Document} order
  * @param {number|null|undefined} courierIdOverride
+ * @param {{ confirmSubstitute?: boolean }} [opts]
  */
-async function runAssignShipFromOrder(order, courierIdOverride) {
+async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
   try {
+    // Shipmozo orders: never call Shiprocket assign APIs
+    if (isShipmozoOrder(order)) {
+      return runShipmozoAssignShip(order, {
+        courierIdOverride,
+        confirmSubstitute: Boolean(opts.confirmSubstitute),
+        applyUpsertShipmentInfo,
+        evaluateAndPersistShipmentOps
+      });
+    }
+
     const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
     const { OPS_STATES } = require('../services/shipmentOps/constants');
 
@@ -1572,7 +1590,7 @@ exports.adminFulfillmentEnsureShipment = async (req, res) => {
   }
 };
 
-/** POST /orders/admin/items/:orderId/fulfillment/assign-ship  body: { courierId?: number } */
+/** POST /orders/admin/items/:orderId/fulfillment/assign-ship  body: { courierId?: number, confirmSubstitute?: boolean } */
 exports.adminFulfillmentAssignShip = async (req, res) => {
   try {
     const order = await loadStaffOrder(req, res, req.params.orderId);
@@ -1580,11 +1598,20 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
     if (!requireFulfillmentPaymentReady(order, res)) return;
     if (!requireShipmentOpsAction(order, 'shipNow', res)) return;
     const courierId = req.body?.courierId != null ? Number(req.body.courierId) : null;
-    const assignRes = await runAssignShipFromOrder(order, courierId);
+    const confirmSubstitute = Boolean(req.body?.confirmSubstitute);
+    const assignRes = await runAssignShipFromOrder(order, courierId, { confirmSubstitute });
     if (!assignRes.success) {
       const c = assignRes.code || 'ASSIGN_AWB_FAILED';
       let status = 502;
-      if (['SHIPMENT_ID_MISSING', 'INVALID_DELIVERY_PINCODE', 'INVALID_COURIER_ID'].includes(c)) {
+      if (
+        [
+          'SHIPMENT_ID_MISSING',
+          'INVALID_DELIVERY_PINCODE',
+          'INVALID_COURIER_ID',
+          'COURIER_ID_REQUIRED',
+          'NO_QUOTED_COURIER'
+        ].includes(c)
+      ) {
         status = 400;
       } else if (c === 'AWB_ALREADY_ASSIGNED') {
         status = 409;
@@ -1592,15 +1619,25 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
         status = 500;
       } else if (c === 'SHIPROCKET_WALLET_OR_BALANCE') {
         status = 402;
+      } else if (c === 'QUOTED_COURIER_UNAVAILABLE') {
+        status = 409;
       }
-      return jsonError(res, status, c, assignRes.message, assignRes.details ? { details: assignRes.details } : {});
+      return jsonError(res, status, c, assignRes.message, {
+        details: assignRes.details || null,
+        quotedCourier: assignRes.quotedCourier || null,
+        suggestedCourier: assignRes.suggestedCourier || null,
+        availableCouriers: assignRes.availableCouriers || null
+      });
     }
     return res.json({
       success: true,
       message: assignRes.message,
       courierId: assignRes.courierId,
       shipment: assignRes.shipment,
-      order: assignRes.order
+      order: assignRes.order,
+      provider: assignRes.provider || resolveOrderShippingProvider(order),
+      substituted: Boolean(assignRes.substituted),
+      pendingAwb: Boolean(assignRes.pendingAwb)
     });
   } catch (error) {
     logger.error('adminFulfillmentAssignShip', { message: error.message, stack: error.stack });
@@ -1614,6 +1651,43 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+
+    if (isShipmozoOrder(order)) {
+      // On-demand Case-1 RTO-aware reconcile — never call Shiprocket
+      const awb = order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber;
+      if (!awb) {
+        return jsonError(
+          res,
+          400,
+          'SHIPMOZO_AWB_MISSING',
+          'No AWB on this Shipmozo order yet. Use Track after AWB is assigned.'
+        );
+      }
+      const { reconcileOrderFromShipmozo } = require('../services/shipmozoReconcile.service');
+      const reconcileResult = await reconcileOrderFromShipmozo(order, {
+        source: 'admin_manual_sync_shipmozo',
+        allowOrderStatusUpdate: true,
+        notify: true
+      });
+      if (!reconcileResult.success) {
+        return jsonError(
+          res,
+          502,
+          reconcileResult.code || 'SHIPMOZO_TRACK_FAILED',
+          reconcileResult.message || 'Track failed'
+        );
+      }
+      const freshOrder = reconcileResult.order || (await Order.findOne({ orderId: order.orderId }));
+      return res.json({
+        success: true,
+        message: 'Shipmozo tracking refreshed for this order.',
+        order: freshOrder,
+        provider: SHIPPING_PROVIDERS.SHIPMOZO,
+        tracking: reconcileResult.tracking || null,
+        warehouseDelivered: Boolean(reconcileResult.warehouseDelivered)
+      });
+    }
+
     const hasSr =
       order.shipmentInfo?.shiprocketOrderId ||
       order.shipmentInfo?.shipmentId ||
@@ -1677,6 +1751,46 @@ exports.adminFulfillmentSchedulePickup = async (req, res) => {
     const order = await loadStaffOrder(req, res, req.params.orderId);
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
+
+    if (isShipmozoOrder(order)) {
+      if (!requireShipmentOpsAction(order, 'schedulePickup', res)) return;
+      const smOid =
+        order.shipmentInfo?.shipmozoOrderId || order.shipmentInfo?.shipmentId || order.orderId;
+      const pickup = await ShipmozoService.schedulePickup({ orderId: smOid });
+      if (!pickup.success) {
+        return jsonError(
+          res,
+          502,
+          pickup.code || 'SCHEDULE_PICKUP_FAILED',
+          pickup.message || 'Shipmozo schedule-pickup failed',
+          { details: pickup.raw || null }
+        );
+      }
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          awbCode: pickup.awbCode || order.shipmentInfo?.awbCode,
+          trackingNumber: pickup.trackingNumber || pickup.awbCode || order.shipmentInfo?.trackingNumber,
+          courier: pickup.courier || order.shipmentInfo?.courier,
+          pickupScheduledAt: new Date(),
+          pickupDate: new Date().toISOString().slice(0, 10),
+          shipmozoNeedsManualPickup: false,
+          providerStatus: 'PICKUP_SCHEDULED',
+          provider: SHIPPING_PROVIDERS.SHIPMOZO
+        },
+        trigger: 'admin_schedule_pickup_shipmozo',
+        allowOrderStatusUpdate: Boolean(pickup.awbCode)
+      });
+      const fresh = await Order.findOne({ orderId: order.orderId });
+      return res.json({
+        success: true,
+        message: 'Pickup scheduled on Shipmozo.',
+        order: fresh,
+        provider: SHIPPING_PROVIDERS.SHIPMOZO,
+        shipment: pickup
+      });
+    }
+
     const shipmentId = order.shipmentInfo?.shipmentId;
     if (!shipmentId) {
       return jsonError(res, 400, 'SHIPMENT_ID_MISSING', 'No shipment_id on order.');
@@ -1769,8 +1883,37 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
     if (!requireShipmentOpsAction(order, 'downloadLabel', res)) return;
     const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
     if (!hasAwb) {
-      return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label from Shiprocket.');
+      return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label.');
     }
+
+    // Shipmozo label (base64 data URL from get-order-label)
+    if (isShipmozoOrder(order)) {
+      const awb = String(order.shipmentInfo.awbCode || order.shipmentInfo.trackingNumber).trim();
+      const label = await ShipmozoService.getOrderLabel(awb);
+      if (!label.success || !label.labelUrl) {
+        return jsonError(res, 502, 'LABEL_FAILED', label.message || 'Shipmozo label fetch failed', {
+          details: label.raw || null
+        });
+      }
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          labelUrl: label.labelUrl,
+          provider: SHIPPING_PROVIDERS.SHIPMOZO,
+          providerStatus: order.shipmentInfo?.providerStatus
+        },
+        trigger: 'admin_shipping_label_shipmozo',
+        allowOrderStatusUpdate: false
+      });
+      const fresh = await Order.findOne({ orderId: order.orderId });
+      return res.json({
+        success: true,
+        labelUrl: label.labelUrl,
+        order: fresh,
+        provider: SHIPPING_PROVIDERS.SHIPMOZO
+      });
+    }
+
     const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
     if (!shiprocketOrderId) {
       return jsonError(
@@ -1886,12 +2029,41 @@ exports.adminFulfillmentCancelShipment = async (req, res) => {
     if (!order) return;
     if (!requireFulfillmentPaymentReady(order, res)) return;
     if (!requireShipmentOpsAction(order, 'cancelShipment', res)) return;
+
+    if (order.orderStatus === 'shipped' || order.orderStatus === 'out_for_delivery' || order.orderStatus === 'delivered') {
+      return jsonError(res, 409, 'ORDER_TOO_FAR', 'Cannot cancel shipment at this order stage.');
+    }
+
+    // Shipmozo cancel
+    if (isShipmozoOrder(order)) {
+      const awb = order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber;
+      const smOid = order.shipmentInfo?.shipmozoOrderId || order.shipmentInfo?.shipmentId || order.orderId;
+      if (!awb) {
+        return jsonError(res, 400, 'AWB_REQUIRED', 'AWB required to cancel on Shipmozo.');
+      }
+      const cancel = await ShipmozoService.cancelOrder({ orderId: smOid, awbNumber: awb });
+      if (!cancel.success) {
+        return jsonError(res, 502, cancel.code || 'CANCEL_FAILED', cancel.message || 'Shipmozo cancel failed', {
+          details: cancel.raw || null
+        });
+      }
+      const fresh = await finalizeShipmentAfterRemoteCancel(order);
+      const ops = fresh ? buildShipmentOpsView(fresh, { source: 'admin_cancel_shipment_shipmozo' }) : null;
+      return res.json({
+        success: true,
+        message:
+          'Shipment cancelled on Shipmozo. Stale AWB data cleared — use Ship now to book again if needed.',
+        raw: cancel.raw || null,
+        order: fresh,
+        shipmentOps: ops,
+        readyForReship: Boolean(ops?.actionCapabilities?.shipNow),
+        provider: SHIPPING_PROVIDERS.SHIPMOZO
+      });
+    }
+
     const srOid = order.shipmentInfo?.shiprocketOrderId;
     if (!srOid) {
       return jsonError(res, 400, 'SHIPROCKET_ORDER_ID_MISSING', 'No Shiprocket order id stored; cannot cancel remotely.');
-    }
-    if (order.orderStatus === 'shipped' || order.orderStatus === 'out_for_delivery' || order.orderStatus === 'delivered') {
-      return jsonError(res, 409, 'ORDER_TOO_FAR', 'Cannot cancel shipment at this order stage.');
     }
 
     const cancel = await ShiprocketService.cancelShiprocketOrders([srOid]);

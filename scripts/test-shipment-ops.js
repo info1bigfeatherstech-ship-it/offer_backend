@@ -414,17 +414,70 @@ function testLegacyLabelUrlWithoutAwbTagStillAllowsLabelDownload() {
 }
 
 function testRtoProviderStatusMapping() {
-  const { mapProviderStatusToOrderStatus, isRtoProviderStatus } = require('../services/shipmentOps/shiprocketStatusMap');
+  const {
+    mapProviderStatusToOrderStatus,
+    isRtoProviderStatus,
+    isNdrOrUndeliveredProviderStatus,
+    isTrueDeliveredProviderStatus
+  } = require('../services/shipmentOps/shiprocketStatusMap');
+  const {
+    canApplyProviderOrderStatus,
+    repairOrderStatusForFalseDeliveredNdr
+  } = require('../constants/rtoOrderQuery');
+  const { classifySignalTexts, CLASSIFICATION } = require('../services/shipmentOps/normalizeProviderSignals');
+
   assert.strictEqual(isRtoProviderStatus('RTO Delivered'), true);
   assert.strictEqual(isRtoProviderStatus('RTO IN TRANSIT'), true);
   assert.strictEqual(isRtoProviderStatus('RTO Initiated'), true);
+  assert.strictEqual(isRtoProviderStatus('Return To Seller'), true);
+  assert.strictEqual(isRtoProviderStatus('Returned to Seller'), true);
+  assert.strictEqual(isRtoProviderStatus('RTS'), true);
   assert.strictEqual(isRtoProviderStatus('Delivered'), false);
   assert.strictEqual(isRtoProviderStatus('Undelivered'), false);
   assert.strictEqual(mapProviderStatusToOrderStatus('RTO Delivered'), 'rto');
   assert.strictEqual(mapProviderStatusToOrderStatus('RTO IN TRANSIT'), 'rto');
   assert.strictEqual(mapProviderStatusToOrderStatus('RTO Initiated'), 'rto');
+  assert.strictEqual(mapProviderStatusToOrderStatus('Return To Seller'), 'rto');
   assert.strictEqual(mapProviderStatusToOrderStatus('Delivered'), 'delivered');
   assert.strictEqual(mapProviderStatusToOrderStatus('Cancelled'), 'cancelled');
+
+  // Regression: "undelivered" must NEVER map to delivered (substring bug).
+  const ndrLabels = [
+    'Undelivered',
+    'Undelivered-EN-ROUTE',
+    'Undelivered-AT DESTINATION HUB',
+    'UNDELIVERED-2ND ATTEMPT',
+    'UNDELIVERED-3RD ATTEMPT',
+    'NDR',
+    'Delivery Failed'
+  ];
+  for (const label of ndrLabels) {
+    assert.strictEqual(isNdrOrUndeliveredProviderStatus(label), true, label);
+    assert.strictEqual(isTrueDeliveredProviderStatus(label), false, label);
+    assert.strictEqual(mapProviderStatusToOrderStatus(label), 'shipped', label);
+    assert.strictEqual(
+      classifySignalTexts([label.toLowerCase().replace(/[_-]+/g, ' ')]),
+      CLASSIFICATION.IN_TRANSIT,
+      label
+    );
+  }
+  assert.strictEqual(isTrueDeliveredProviderStatus('Delivered'), true);
+  assert.strictEqual(isTrueDeliveredProviderStatus('Delivery Completed'), true);
+  assert.strictEqual(mapProviderStatusToOrderStatus('Out for Delivery'), 'out_for_delivery');
+
+  assert.strictEqual(
+    canApplyProviderOrderStatus('delivered', 'shipped', 'Undelivered-EN-ROUTE'),
+    true
+  );
+  assert.strictEqual(canApplyProviderOrderStatus('delivered', 'shipped', 'Delivered'), false);
+
+  const falseDelivered = {
+    orderStatus: 'delivered',
+    shipmentInfo: { providerStatus: 'Undelivered-AT DESTINATION HUB', deliveredAt: new Date() }
+  };
+  assert.strictEqual(repairOrderStatusForFalseDeliveredNdr(falseDelivered), true);
+  assert.strictEqual(falseDelivered.orderStatus, 'shipped');
+  assert.strictEqual(falseDelivered.shipmentInfo.deliveredAt, null);
 }
 
 function testRtoOpsStateUsesShiprocketLabel() {

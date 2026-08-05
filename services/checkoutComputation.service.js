@@ -5,7 +5,9 @@
 const crypto = require('crypto');
 const Coupon = require('../models/Coupon');
 const Product = require('../models/Product');
-const ShiprocketService = require('../utils/shiprocket');
+const {
+  checkDeliveryAvailabilityForActiveProvider
+} = require('./shippingQuote.service');
 const {
   isProductListedOnStorefront,
   isVariantListedOnStorefront
@@ -301,7 +303,7 @@ async function resolveCouponDiscount(couponCode, subtotal, finalUserType, sessio
 }
 
 /**
- * Full pricing + Shiprocket for a pincode.
+ * Full pricing + active shipping provider quote for a pincode.
  */
 async function computeCheckoutTotals({
   cart,
@@ -338,6 +340,15 @@ async function computeCheckoutTotals({
         baseOverride.courierCompanyId != null && Number.isFinite(Number(baseOverride.courierCompanyId))
           ? Number(baseOverride.courierCompanyId)
           : null,
+      shipmozoCourierId:
+        baseOverride.shipmozoCourierId != null && Number.isFinite(Number(baseOverride.shipmozoCourierId))
+          ? Number(baseOverride.shipmozoCourierId)
+          : null,
+      shippingProvider: baseOverride.shippingProvider || baseOverride.provider || null,
+      pickupsAutomaticallyScheduled:
+        baseOverride.pickupsAutomaticallyScheduled != null
+          ? Boolean(baseOverride.pickupsAutomaticallyScheduled)
+          : null,
       isDeliverable: baseOverride.isDeliverable !== false,
       codAvailable: baseOverride.codAvailable !== false,
       mock: Boolean(baseOverride.mock),
@@ -351,12 +362,13 @@ async function computeCheckoutTotals({
           : null
     };
   } else {
-    const ship = await ShiprocketService.checkDeliveryAvailability(postalCode, {
+    const ship = await checkDeliveryAvailabilityForActiveProvider(postalCode, {
       weightKg: evaluated.totalWeight,
       lengthCm: evaluated.dims.lengthCm,
       widthCm: evaluated.dims.widthCm,
       heightCm: evaluated.dims.heightCm,
-      codAmount: codAmountForShiprocket
+      codAmount: codAmountForShiprocket,
+      orderAmount: Math.max(0, evaluated.subtotal - discount)
     });
 
     if (!ship.isDeliverable) {
@@ -371,10 +383,22 @@ async function computeCheckoutTotals({
       ship.courierCompanyId != null && Number.isFinite(Number(ship.courierCompanyId))
         ? Number(ship.courierCompanyId)
         : null;
+    const smCourierId =
+      ship.shipmozoCourierId != null && Number.isFinite(Number(ship.shipmozoCourierId))
+        ? Number(ship.shipmozoCourierId)
+        : ship.shippingProvider === 'shipmozo'
+          ? cid
+          : null;
     deliveryMeta = {
       estimatedDays: ship.estimatedDays,
       courierName: ship.courierName,
       courierCompanyId: cid,
+      shipmozoCourierId: smCourierId,
+      shippingProvider: ship.shippingProvider || ship.provider || null,
+      pickupsAutomaticallyScheduled:
+        ship.pickupsAutomaticallyScheduled != null
+          ? Boolean(ship.pickupsAutomaticallyScheduled)
+          : null,
       isDeliverable: ship.isDeliverable,
       codAvailable: ship.codAvailable !== false,
       mock: ship.mock,
@@ -408,7 +432,7 @@ async function computeCheckoutTotals({
  * Recompute delivery using an existing snapshot weight/dims when pincode matches (TTL handled by caller).
  */
 async function refreshDeliveryOnly(postalCode, weightKg, dims, codAmount = 0) {
-  return ShiprocketService.checkDeliveryAvailability(postalCode, {
+  return checkDeliveryAvailabilityForActiveProvider(postalCode, {
     weightKg,
     lengthCm: dims.lengthCm,
     widthCm: dims.widthCm,

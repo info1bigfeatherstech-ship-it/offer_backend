@@ -1,5 +1,6 @@
 /**
- * Background Shiprocket → DB sync for admin RTO bucket only.
+ * Background provider → DB sync for admin RTO bucket only (Case-1 courier RTO).
+ * Shiprocket: reconcileOrderFromShiprocket. Shipmozo: reconcileOrderFromShipmozo (AWB track).
  * Does not touch forward Orders auto-sync (ACTIVE_FORWARD_SYNC_STATUSES).
  * Stops syncing once providerStatus is warehouse-delivered (refund gate already open).
  */
@@ -13,7 +14,9 @@ const {
   RTO_WAREHOUSE_DELIVERED_REGEX,
 } = require('./rtoRefund.service');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
+const { reconcileOrderFromShipmozo } = require('./shipmozoReconcile.service');
 const { hasShiprocketReference } = require('./adminOrderAutoSync.service');
+const { isShipmozoOrder } = require('../constants/shippingProviders');
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 3;
@@ -184,7 +187,23 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     };
   }
 
-  if (!hasShiprocketReference(order.shipmentInfo)) {
+  const shipmozo = isShipmozoOrder(order);
+  const awb = String(
+    order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || ''
+  ).trim();
+
+  if (shipmozo) {
+    if (!awb) {
+      return {
+        orderId: id,
+        success: false,
+        updated: false,
+        skipped: true,
+        code: 'SHIPMOZO_AWB_MISSING',
+        message: 'No AWB on this Shipmozo order',
+      };
+    }
+  } else if (!hasShiprocketReference(order.shipmentInfo)) {
     return {
       orderId: id,
       success: false,
@@ -211,6 +230,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
     let freightUpdated = false;
     try {
       if (orderNeedsRtoFreightSync(order)) {
+        // Routes to env default for Shipmozo; Shiprocket billing for SR
         const freight = await syncRtoFreightChargeFromShiprocket(order, { persist: false });
         freightUpdated = Boolean(freight?.updated);
       }
@@ -238,11 +258,17 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
   const previousOrderStatus = String(order.orderStatus || '').toLowerCase();
   const previousLatch = Boolean(order.returnInfo?.rtoWarehouseDeliveredAt);
 
-  const reconcileResult = await reconcileOrderFromShiprocket(order, {
-    source,
-    mode: 'full',
-    allowOrderStatusUpdate: true,
-  });
+  const reconcileResult = shipmozo
+    ? await reconcileOrderFromShipmozo(order, {
+        source,
+        allowOrderStatusUpdate: true,
+        notify: true,
+      })
+    : await reconcileOrderFromShiprocket(order, {
+        source,
+        mode: 'full',
+        allowOrderStatusUpdate: true,
+      });
 
   if (!reconcileResult.success) {
     return {
@@ -304,7 +330,7 @@ async function runRtoAutoSyncSingle(orderId, source = 'admin_rto_auto_sync') {
 }
 
 /**
- * Sync stale non-warehouse-delivered RTO orders from Shiprocket into Mongo.
+ * Sync stale non-warehouse-delivered RTO orders from provider into Mongo.
  * @param {{
  *   from?: Date,
  *   to?: Date,

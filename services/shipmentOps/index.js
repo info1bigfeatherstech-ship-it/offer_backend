@@ -2,7 +2,10 @@
  * Evaluate and optionally persist shipment ops snapshot on an order.
  */
 
-const { repairOrderStatusForShiprocketRto } = require('../../constants/rtoOrderQuery');
+const {
+  repairOrderStatusForShiprocketRto,
+  repairOrderStatusForFalseDeliveredNdr
+} = require('../../constants/rtoOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../../utils/orderFulfillmentPaymentGate');
 const { OPS_STATE_LABELS, ACTION_KEYS, OPS_STATES } = require('./constants');
 const { computeOpsState, hasAwb } = require('./computeOpsState');
@@ -126,6 +129,7 @@ async function evaluateAndPersistShipmentOps(orderDoc, options = {}) {
   if (!orderDoc) return null;
   maybeRevertOrderStatusForProviderReset(orderDoc);
   repairOrderStatusForShiprocketRto(orderDoc);
+  repairOrderStatusForFalseDeliveredNdr(orderDoc);
   const view = buildShipmentOpsView(orderDoc, options);
   orderDoc.shipmentOps = view;
   orderDoc.markModified('shipmentOps');
