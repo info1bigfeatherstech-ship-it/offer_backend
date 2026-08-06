@@ -18,6 +18,10 @@ const {
 const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
 const { isRtoProviderStatus } = require('./shiprocketStatusMap');
 const { isUnpaidTerminalOrder } = require('../../utils/orderPaymentState');
+const {
+  resolveOrderShippingProvider,
+  SHIPPING_PROVIDERS,
+} = require('../../constants/shippingProviders');
 
 /**
  * @param {string} orderStatus
@@ -55,7 +59,10 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
   const gateOk = fulfillmentPaymentGate?.ok === true;
   const awb = hasAwb(si);
   const shipmentId = hasShipmentId(si);
-  const shiprocket = hasShiprocketOrderId(si) || shipmentId || awb;
+  const provider = resolveOrderShippingProvider(o);
+  const isShipmozo = provider === SHIPPING_PROVIDERS.SHIPMOZO;
+  const shiprocket = !isShipmozo && (hasShiprocketOrderId(si) || shipmentId || awb);
+  const shipmozoReady = isShipmozo && (Boolean(si.shipmozoOrderId) || shipmentId || awb);
   const shiprocketRto = st === 'rto' || isRtoProviderStatus(si.providerStatus);
   const terminal = isUnpaidTerminalOrder(o) || shiprocketRto;
   const inTransit = IN_TRANSIT_ORDER_STATUSES.includes(st);
@@ -113,7 +120,9 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       caps.shipNow =
         !awb &&
         gateOk &&
-        (st === 'confirmed' || (st === 'processing' && Boolean(si.shiprocketOrderId)));
+        (st === 'confirmed' ||
+          (st === 'processing' &&
+            (Boolean(si.shiprocketOrderId) || Boolean(si.shipmozoOrderId) || shipmentId)));
       caps.syncShiprocket = shiprocket && gateOk;
       if (!gateOk && fulfillmentPaymentGate?.message) {
         blockReasons.shipNow = fulfillmentPaymentGate.message;
@@ -121,99 +130,158 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       break;
 
     case OPS_STATES.AWB_ASSIGNED:
-      caps.schedulePickup = awb && shipmentId && gateOk && !inTransit && st !== 'delivered' && !terminal;
-      caps.syncShiprocket = shiprocket && !terminal;
-      caps.refreshTracking = awb;
-      caps.openShiprocket = Boolean(si.shiprocketOrderId);
-      caps.cancelShipment = shiprocket && gateOk && !terminal;
+      if (isShipmozo) {
+        // Shipmozo: label via get-order-label; no Shiprocket manifest flow
+        caps.schedulePickup =
+          awb &&
+          si.shipmozoNeedsManualPickup === true &&
+          gateOk &&
+          !inTransit &&
+          st !== 'delivered' &&
+          !terminal;
+        caps.downloadLabel = awb && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.cancelShipment = shipmozoReady && gateOk && !terminal;
+      } else {
+        caps.schedulePickup = awb && shipmentId && gateOk && !inTransit && st !== 'delivered' && !terminal;
+        caps.syncShiprocket = shiprocket && !terminal;
+        caps.refreshTracking = awb;
+        caps.openShiprocket = Boolean(si.shiprocketOrderId);
+        caps.cancelShipment = shiprocket && gateOk && !terminal;
+      }
       break;
 
     case OPS_STATES.PICKUP_SCHEDULED:
-      caps.generateManifest =
-        awb && shipmentId && providerSignalsValid && !terminal && !inTransit && st !== 'delivered';
-      caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
-      caps.downloadLabel =
-        awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
-      caps.syncShiprocket = shiprocket && !terminal;
-      caps.refreshTracking = awb;
-      caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
-      caps.openShiprocket = Boolean(si.shiprocketOrderId);
-      caps.cancelShipment = shiprocket && gateOk && !terminal && !inTransit;
+      if (isShipmozo) {
+        caps.downloadLabel = awb && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
+        caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
+      } else {
+        caps.generateManifest =
+          awb && shipmentId && providerSignalsValid && !terminal && !inTransit && st !== 'delivered';
+        caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
+        caps.downloadLabel =
+          awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
+        caps.syncShiprocket = shiprocket && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
+        caps.openShiprocket = Boolean(si.shiprocketOrderId);
+        caps.cancelShipment = shiprocket && gateOk && !terminal && !inTransit;
+      }
       break;
 
     case OPS_STATES.MANIFEST_READY:
-      caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
-      caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
-      caps.generateManifest = awb && shipmentId && providerSignalsValid && !terminal && !inTransit;
-      caps.syncShiprocket = shiprocket && !terminal;
-      caps.refreshTracking = awb;
-      caps.track = awb;
-      caps.openShiprocket = Boolean(si.shiprocketOrderId);
-      caps.cancelShipment = shiprocket && gateOk && !terminal && !inTransit;
+      if (isShipmozo) {
+        caps.downloadLabel = awb && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
+      } else {
+        caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
+        caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
+        caps.generateManifest = awb && shipmentId && providerSignalsValid && !terminal && !inTransit;
+        caps.syncShiprocket = shiprocket && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.openShiprocket = Boolean(si.shiprocketOrderId);
+        caps.cancelShipment = shiprocket && gateOk && !terminal && !inTransit;
+      }
       break;
 
     case OPS_STATES.LABEL_READY:
-      caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
-      caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
-      caps.syncShiprocket = shiprocket && !terminal;
-      caps.refreshTracking = awb;
-      caps.track = awb;
-      caps.openShiprocket = Boolean(si.shiprocketOrderId);
+      if (isShipmozo) {
+        caps.downloadLabel = awb && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
+      } else {
+        caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
+        caps.downloadLabel = awb && shipmentId && artifactsValid && !terminal;
+        caps.syncShiprocket = shiprocket && !terminal;
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.openShiprocket = Boolean(si.shiprocketOrderId);
+      }
       break;
 
     case OPS_STATES.PICKUP_EXCEPTION:
-      caps.retryPickup = shipmentId && gateOk;
-      enableSupportLink();
-      caps.syncShiprocket = shiprocket;
-      caps.refreshTracking = awb;
-      caps.cancelShipment = shiprocket && gateOk;
-      caps.track = awb;
-      if (!shipmentId) {
-        blockReasons.retryPickup = 'No shipment_id on order — refresh Shiprocket sync first.';
+      if (isShipmozo) {
+        caps.refreshTracking = awb;
+        caps.track = awb;
+        caps.cancelShipment = shipmozoReady && gateOk;
+        caps.schedulePickup = awb && gateOk;
+      } else {
+        caps.retryPickup = shipmentId && gateOk;
+        enableSupportLink();
+        caps.syncShiprocket = shiprocket;
+        caps.refreshTracking = awb;
+        caps.cancelShipment = shiprocket && gateOk;
+        caps.track = awb;
+        if (!shipmentId) {
+          blockReasons.retryPickup = 'No shipment_id on order — refresh Shiprocket sync first.';
+        }
+        blockFulfillmentArtifacts(
+          'Pickup exception on Shiprocket. Retry pickup, open Shiprocket support, or cancel and ship again before manifest/label.'
+        );
       }
-      blockFulfillmentArtifacts(
-        'Pickup exception on Shiprocket. Retry pickup, open Shiprocket support, or cancel and ship again before manifest/label.'
-      );
       break;
 
     case OPS_STATES.PROVIDER_RESET:
-      caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk;
-      enableSupportLink();
-      caps.syncShiprocket = shiprocket;
-      caps.refreshTracking = awb;
-      caps.cancelShipment = shiprocket && gateOk;
-      blockFulfillmentArtifacts(
-        'Shiprocket reset this shipment. Refresh sync, then use Ship now to re-create the shipment.'
-      );
+      if (isShipmozo) {
+        caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk;
+        caps.refreshTracking = awb;
+      } else {
+        caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk;
+        enableSupportLink();
+        caps.syncShiprocket = shiprocket;
+        caps.refreshTracking = awb;
+        caps.cancelShipment = shiprocket && gateOk;
+        blockFulfillmentArtifacts(
+          'Shiprocket reset this shipment. Refresh sync, then use Ship now to re-create the shipment.'
+        );
+      }
       if (!gateOk && fulfillmentPaymentGate?.message) {
         blockReasons.shipNow = fulfillmentPaymentGate.message;
       }
       break;
 
     case OPS_STATES.NEEDS_MANUAL_REVIEW:
-      caps.retryPickup = shipmentId && awb && gateOk;
-      caps.syncShiprocket = shiprocket;
-      caps.refreshTracking = awb;
-      enableSupportLink();
-      caps.track = awb;
-      blockFulfillmentArtifacts('Unknown Shiprocket status — sync and review before manifest or label.');
+      if (isShipmozo) {
+        caps.refreshTracking = awb;
+        caps.track = awb;
+      } else {
+        caps.retryPickup = shipmentId && awb && gateOk;
+        caps.syncShiprocket = shiprocket;
+        caps.refreshTracking = awb;
+        enableSupportLink();
+        caps.track = awb;
+        blockFulfillmentArtifacts('Unknown Shiprocket status — sync and review before manifest or label.');
+      }
       break;
 
     case OPS_STATES.IN_TRANSIT:
     case OPS_STATES.OUT_FOR_DELIVERY:
       caps.track = awb;
       caps.refreshTracking = awb;
-      caps.syncShiprocket = shiprocket;
-      caps.downloadManifest = awb && Boolean(si.manifestUrl);
-      caps.downloadLabel = awb && !terminal;
-      caps.openShiprocket = Boolean(si.shiprocketOrderId);
+      if (isShipmozo) {
+        caps.downloadLabel = awb && !terminal;
+      } else {
+        caps.syncShiprocket = shiprocket;
+        caps.downloadManifest = awb && Boolean(si.manifestUrl);
+        caps.downloadLabel = awb && !terminal;
+        caps.openShiprocket = Boolean(si.shiprocketOrderId);
+      }
       break;
 
     case OPS_STATES.DELIVERED:
       caps.track = awb;
       caps.refreshTracking = awb;
-      caps.downloadManifest = awb && Boolean(si.manifestUrl);
       caps.downloadLabel = awb;
+      if (!isShipmozo) {
+        caps.downloadManifest = awb && Boolean(si.manifestUrl);
+      }
       break;
 
     case OPS_STATES.CANCELLED:

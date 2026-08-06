@@ -100,7 +100,16 @@ function classifySignalTexts(texts) {
     return CLASSIFICATION.OUT_FOR_DELIVERY;
   }
 
-  if (/delivered|delivery\s*completed/.test(combined)) {
+  // NDR / Undelivered before delivered — "undelivered" contains substring "delivered".
+  if (
+    /\bundelivered\b|\bndr\b|delivery\s*failed|failed\s*delivery|not\s*delivered|delivery\s*attempt\s*failed|consignee\s*refused|customer\s*refused|refused\s*by\s*customer|customer\s*not\s*available/.test(
+      combined
+    )
+  ) {
+    return CLASSIFICATION.IN_TRANSIT;
+  }
+
+  if (/\bdelivered\b|delivery\s*completed/.test(combined)) {
     return CLASSIFICATION.DELIVERED;
   }
 

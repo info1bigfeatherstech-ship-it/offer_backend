@@ -53,6 +53,18 @@ const orderSchema = new mongoose.Schema(
 
     /** Checkout channel at order place (for ID prefix + admin scope) */
     storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
+
+    /**
+     * Frozen at place-order from active shipping partner setting.
+     * Fulfillment/track/return ALWAYS use this — never the current active setting.
+     * Legacy orders without this field are treated as shiprocket.
+     */
+    shippingProvider: {
+      type: String,
+      enum: ['shiprocket', 'shipmozo'],
+      default: 'shiprocket',
+      index: true
+    },
     
     orderStatus: {
       type: String,
@@ -116,6 +128,11 @@ const orderSchema = new mongoose.Schema(
       shipmentId: String,
       /** Shiprocket channel order id (numeric) — used for cancel API */
       shiprocketOrderId: { type: String, default: null },
+      /** Shipmozo panel order id / reference after push-order */
+      shipmozoOrderId: { type: String, default: null },
+      shipmozoReferenceId: { type: String, default: null },
+      /** Mirror of order.shippingProvider for quick shipment reads */
+      provider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
       awbCode: String,
       trackingNumber: String,
       courier: String,
@@ -124,6 +141,11 @@ const orderSchema = new mongoose.Schema(
       courierAssignNote: { type: String, default: null },
       courierSubstitutedFromId: { type: Number, default: null },
       courierSubstitutedFromName: { type: String, default: null },
+      /**
+       * Shipmozo: when true, schedule-pickup was required / done.
+       * When false, panel auto-schedules pickups.
+       */
+      shipmozoNeedsManualPickup: { type: Boolean, default: null },
       providerStatus: String,
       estimatedDelivery: String,
       labelUrl: String,
@@ -273,11 +295,17 @@ const orderSchema = new mongoose.Schema(
         discount: { type: Number, default: 0 }
     },
 
-    /** Snapshot from checkout quote (Shiprocket serviceability) — quote courier at order time */
+    /** Snapshot from checkout quote — quote courier at order time */
     shippingSnapshot: {
       courierName: { type: String, default: null },
       estimatedDays: { type: String, default: null },
-      courierCompanyId: { type: Number, default: null }
+      /** Shiprocket courier company id OR Shipmozo courier_id (same slot for quote→ship continuity) */
+      courierCompanyId: { type: Number, default: null },
+      /** Explicit Shipmozo courier id (mirrors courierCompanyId when provider=shipmozo) */
+      shipmozoCourierId: { type: Number, default: null },
+      /** Provider that produced this quote */
+      provider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
+      pickupsAutomaticallyScheduled: { type: Boolean, default: null }
     },
 
     /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */

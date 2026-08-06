@@ -376,6 +376,12 @@ exports.quoteCheckout = async (req, res) => {
         estimatedDays: finalTotals.deliveryMeta?.estimatedDays || null,
         courierName: finalTotals.deliveryMeta?.courierName || null,
         courierCompanyId: finalTotals.deliveryMeta?.courierCompanyId || null,
+        shipmozoCourierId: finalTotals.deliveryMeta?.shipmozoCourierId || null,
+        shippingProvider: finalTotals.deliveryMeta?.shippingProvider || null,
+        pickupsAutomaticallyScheduled:
+          finalTotals.deliveryMeta?.pickupsAutomaticallyScheduled != null
+            ? Boolean(finalTotals.deliveryMeta.pickupsAutomaticallyScheduled)
+            : null,
         codAvailable: finalTotals.deliveryMeta?.codAvailable !== false,
         message: 'Delivery available',
         mock: Boolean(finalTotals.deliveryMeta?.mock),

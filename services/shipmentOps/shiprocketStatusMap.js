@@ -82,7 +82,7 @@ function isForwardProgressStatus(statusLabel, statusCode) {
     return true;
   }
   const label = normalizeText(statusLabel);
-  return /pickup generated|pickup scheduled|pickup queued|out for pickup|\bofp\b|ready to ship|awb assigned|manifest|in transit|out for delivery|delivered|shipped/.test(
+  return /pickup generated|pickup scheduled|pickup queued|out for pickup|\bofp\b|ready to ship|awb assigned|manifest|in transit|out for delivery|\bdelivered\b|shipped/.test(
     label
   );
 }
@@ -220,13 +220,51 @@ function isRtoProviderStatus(rawStatus) {
   const s = normalizeText(rawStatus);
   if (!s) return false;
   if (/pickup scheduled|pickup generated/.test(s)) return false;
-  return /\brto\b/.test(s) || /return to origin/.test(s) || /returned to origin/.test(s);
+  // Shiprocket + Shipmozo courier labels (Case-1 courier RTO)
+  return (
+    /\brto\b/.test(s) ||
+    /return to origin/.test(s) ||
+    /returned to origin/.test(s) ||
+    /return to seller/.test(s) ||
+    /returned to seller/.test(s) ||
+    /\brts\b/.test(s)
+  );
+}
+
+/**
+ * Failed delivery attempt / NDR — still in forward transit (not terminal delivered).
+ * Must be checked BEFORE any `/delivered/` substring match ("undelivered" contains "delivered").
+ * @param {string|null|undefined} rawStatus
+ */
+function isNdrOrUndeliveredProviderStatus(rawStatus) {
+  const s = normalizeText(rawStatus);
+  if (!s) return false;
+  if (isRtoProviderStatus(s)) return false;
+  return (
+    /\bundelivered\b/.test(s) ||
+    /\bndr\b/.test(s) ||
+    /delivery failed|failed delivery|not delivered|delivery attempt failed/.test(s) ||
+    /consignee refused|customer refused|refused by customer|customer not available/.test(s)
+  );
+}
+
+/**
+ * True customer delivery — word-boundary so "undelivered" never matches.
+ * @param {string|null|undefined} rawStatus
+ */
+function isTrueDeliveredProviderStatus(rawStatus) {
+  const s = normalizeText(rawStatus);
+  if (!s) return false;
+  if (isNdrOrUndeliveredProviderStatus(s)) return false;
+  if (isRtoProviderStatus(s)) return false;
+  return /\bdelivered\b|delivery completed/.test(s);
 }
 
 /**
  * Map live Shiprocket provider label → internal orderStatus.
  * Pre-transit (AWB, ready to ship, pickup pending) stays `processing`.
  * Only true movement → `shipped` / later.
+ * NDR / Undelivered* → `shipped` (In Transit tab) — never `delivered` / `cancelled`.
  * RTO labels → `rto` (exact Shiprocket text kept in shipmentInfo.providerStatus).
  * @param {string|null|undefined} rawStatus
  * @returns {'processing'|'shipped'|'out_for_delivery'|'delivered'|'cancelled'|'rto'|null}
@@ -240,8 +278,13 @@ function mapProviderStatusToOrderStatus(rawStatus) {
   if (isRtoProviderStatus(s)) return 'rto';
 
   if (/out for delivery|\bofd\b/.test(s)) return 'out_for_delivery';
-  if (/delivered|delivery completed/.test(s)) return 'delivered';
-  if (/cancel|undelivered/.test(s) && !/pickup scheduled|pickup generated/.test(s)) {
+
+  // NDR / Undelivered-* BEFORE delivered — "undelivered" contains substring "delivered".
+  if (isNdrOrUndeliveredProviderStatus(s)) return 'shipped';
+
+  if (isTrueDeliveredProviderStatus(s)) return 'delivered';
+
+  if (/\bcancel/.test(s) && !/pickup scheduled|pickup generated/.test(s)) {
     return 'cancelled';
   }
 
@@ -278,6 +321,8 @@ module.exports = {
   isStaleCancelTimelineStatus,
   sanitizeTrackingEventsForProvider,
   isRtoProviderStatus,
+  isNdrOrUndeliveredProviderStatus,
+  isTrueDeliveredProviderStatus,
   mapProviderStatusToOrderStatus,
   isProviderStatusInTransit
 };

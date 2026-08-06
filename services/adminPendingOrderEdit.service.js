@@ -21,6 +21,11 @@ const {
 const { buildShippingWeightSnapshotFromCheckoutLines } = require('../utils/shippingWeightSnapshot');
 const { resolveVariantShipping } = require('../utils/variantCatalogFields');
 const ShiprocketService = require('../utils/shiprocket');
+const ShipmozoService = require('../utils/shipmozo');
+const {
+  resolveOrderShippingProvider,
+  SHIPPING_PROVIDERS
+} = require('../constants/shippingProviders');
 const { releaseReservedInventoryForLines } = require('./orderInventory.service');
 const {
   releaseOrderStockHold,
@@ -365,13 +370,24 @@ async function repriceShippingForItems(order, nextItems) {
   const provisionalTotalWithOldShip = roundMoney2(subtotal + oldDelivery + tax - discount);
   const codPass1 = estimateCodAmount(order, provisionalTotalWithOldShip, amountPaidInr);
 
-  const ship = await ShiprocketService.checkDeliveryAvailability(postalCode, {
-    weightKg: dimsAgg.weightKg,
-    lengthCm: dimsAgg.lengthCm,
-    widthCm: dimsAgg.widthCm,
-    heightCm: dimsAgg.heightCm,
-    codAmount: codPass1
-  });
+  const orderProvider = resolveOrderShippingProvider(order);
+  const ship =
+    orderProvider === SHIPPING_PROVIDERS.SHIPMOZO
+      ? await ShipmozoService.checkDeliveryAvailability(postalCode, {
+          weightKg: dimsAgg.weightKg,
+          lengthCm: dimsAgg.lengthCm,
+          widthCm: dimsAgg.widthCm,
+          heightCm: dimsAgg.heightCm,
+          codAmount: codPass1,
+          orderAmount: provisionalTotalWithOldShip
+        })
+      : await ShiprocketService.checkDeliveryAvailability(postalCode, {
+          weightKg: dimsAgg.weightKg,
+          lengthCm: dimsAgg.lengthCm,
+          widthCm: dimsAgg.widthCm,
+          heightCm: dimsAgg.heightCm,
+          codAmount: codPass1
+        });
 
   if (!ship.isDeliverable) {
     throw createEditError(
@@ -405,7 +421,16 @@ async function repriceShippingForItems(order, nextItems) {
     shippingSnapshot: {
       courierName: ship.courierName || null,
       estimatedDays: ship.estimatedDays != null ? String(ship.estimatedDays) : null,
-      courierCompanyId
+      courierCompanyId,
+      shipmozoCourierId:
+        orderProvider === SHIPPING_PROVIDERS.SHIPMOZO
+          ? courierCompanyId
+          : null,
+      provider: orderProvider,
+      pickupsAutomaticallyScheduled:
+        ship.pickupsAutomaticallyScheduled != null
+          ? Boolean(ship.pickupsAutomaticallyScheduled)
+          : null
     },
     shipMeta: {
       isDeliverable: ship.isDeliverable,

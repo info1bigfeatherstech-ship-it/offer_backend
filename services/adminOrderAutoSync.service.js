@@ -8,6 +8,7 @@ const {
   isActiveForwardSyncOrderStatus,
 } = require('../constants/adminOrderFulfillmentBuckets');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
+const { isShipmozoOrder } = require('../constants/shippingProviders');
 
 const DEFAULT_STALE_MS = 5 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 4;
@@ -39,6 +40,25 @@ function buildAutoSyncCandidateFilter(opts) {
     $and: [
       base,
       { orderStatus: { $in: [...ACTIVE_FORWARD_SYNC_STATUSES] } },
+      // Never bulk-poll Shipmozo orders (on-demand track only)
+      {
+        $and: [
+          {
+            $or: [
+              { shippingProvider: { $exists: false } },
+              { shippingProvider: null },
+              { shippingProvider: 'shiprocket' }
+            ]
+          },
+          {
+            $or: [
+              { 'shipmentInfo.shipmozoOrderId': { $exists: false } },
+              { 'shipmentInfo.shipmozoOrderId': null },
+              { 'shipmentInfo.shipmozoOrderId': '' }
+            ]
+          }
+        ]
+      },
       {
         $or: [
           { 'shipmentInfo.shiprocketOrderId': { $exists: true, $nin: [null, ''] } },
@@ -111,6 +131,18 @@ async function runAutoSyncSingle(orderId) {
       skipped: true,
       code: 'ORDER_NOT_FOUND',
       message: 'Order not found',
+    };
+  }
+
+  // Production guard: never Shiprocket-reconcile Shipmozo orders (even if AWB exists)
+  if (isShipmozoOrder(order)) {
+    return {
+      orderId: id,
+      success: false,
+      updated: false,
+      skipped: true,
+      code: 'SHIPMOZO_ON_DEMAND_ONLY',
+      message: 'Shipmozo orders are excluded from forward list auto-sync',
     };
   }
 

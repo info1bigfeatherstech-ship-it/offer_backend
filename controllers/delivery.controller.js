@@ -1,6 +1,9 @@
 // controllers/delivery.controller.js
 const mongoose = require('mongoose');
-const ShiprocketService = require('../utils/shiprocket');
+const {
+  checkDeliveryAvailabilityForActiveProvider,
+  getDeliveryChargesForActiveProvider
+} = require('../services/shippingQuote.service');
 const Cart = require('../models/cart');
 const Product = require('../models/Product');
 const { aggregateShipping } = require('../services/checkoutComputation.service');
@@ -107,7 +110,7 @@ exports.checkDeliveryAvailability = async (req, res) => {
       }
     }
 
-    const result = await ShiprocketService.checkDeliveryAvailability(pincode, {
+    const result = await checkDeliveryAvailabilityForActiveProvider(pincode, {
       weightKg: totalWeight,
       lengthCm: dims.lengthCm,
       widthCm: dims.widthCm,
@@ -120,7 +123,8 @@ exports.checkDeliveryAvailability = async (req, res) => {
       estimatedDays: result.estimatedDays,
       courierName: result.courierName,
       message: result.message,
-      pincode: pincode
+      pincode: pincode,
+      shippingProvider: result.shippingProvider || result.provider || null
     });
   } catch (error) {
     logger.error('Delivery check error:', { message: error.message, stack: error.stack });
@@ -144,14 +148,15 @@ exports.getDeliveryCharges = async (req, res) => {
       });
     }
 
-    const result = await ShiprocketService.getDeliveryCharges(pincode, parseFloat(weight));
+    const result = await getDeliveryChargesForActiveProvider(pincode, parseFloat(weight));
 
     return res.status(200).json({
       success: true,
       isServiceable: result.isDeliverable,
       deliveryCharges: result.deliveryCharges,
       estimatedDays: result.estimatedDays,
-      courierName: result.courierName
+      courierName: result.courierName,
+      shippingProvider: result.shippingProvider || result.provider || null
     });
   } catch (error) {
     logger.error('Get delivery charges error:', { message: error.message, stack: error.stack });

@@ -21,6 +21,9 @@ const checkoutQuoteSchema = new mongoose.Schema(
       estimatedDays: { type: String, default: null },
       courierName: { type: String, default: null },
       courierCompanyId: { type: Number, default: null },
+      shipmozoCourierId: { type: Number, default: null },
+      shippingProvider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
+      pickupsAutomaticallyScheduled: { type: Boolean, default: null },
       codAvailable: { type: Boolean, default: true },
       message: { type: String, default: null },
       mock: { type: Boolean, default: false }

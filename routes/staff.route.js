@@ -1,8 +1,11 @@
 /**
  * Staff Management Routes
  * All routes are protected with Admin authentication
- * 
- * @version 2.0.0
+ *
+ * IMPORTANT: Static paths (`/profile/me`, `/`) must be registered BEFORE `/:id`
+ * so Express does not treat "profile" as a staff id.
+ *
+ * @version 2.1.0
  * @author OfferWaleBaba Team
  */
 
@@ -20,6 +23,77 @@ const staffController = require('../controllers/staff.controller');
 router.use(verifyToken);
 router.use(authorizeRoles('admin'));
 router.use(requireStrictAdminStorefrontScope);
+
+// =============================================
+// ADMIN'S OWN PROFILE (before /:id)
+// =============================================
+
+/**
+ * @route   GET /api/admin/staff/profile/me
+ * @desc    Get admin's own profile (view only)
+ * @access  Admin only
+ */
+router.get('/profile/me', staffController.getAdminProfile);
+
+/**
+ * @route   PUT /api/admin/staff/profile/me
+ * @desc    Update admin's own profile (name, phone only)
+ * @access  Admin only
+ * @body    name, phone (both optional)
+ */
+router.put(
+  '/profile/me',
+  [
+    body('name').optional().trim(),
+    body('phone')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Phone number must be 10 digits')
+  ],
+  staffController.updateOwnProfile
+);
+
+/**
+ * @route   POST /api/admin/staff/profile/me/initiate-password-reset
+ * @desc    Send OTP to logged-in admin email (self password reset)
+ * @access  Admin only — storefront scoped via x-storefront
+ */
+router.post(
+  '/profile/me/initiate-password-reset',
+  staffController.initiateSelfPasswordReset
+);
+
+/**
+ * @route   POST /api/admin/staff/profile/me/verify-password-reset
+ * @desc    Verify OTP and set new admin password
+ * @access  Admin only — storefront scoped via x-storefront
+ * @body    otp, newPassword, confirmPassword?
+ */
+router.post(
+  '/profile/me/verify-password-reset',
+  [
+    body('otp')
+      .notEmpty()
+      .withMessage('OTP is required')
+      .matches(/^\d{6}$/)
+      .withMessage('OTP must be a 6-digit number'),
+    body('newPassword')
+      .notEmpty()
+      .withMessage('New password is required')
+      .isLength({ min: 6 })
+      .withMessage('Password must be at least 6 characters'),
+    body('confirmPassword')
+      .optional({ values: 'falsy' })
+      .custom((value, { req }) => {
+        if (value != null && String(value) !== String(req.body.newPassword || '')) {
+          throw new Error('New password and confirmation do not match');
+        }
+        return true;
+      })
+  ],
+  staffController.verifySelfPasswordReset
+);
 
 // =============================================
 // STAFF CRUD OPERATIONS
@@ -72,32 +146,6 @@ router.post(
 );
 
 /**
- * @route   GET /api/admin/staff/:id
- * @desc    Get single staff member by ID
- * @access  Admin only
- */
-router.get('/:id', staffController.getStaffById);
-
-/**
- * @route   PUT /api/admin/staff/:id
- * @desc    Update staff member details
- * @access  Admin only
- * @body    name, email, phone, role, status (all optional)
- */
-router.put('/:id', staffController.updateStaff);
-
-/**
- * @route   DELETE /api/admin/staff/:id
- * @desc    Delete staff member
- * @access  Admin only
- */
-router.delete('/:id', staffController.deleteStaff);
-
-// =============================================
-// PASSWORD RESET WITH OTP (New endpoints)
-// =============================================
-
-/**
  * @route   POST /api/admin/staff/:id/initiate-reset
  * @desc    Initiate password reset - sends OTP to admin email
  * @access  Admin only
@@ -127,34 +175,26 @@ router.post(
   staffController.verifyOTPAndResetPassword
 );
 
-// =============================================
-// ADMIN'S OWN PROFILE ENDPOINTS
-// =============================================
-
 /**
- * @route   GET /api/admin/staff/profile/me
- * @desc    Get admin's own profile (view only)
+ * @route   GET /api/admin/staff/:id
+ * @desc    Get single staff member by ID
  * @access  Admin only
  */
-router.get('/profile/me', staffController.getAdminProfile);
+router.get('/:id', staffController.getStaffById);
 
 /**
- * @route   PUT /api/admin/staff/profile/me
- * @desc    Update admin's own profile (name, phone only)
+ * @route   PUT /api/admin/staff/:id
+ * @desc    Update staff member details
  * @access  Admin only
- * @body    name, phone (both optional)
+ * @body    name, email, phone, role, status (all optional)
  */
-router.put(
-  '/profile/me',
-  [
-    body('name').optional().trim(),
-    body('phone')
-      .optional()
-      .trim()
-      .matches(/^[0-9]{10}$/)
-      .withMessage('Phone number must be 10 digits')
-  ],
-  staffController.updateOwnProfile
-);
+router.put('/:id', staffController.updateStaff);
+
+/**
+ * @route   DELETE /api/admin/staff/:id
+ * @desc    Delete staff member
+ * @access  Admin only
+ */
+router.delete('/:id', staffController.deleteStaff);
 
 module.exports = router;
