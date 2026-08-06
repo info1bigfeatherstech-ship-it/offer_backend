@@ -563,13 +563,23 @@ class ShipmozoService {
       .trim();
     const balanceViaCod =
       String(order.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
-    const balanceDue = Math.max(0, Number(order.balanceDueInr) || 0);
+    const totalInr = roundMoney2(Number(order.totalAmount) || 0);
+    const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
+    let balanceDue = roundMoney2(Math.max(0, Number(order.balanceDueInr) || 0));
+    if (!(balanceDue > 0.005) && paidInr > 0.005 && totalInr > 0.005) {
+      balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
+    }
+    const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
+    if (balanceDue > unpaidInr + 0.005) {
+      balanceDue = unpaidInr;
+    }
+    // Pure COD, or online advance with remaining COD due only (never full bill when prepaid covers).
     const useCodAtDoor =
-      payMethod === 'cod' || (balanceViaCod && balanceDue > 0);
+      payMethod === 'cod' || (balanceViaCod && balanceDue > 0.005);
     const codCollect = useCodAtDoor
       ? payMethod === 'cod'
-        ? roundMoney2(Number(order.totalAmount) || 0)
-        : roundMoney2(balanceDue)
+        ? totalInr
+        : balanceDue
       : 0;
 
     return {
@@ -583,7 +593,7 @@ class ShipmozoService {
       useCodAtDoor,
       paymentType: useCodAtDoor ? 'COD' : 'PREPAID',
       codAmount: useCodAtDoor ? String(codCollect) : '',
-      orderAmount: roundMoney2(Number(order.totalAmount) || 0)
+      orderAmount: totalInr
     };
   }
 

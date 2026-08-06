@@ -18,6 +18,7 @@
 const User = require('../models/User');
 const { validationResult } = require('express-validator');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const redisManager = require('../config/redis.config');
 
@@ -34,6 +35,13 @@ const OTP_EXPIRY_SECONDS = 600;
 /** OTP length (6 digits) */
 const OTP_LENGTH = 6;
 
+/** Admin self-reset: max OTP sends per hour (per admin + storefront) */
+const SELF_RESET_OTP_SEND_LIMIT = 5;
+const SELF_RESET_OTP_SEND_WINDOW_SECONDS = 3600;
+
+/** Admin self-reset: max failed OTP verifies before OTP is invalidated */
+const SELF_RESET_OTP_FAIL_LIMIT = 5;
+
 /** Email configuration */
 const EMAIL_FROM = process.env.EMAIL_USER;
 
@@ -41,13 +49,59 @@ const EMAIL_FROM = process.env.EMAIL_USER;
 // EMAIL TRANSPORTER
 // ==============================
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
+/**
+ * Same pattern as email-otp.provider / auth.controller:
+ * await nodemailer sendMail until SMTP accepts or truly fails.
+ * Do NOT Promise.race a short timer — Gmail often delivers after 8–15s while
+ * still succeeding; a race would return EMAIL_SEND_TIMEOUT and delete Redis OTP
+ * even though the user already received the code.
+ */
+let cachedTransporter = null;
+
+function getMailTransporter() {
+  if (cachedTransporter) return cachedTransporter;
+
+  const user = process.env.EMAIL_USER;
+  const pass = process.env.EMAIL_PASSWORD;
+  if (!user || !pass) {
+    const err = new Error(
+      'Email transport not configured: set EMAIL_USER and EMAIL_PASSWORD.'
+    );
+    err.code = 'EMAIL_NOT_CONFIGURED';
+    throw err;
   }
-});
+
+  cachedTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass }
+  });
+  return cachedTransporter;
+}
+
+/**
+ * @param {import('nodemailer').SendMailOptions} mailOptions
+ * @returns {Promise<import('nodemailer').SentMessageInfo>}
+ */
+async function sendMail(mailOptions) {
+  const transporter = getMailTransporter();
+  return transporter.sendMail(mailOptions);
+}
+
+/**
+ * Fire-and-forget email (never blocks the HTTP response).
+ * Used only for post-success confirmation mail — not for OTP delivery.
+ * @param {string} label
+ * @param {() => Promise<unknown>} sendFn
+ */
+function enqueueBackgroundEmail(label, sendFn) {
+  setImmediate(() => {
+    Promise.resolve()
+      .then(() => sendFn())
+      .catch((err) => {
+        console.error(`[StaffController] ${label}:`, err?.message || err);
+      });
+  });
+}
 
 // ==============================
 // HELPER FUNCTIONS
@@ -171,7 +225,7 @@ const sendOTPToAdmin = async (adminEmail, adminName, staffName, otp) => {
     `
   };
 
-  await transporter.sendMail(mailOptions);
+  await sendMail(mailOptions);
 };
 
 /**
@@ -216,7 +270,7 @@ const sendResetConfirmation = async (adminEmail, adminName, staffName) => {
       </html>
     `
   };
-  await transporter.sendMail(mailOptions);
+  await sendMail(mailOptions);
 };
 
 /**
@@ -259,6 +313,136 @@ const buildStaffQuery = (search, role, storefront) => {
 };
 
 const storefrontFromScope = (req) => req.adminScope?.storefront || 'ecomm';
+
+/**
+ * Timing-safe digit OTP compare. Normalizes to digits-only strings first.
+ * @param {string} a
+ * @param {string} b
+ */
+const otpsEqual = (a, b) => {
+  const norm = (v) => String(v ?? '').replace(/\D/g, '');
+  const aa = Buffer.from(norm(a), 'utf8');
+  const bb = Buffer.from(norm(b), 'utf8');
+  if (aa.length !== bb.length || aa.length === 0) return false;
+  return crypto.timingSafeEqual(aa, bb);
+};
+
+/**
+ * Normalize Redis GET value to string (handles Buffer / odd client returns).
+ * @param {unknown} value
+ */
+const redisValueToString = (value) => {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (Buffer.isBuffer(value)) return value.toString('utf8');
+  return String(value);
+};
+
+/**
+ * Mask email for API responses (never leak full address unnecessarily).
+ * @param {string|null|undefined} email
+ */
+const maskEmail = (email) => {
+  const s = String(email || '').trim();
+  const at = s.indexOf('@');
+  if (at < 1) return 'your registered email';
+  const local = s.slice(0, at);
+  const domain = s.slice(at + 1);
+  const visible = local.slice(0, Math.min(2, local.length));
+  return `${visible}***@${domain}`;
+};
+
+const selfResetOtpKey = (storefront, adminId) =>
+  `admin_self_reset:${storefront}:${adminId}`;
+const selfResetRateKey = (storefront, adminId) =>
+  `admin_self_reset_rate:${storefront}:${adminId}`;
+const selfResetFailKey = (storefront, adminId) =>
+  `admin_self_reset_fail:${storefront}:${adminId}`;
+
+/**
+ * Send OTP to admin for their own password reset (storefront-scoped flow).
+ */
+const sendSelfPasswordResetOTP = async (adminEmail, adminName, otp, storefront) => {
+  const scopeLabel = storefront === 'wholesale' ? 'Wholesale' : 'E-commerce';
+  const mailOptions = {
+    from: `"OfferWaleBaba Security" <${EMAIL_FROM}>`,
+    to: adminEmail,
+    subject: `Admin Password Reset Verification (${scopeLabel})`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4;">
+        <div style="max-width: 550px; margin: 20px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+          <div style="background-color: #1a1a2e; padding: 25px; text-align: center;">
+            <h2 style="color: #ffffff; margin: 0;">Admin Password Reset</h2>
+          </div>
+          <div style="padding: 30px 25px;">
+            <p style="color: #333; font-size: 16px; margin: 0 0 10px 0;">Dear <strong>${adminName || 'Admin'}</strong>,</p>
+            <p style="color: #555; font-size: 14px; line-height: 1.5; margin: 0 0 20px 0;">
+              You requested to reset your admin password for the <strong>${scopeLabel}</strong> dashboard.
+            </p>
+            <p style="color: #555; font-size: 14px; margin: 0 0 15px 0;">
+              Use this One-Time Password (OTP) to continue:
+            </p>
+            <div style="background-color: #1a1a2e; padding: 20px; text-align: center; border-radius: 10px; margin: 0 0 20px 0;">
+              <span style="font-size: 36px; font-weight: bold; letter-spacing: 8px; color: #ffffff;">${otp}</span>
+            </div>
+            <div style="background-color: #fff3cd; padding: 12px; border-radius: 6px; margin: 0 0 20px 0; border-left: 4px solid #ffc107;">
+              <p style="margin: 0; color: #856404; font-size: 13px;">
+                This OTP expires in ${OTP_EXPIRY_SECONDS / 60} minutes and can be used once.
+              </p>
+            </div>
+            <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;" />
+            <p style="color: #999; font-size: 12px; margin: 0;">
+              If you did not request this, ignore this email. Your password will remain unchanged.
+            </p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `
+  };
+  await sendMail(mailOptions);
+};
+
+/**
+ * Confirmation email after admin self password reset.
+ */
+const sendSelfPasswordResetConfirmation = async (adminEmail, adminName, storefront) => {
+  const scopeLabel = storefront === 'wholesale' ? 'Wholesale' : 'E-commerce';
+  const mailOptions = {
+    from: `"OfferWaleBaba Security" <${EMAIL_FROM}>`,
+    to: adminEmail,
+    subject: `Admin Password Updated (${scopeLabel})`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"></head>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4;">
+        <div style="max-width: 550px; margin: 20px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+          <div style="background-color: #28a745; padding: 25px; text-align: center;">
+            <h2 style="color: #ffffff; margin: 0;">Password Updated</h2>
+          </div>
+          <div style="padding: 30px 25px;">
+            <p style="color: #333; font-size: 16px; margin: 0 0 10px 0;">Dear <strong>${adminName || 'Admin'}</strong>,</p>
+            <p style="color: #555; font-size: 14px; line-height: 1.5; margin: 0 0 20px 0;">
+              Your admin password for the <strong>${scopeLabel}</strong> dashboard was updated successfully.
+            </p>
+            <p style="color: #999; font-size: 12px; margin: 0;">
+              If you did not perform this action, contact support immediately.
+            </p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `
+  };
+  await sendMail(mailOptions);
+};
 
 // ==============================
 // CONTROLLER FUNCTIONS
@@ -716,9 +900,14 @@ const verifyOTPAndResetPassword = async (req, res) => {
     staff.password = newPassword;
     await staff.save();
 
-    // Send confirmation email to admin
-    if (admin) {
-      await sendResetConfirmation(admin.email, admin.name, staff.name);
+    // Send confirmation email to admin (non-blocking — never delay success response)
+    if (admin?.email) {
+      const to = admin.email;
+      const name = admin.name;
+      const staffName = staff.name;
+      enqueueBackgroundEmail('staff reset confirmation email failed', () =>
+        sendResetConfirmation(to, name, staffName)
+      );
     }
 
     return res.status(200).json({
@@ -828,6 +1017,344 @@ const getAdminProfile = async (req, res) => {
 };
 
 /**
+ * @route   POST /api/admin/staff/profile/me/initiate-password-reset
+ * @desc    Send OTP to logged-in admin email for self password reset (storefront-scoped)
+ * @access  Admin only
+ */
+const initiateSelfPasswordReset = async (req, res) => {
+  try {
+    const adminId = String(req.userId || '').trim();
+    const storefront = storefrontFromScope(req);
+
+    if (!adminId) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required'
+      });
+    }
+
+    if (!redisManager.isReady()) {
+      return res.status(503).json({
+        success: false,
+        code: 'REDIS_UNAVAILABLE',
+        message: 'Service temporarily unavailable. Please try again later.'
+      });
+    }
+
+    const client = redisManager.getClient();
+    const rateKey = selfResetRateKey(storefront, adminId);
+    let sendCount = 0;
+    try {
+      sendCount = await client.incr(rateKey);
+      if (sendCount === 1) {
+        await client.expire(rateKey, SELF_RESET_OTP_SEND_WINDOW_SECONDS);
+      }
+    } catch (rateErr) {
+      console.error('[StaffController] self-reset rate limit error:', rateErr?.message || rateErr);
+      return res.status(503).json({
+        success: false,
+        code: 'REDIS_UNAVAILABLE',
+        message: 'Service temporarily unavailable. Please try again later.'
+      });
+    }
+
+    if (sendCount > SELF_RESET_OTP_SEND_LIMIT) {
+      return res.status(429).json({
+        success: false,
+        code: 'SELF_RESET_RATE_LIMITED',
+        message: 'Too many password reset requests. Please try again after some time.'
+      });
+    }
+
+    const admin = await User.findById(adminId).select('name email role status');
+    if (!admin) {
+      return res.status(404).json({
+        success: false,
+        code: 'ADMIN_NOT_FOUND',
+        message: 'Admin not found'
+      });
+    }
+
+    if (String(admin.role || '').toLowerCase() !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Only admin accounts can reset password from profile.'
+      });
+    }
+
+    if (String(admin.status || '').toLowerCase() === 'inactive') {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_INACTIVE',
+        message: 'Inactive accounts cannot reset password.'
+      });
+    }
+
+    const email = String(admin.email || '').trim();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({
+        success: false,
+        code: 'ADMIN_EMAIL_MISSING',
+        message: 'No valid email on your admin account. Contact support.'
+      });
+    }
+
+    const otp = generateOTP();
+    try {
+      await client.setEx(selfResetOtpKey(storefront, adminId), OTP_EXPIRY_SECONDS, otp);
+      await client.del(selfResetFailKey(storefront, adminId));
+    } catch (storeErr) {
+      console.error('[StaffController] self-reset OTP store error:', storeErr?.message || storeErr);
+      return res.status(503).json({
+        success: false,
+        code: 'REDIS_UNAVAILABLE',
+        message: 'Service temporarily unavailable. Please try again later.'
+      });
+    }
+
+    try {
+      await sendSelfPasswordResetOTP(email, admin.name, otp, storefront);
+    } catch (mailErr) {
+      console.error('[StaffController] self-reset email failed:', mailErr?.message || mailErr);
+      try {
+        await client.del(selfResetOtpKey(storefront, adminId));
+      } catch (_) {
+        /* ignore */
+      }
+      const notConfigured = mailErr?.code === 'EMAIL_NOT_CONFIGURED';
+      return res.status(502).json({
+        success: false,
+        code: notConfigured ? 'EMAIL_NOT_CONFIGURED' : 'EMAIL_SEND_FAILED',
+        message: notConfigured
+          ? 'Email is not configured on the server. Contact support.'
+          : 'Could not send OTP email. Please try again later.'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `OTP sent to ${maskEmail(email)}. Valid for ${OTP_EXPIRY_SECONDS / 60} minutes.`,
+      data: {
+        expiresInSeconds: OTP_EXPIRY_SECONDS,
+        maskedEmail: maskEmail(email),
+        storefront
+      }
+    });
+  } catch (error) {
+    console.error('[StaffController] initiateSelfPasswordReset Error:', error);
+    return res.status(500).json({
+      success: false,
+      code: 'SELF_RESET_INIT_FAILED',
+      message: 'Failed to initiate password reset',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * @route   POST /api/admin/staff/profile/me/verify-password-reset
+ * @desc    Verify OTP and set new password for logged-in admin (storefront-scoped)
+ * @access  Admin only
+ * @body    otp, newPassword, confirmPassword?
+ */
+const verifySelfPasswordReset = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        code: 'VALIDATION_ERROR',
+        message: errors.array()[0]?.msg || 'Invalid input',
+        errors: errors.array()
+      });
+    }
+
+    const adminId = String(req.userId || '').trim();
+    const storefront = storefrontFromScope(req);
+    const otp = String(req.body.otp || '').replace(/\D/g, '').slice(0, 6);
+    const newPassword = String(req.body.newPassword || '');
+    const confirmPassword =
+      req.body.confirmPassword != null ? String(req.body.confirmPassword) : null;
+
+    if (!adminId) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required'
+      });
+    }
+
+    if (!otp || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        code: 'PAYLOAD_INVALID',
+        message: 'OTP and new password are required'
+      });
+    }
+
+    if (!/^\d{6}$/.test(otp)) {
+      return res.status(400).json({
+        success: false,
+        code: 'OTP_FORMAT_INVALID',
+        message: 'OTP must be a 6-digit number'
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        code: 'PASSWORD_TOO_SHORT',
+        message: 'Password must be at least 6 characters'
+      });
+    }
+
+    if (confirmPassword != null && confirmPassword !== newPassword) {
+      return res.status(400).json({
+        success: false,
+        code: 'PASSWORD_MISMATCH',
+        message: 'New password and confirmation do not match'
+      });
+    }
+
+    if (!redisManager.isReady()) {
+      return res.status(503).json({
+        success: false,
+        code: 'REDIS_UNAVAILABLE',
+        message: 'Service temporarily unavailable. Please try again later.'
+      });
+    }
+
+    // Load admin BEFORE consuming OTP so validation failures keep the OTP usable.
+    const admin = await User.findById(adminId).select('+password name email role status');
+    if (!admin) {
+      return res.status(404).json({
+        success: false,
+        code: 'ADMIN_NOT_FOUND',
+        message: 'Admin not found'
+      });
+    }
+
+    if (String(admin.role || '').toLowerCase() !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Only admin accounts can reset password from profile.'
+      });
+    }
+
+    try {
+      if (admin.password && (await admin.comparePassword(newPassword))) {
+        return res.status(400).json({
+          success: false,
+          code: 'PASSWORD_UNCHANGED',
+          message: 'New password must be different from your current password. OTP is still valid — enter a different password.'
+        });
+      }
+    } catch (_) {
+      /* no prior password / compare edge — allow set */
+    }
+
+    const client = redisManager.getClient();
+    const otpKey = selfResetOtpKey(storefront, adminId);
+    const failKey = selfResetFailKey(storefront, adminId);
+
+    let storedOTP = null;
+    try {
+      storedOTP = redisValueToString(await client.get(otpKey));
+    } catch (redisErr) {
+      console.error('[StaffController] self-reset OTP read error:', redisErr?.message || redisErr);
+      return res.status(503).json({
+        success: false,
+        code: 'REDIS_UNAVAILABLE',
+        message: 'Service temporarily unavailable. Please try again later.'
+      });
+    }
+
+    if (!storedOTP) {
+      return res.status(400).json({
+        success: false,
+        code: 'OTP_EXPIRED',
+        message: 'OTP expired or was already used. Please request a new OTP.'
+      });
+    }
+
+    if (!otpsEqual(storedOTP, otp)) {
+      let failCount = 0;
+      try {
+        failCount = await client.incr(failKey);
+        if (failCount === 1) {
+          await client.expire(failKey, OTP_EXPIRY_SECONDS);
+        }
+        if (failCount >= SELF_RESET_OTP_FAIL_LIMIT) {
+          await client.del(otpKey);
+          await client.del(failKey);
+          return res.status(400).json({
+            success: false,
+            code: 'OTP_LOCKED',
+            message: 'Too many invalid OTP attempts. Please request a new OTP.'
+          });
+        }
+      } catch (_) {
+        /* non-blocking fail counter */
+      }
+
+      return res.status(400).json({
+        success: false,
+        code: 'OTP_INVALID',
+        message: 'Incorrect OTP. Please check the latest email and try again.'
+      });
+    }
+
+    // Persist password first — only then consume OTP (avoids burning OTP on save failure).
+    admin.password = newPassword;
+    try {
+      await admin.save();
+    } catch (saveErr) {
+      console.error('[StaffController] self-reset save error:', saveErr?.message || saveErr);
+      return res.status(500).json({
+        success: false,
+        code: 'PASSWORD_SAVE_FAILED',
+        message: 'Failed to update password. Your OTP is still valid — try again.'
+      });
+    }
+
+    try {
+      await client.del(otpKey);
+      await client.del(failKey);
+    } catch (delErr) {
+      console.error('[StaffController] self-reset OTP cleanup error:', delErr?.message || delErr);
+      /* password already saved — do not fail the request */
+    }
+
+    // Confirmation email must NEVER block the success response (SMTP hang → client timeout).
+    if (admin.email) {
+      const to = String(admin.email);
+      const name = admin.name;
+      const sf = storefront;
+      enqueueBackgroundEmail('self-reset confirmation email failed', () =>
+        sendSelfPasswordResetConfirmation(to, name, sf)
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password updated successfully. Use your new password next time you sign in.',
+      data: { storefront }
+    });
+  } catch (error) {
+    console.error('[StaffController] verifySelfPasswordReset Error:', error);
+    return res.status(500).json({
+      success: false,
+      code: 'SELF_RESET_VERIFY_FAILED',
+      message: 'Failed to reset password',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
  * @route   PUT /api/admin/staff/profile/me
  * @desc    Update admin's own profile (name, phone only)
  * @access  Admin only
@@ -888,9 +1415,13 @@ module.exports = {
   updateStaff,
   deleteStaff,
   
-  // Password reset
+  // Password reset (staff)
   initiatePasswordReset,
   verifyOTPAndResetPassword,
+
+  // Admin self password reset (profile)
+  initiateSelfPasswordReset,
+  verifySelfPasswordReset,
   
   // Profile management
   getAdminProfile,

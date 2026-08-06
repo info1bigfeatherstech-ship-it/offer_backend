@@ -497,19 +497,36 @@ class ShiprocketService {
     const payMethod = String(order.paymentInfo?.method || '').toLowerCase();
     const balanceViaCod = String(order.paymentInfo?.balanceCollectionMethod || 'online').toLowerCase() === 'cod';
     const splitAdv = String(order.paymentInfo?.splitMode || 'full').toLowerCase() === 'advance';
-    const useCodAtDoor =
-      payMethod === 'cod' || (payMethod === 'online' && balanceViaCod && splitAdv);
-    let codCollect = 0;
-    if (useCodAtDoor && payMethod === 'online' && balanceViaCod) {
-      codCollect = roundMoney2(order.balanceDueInr);
-      if (!(codCollect > 0)) {
-        const totalInr = roundMoney2(Number(order.totalAmount) || 0);
-        const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
-        codCollect = roundMoney2(Math.max(0, totalInr - paidInr));
-      }
+    const totalInr = roundMoney2(Number(order.totalAmount) || 0);
+    const paidInr = roundMoney2(Number(order.amountPaidInr) || 0);
+    let balanceDue = roundMoney2(Number(order.balanceDueInr) || 0);
+    // Recompute unpaid when balanceDue missing/stale after OOS edits.
+    if (!(balanceDue > 0.005) && paidInr > 0.005 && totalInr > 0.005) {
+      balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
     }
-    const codAmountForQuote =
-      useCodAtDoor && payMethod === 'cod' ? roundMoney2(Number(order.totalAmount) || 0) : useCodAtDoor ? codCollect : 0;
+    const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
+    if (balanceDue > unpaidInr + 0.005) {
+      balanceDue = unpaidInr;
+    }
+
+    let useCodAtDoor = false;
+    let codCollect = 0;
+    if (payMethod === 'cod') {
+      // Pure COD — collect full order value at door.
+      useCodAtDoor = true;
+      codCollect = totalInr;
+    } else if (payMethod === 'online' && balanceViaCod && splitAdv) {
+      // Partial prepaid + COD balance: only COD when something remains after prepaid.
+      // When prepaid covers (or exceeds) amended total → Prepaid (never full bill as COD).
+      codCollect = roundMoney2(Math.max(0, balanceDue));
+      useCodAtDoor = codCollect > 0.005;
+    }
+
+    const codAmountForQuote = useCodAtDoor
+      ? payMethod === 'cod'
+        ? totalInr
+        : codCollect
+      : 0;
 
     return {
       orderItems,
@@ -523,7 +540,10 @@ class ShiprocketService {
       balanceViaCod,
       splitAdv,
       codCollect,
-      codAmountForQuote
+      codAmountForQuote,
+      unpaidInr,
+      paidInr,
+      totalInr
     };
   }
 
@@ -532,17 +552,46 @@ class ShiprocketService {
    * @returns {{ totalInr: number, paidInr: number, balanceDue: number, codCollect: number }}
    */
   static resolvePartialCodCollect(parts, order) {
-    const totalInr = roundMoney2(Number(order?.totalAmount) || 0);
-    const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
+    const totalInr = roundMoney2(Number(order?.totalAmount) || Number(parts?.totalInr) || 0);
+    const paidInr = roundMoney2(Number(order?.amountPaidInr) || Number(parts?.paidInr) || 0);
     let balanceDue = roundMoney2(Number(order?.balanceDueInr) || 0);
-    if (!(balanceDue > 0) && paidInr > 0 && totalInr > 0) {
+    if (!(balanceDue > 0.005) && paidInr > 0.005 && totalInr > 0.005) {
       balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
     }
+    const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
+    if (balanceDue > unpaidInr + 0.005) {
+      balanceDue = unpaidInr;
+    }
     let codCollect = roundMoney2(Number(parts?.codCollect) || 0);
-    if (!(codCollect > 0) && balanceDue > 0) {
+    if (!(codCollect > 0.005) && balanceDue > 0.005) {
       codCollect = balanceDue;
     }
-    return { totalInr, paidInr, balanceDue, codCollect };
+    if (codCollect > unpaidInr + 0.005) {
+      codCollect = unpaidInr;
+    }
+    return { totalInr, paidInr, balanceDue, codCollect, unpaidInr };
+  }
+
+  /**
+   * Online advance already covers (amended) total — must ship as Prepaid, never COD of full bill.
+   */
+  static isAdvanceFullyCoveredNoCod(parts, order) {
+    try {
+      const payMethod = String(parts?.payMethod || order?.paymentInfo?.method || '').toLowerCase();
+      if (payMethod !== 'online') return false;
+
+      const balanceViaCod =
+        parts?.balanceViaCod === true ||
+        String(order?.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
+      if (!balanceViaCod) return false;
+
+      const { totalInr, paidInr, codCollect } = ShiprocketService.resolvePartialCodCollect(parts, order);
+      if (!(paidInr > 0.005)) return false;
+      if (paidInr + 0.005 >= totalInr) return true;
+      return !(codCollect > 0.005);
+    } catch (_) {
+      return false;
+    }
   }
 
   /**
@@ -552,10 +601,12 @@ class ShiprocketService {
     const payMethod = String(parts?.payMethod || order?.paymentInfo?.method || '').toLowerCase();
     if (payMethod !== 'online') return false;
 
-    const { totalInr, paidInr, codCollect } = ShiprocketService.resolvePartialCodCollect(parts, order);
-    if (!(codCollect > 0) || codCollect >= totalInr - 0.005) return false;
+    if (ShiprocketService.isAdvanceFullyCoveredNoCod(parts, order)) return false;
 
-    if (!(paidInr > 0)) return false;
+    const { totalInr, paidInr, codCollect } = ShiprocketService.resolvePartialCodCollect(parts, order);
+    if (!(codCollect > 0.005) || codCollect >= totalInr - 0.005) return false;
+
+    if (!(paidInr > 0.005)) return false;
 
     const balanceViaCod =
       parts?.balanceViaCod === true ||
@@ -593,6 +644,7 @@ class ShiprocketService {
 
   /**
    * Finalize adhoc create payload — full COD/prepaid unchanged; partial prepaid+COD uses balance only.
+   * When prepaid covers amended total → Prepaid (never send full bill as COD).
    */
   static finalizeAdhocCreatePayload(basePayload, order, parts, orderItems) {
     const payload = { ...basePayload };
@@ -606,22 +658,45 @@ class ShiprocketService {
       hsn: it.hsn
     }));
 
-    if (ShiprocketService.isPartialCodBalanceShipment(parts, order)) {
-      const { codCollect, paidInr } = ShiprocketService.resolvePartialCodCollect(parts, order);
-      const scaledItems = ShiprocketService.scaleOrderItemsForCodCollect(
-        mappedItems,
-        codCollect,
-        order.totalAmount
-      );
-      payload.payment_method = 'COD';
-      payload.order_items = scaledItems;
-      payload.sub_total = codCollect;
-      payload.shipping_charges = 0;
-      payload.total = codCollect;
-      payload.cod_amount = codCollect;
-      payload.total_discount = 0;
-      payload.comment = `Partial prepaid ₹${paidInr}; collect COD ₹${codCollect}`;
-      return payload;
+    try {
+      if (ShiprocketService.isAdvanceFullyCoveredNoCod(parts, order)) {
+        const { paidInr, totalInr } = ShiprocketService.resolvePartialCodCollect(parts, order);
+        payload.payment_method = 'Prepaid';
+        payload.order_items = mappedItems;
+        if (Object.prototype.hasOwnProperty.call(payload, 'cod_amount')) {
+          delete payload.cod_amount;
+        }
+        payload.comment = `Prepaid ₹${paidInr} covers order ₹${totalInr}; no COD`;
+        return payload;
+      }
+
+      if (ShiprocketService.isPartialCodBalanceShipment(parts, order)) {
+        const { codCollect, paidInr } = ShiprocketService.resolvePartialCodCollect(parts, order);
+        const scaledItems = ShiprocketService.scaleOrderItemsForCodCollect(
+          mappedItems,
+          codCollect,
+          order.totalAmount
+        );
+        payload.payment_method = 'COD';
+        payload.order_items = scaledItems;
+        payload.sub_total = codCollect;
+        payload.shipping_charges = 0;
+        payload.total = codCollect;
+        payload.cod_amount = codCollect;
+        payload.total_discount = 0;
+        payload.comment = `Partial prepaid ₹${paidInr}; collect COD ₹${codCollect}`;
+        return payload;
+      }
+    } catch (err) {
+      // Fall through to default mapping — never block shipment create on finalize helpers.
+      try {
+        logger.warn('[Shiprocket] finalizeAdhocCreatePayload payment branch failed', {
+          orderId: order?.orderId,
+          message: err?.message || String(err)
+        });
+      } catch (_) {
+        /* ignore logger issues */
+      }
     }
 
     payload.order_items = mappedItems;
@@ -682,6 +757,7 @@ class ShiprocketService {
 
     const payload = ShiprocketService.finalizeAdhocCreatePayload(basePayload, order, parts, orderItems);
     const isPartial = ShiprocketService.isPartialCodBalanceShipment(parts, order);
+    const isAdvanceCovered = ShiprocketService.isAdvanceFullyCoveredNoCod(parts, order);
     const lineSum = roundMoney2(
       (payload.order_items || []).reduce(
         (s, it) => s + (Number(it.selling_price) || 0) * Math.max(1, Number(it.units) || 1),
@@ -690,6 +766,7 @@ class ShiprocketService {
     );
     const adhocPayloadDebug = {
       isPartial,
+      isAdvanceCovered,
       useCodAtDoor,
       payMethod,
       balanceViaCod,

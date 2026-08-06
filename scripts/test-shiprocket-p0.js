@@ -555,11 +555,91 @@ function testFullCodAdhocPayloadUnchanged() {
   assert.strictEqual(payload.order_items[0].selling_price, 450);
 }
 
+/** OOS edit: prepaid covers amended total — must NOT send full bill as COD. */
+function testAdvanceCoveredAfterOosEditBecomesPrepaid() {
+  const Cls = ShiprocketService;
+  const order = {
+    orderId: 'OWB-ECOMM-OOS-COVERED',
+    totalAmount: 196.66,
+    amountPaidInr: 212.8,
+    balanceDueInr: 0,
+    subtotal: 29,
+    deliveryCharges: 167.66,
+    paymentInfo: {
+      method: 'online',
+      splitMode: 'advance',
+      balanceCollectionMethod: 'cod',
+      advancePercent: 60
+    }
+  };
+  const parts = {
+    // Stale / buggy parts that previously caused Shiprocket COD of full total
+    useCodAtDoor: true,
+    payMethod: 'online',
+    balanceViaCod: true,
+    splitAdv: true,
+    codCollect: 0
+  };
+  const orderItems = [
+    { name: 'Speaker', sku: 'SKU-0014-1', units: 1, selling_price: 29, discount: 0, tax: '', hsn: '' }
+  ];
+  assert.strictEqual(Cls.isAdvanceFullyCoveredNoCod(parts, order), true);
+  assert.strictEqual(Cls.isPartialCodBalanceShipment(parts, order), false);
+  const payload = Cls.finalizeAdhocCreatePayload(
+    { payment_method: 'COD', sub_total: 29, shipping_charges: 167.66 },
+    order,
+    parts,
+    orderItems
+  );
+  assert.strictEqual(payload.payment_method, 'Prepaid');
+  assert.strictEqual(payload.cod_amount, undefined);
+  assert.strictEqual(payload.order_items[0].selling_price, 29);
+}
+
+/** OOS edit: prepaid partial — COD due shrinks, never increases. */
+function testPartialCodShrinksAfterOosEdit() {
+  const Cls = ShiprocketService;
+  const order = {
+    orderId: 'OWB-ECOMM-OOS-SHRINK',
+    totalAmount: 250,
+    amountPaidInr: 100,
+    balanceDueInr: 150,
+    paymentInfo: {
+      method: 'online',
+      splitMode: 'advance',
+      balanceCollectionMethod: 'cod',
+      advancePercent: 33
+    }
+  };
+  const parts = {
+    useCodAtDoor: true,
+    payMethod: 'online',
+    balanceViaCod: true,
+    splitAdv: true,
+    codCollect: 150
+  };
+  const orderItems = [
+    { name: 'Item', sku: 'S1', units: 1, selling_price: 250, discount: 0, tax: '', hsn: '' }
+  ];
+  assert.strictEqual(Cls.isPartialCodBalanceShipment(parts, order), true);
+  const payload = Cls.finalizeAdhocCreatePayload(
+    { payment_method: 'COD', sub_total: 250, shipping_charges: 0 },
+    order,
+    parts,
+    orderItems
+  );
+  assert.strictEqual(payload.payment_method, 'COD');
+  assert.strictEqual(payload.cod_amount, 150);
+  assert.strictEqual(payload.total, 150);
+}
+
 function run() {
   testPartialCodAdhocPayload();
   testPartialCodFinalizeResolvesWhenPartsCodCollectZero();
   testFullPrepaidAdhocPayloadUnchanged();
   testFullCodAdhocPayloadUnchanged();
+  testAdvanceCoveredAfterOosEditBecomesPrepaid();
+  testPartialCodShrinksAfterOosEdit();
   testNormalizeYmdDate();
   testCourierPickupDateGuards();
   testOrdersShowShipmentObjectShape();
