@@ -32,6 +32,34 @@ function parseShipmozoResult(data) {
   };
 }
 
+/**
+ * Shipmozo may return serviceable as boolean, "true"/"false", or 1/0.
+ * Only treat explicit positives as serviceable.
+ */
+function isShipmozoServiceableFlag(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0 || value == null) return false;
+  const s = String(value).trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 'yes';
+}
+
+function emptyShipmozoQuote(message, extra = {}) {
+  return {
+    isDeliverable: false,
+    deliveryCharges: 0,
+    freightInr: 0,
+    codFeeInr: 0,
+    estimatedDays: null,
+    courierName: null,
+    courierCompanyId: null,
+    shipmozoCourierId: null,
+    message,
+    provider: 'shipmozo',
+    mock: false,
+    ...extra
+  };
+}
+
 class ShipmozoService {
   constructor() {
     this.baseURL = String(process.env.SHIPMOZO_BASE_URL || DEFAULT_BASE).replace(/\/+$/, '');
@@ -150,6 +178,7 @@ class ShipmozoService {
       return {
         ok: false,
         serviceable: false,
+        explicitlyNotServiceable: false,
         message: 'Shipmozo pickup pincode is not configured',
         code: 'SHIPMOZO_PICKUP_PIN_MISSING'
       };
@@ -158,6 +187,7 @@ class ShipmozoService {
       return {
         ok: false,
         serviceable: false,
+        explicitlyNotServiceable: false,
         message: 'Valid 6-digit delivery pincode required',
         code: 'INVALID_PINCODE'
       };
@@ -172,10 +202,14 @@ class ShipmozoService {
       }
     });
 
-    const serviceable = Boolean(res.ok && (res.data?.serviceable === true || res.data?.serviceable === 'true'));
+    // API may succeed (result=1) while data.serviceable is false — treat that as a real answer.
+    const flag = res.data?.serviceable;
+    const serviceable = Boolean(res.ok && isShipmozoServiceableFlag(flag));
     return {
       ok: res.ok,
       serviceable,
+      /** Explicit false from Shipmozo vs unknown/error (so callers can soft-fail). */
+      explicitlyNotServiceable: Boolean(res.ok && flag != null && !isShipmozoServiceableFlag(flag)),
       message: res.message,
       code: res.code,
       pickupPincode: pickup,
@@ -354,7 +388,10 @@ class ShipmozoService {
 
   /**
    * Checkout-compatible quote (same shape as ShiprocketService.checkDeliveryAvailability).
-   * Always requires pincode-serviceability === true before returning a rate.
+   *
+   * Source of truth: rate-calculator (bookable couriers + charges).
+   * pincode-serviceability is advisory only — Shipmozo often returns
+   * result=1 with serviceable=false even when rate-calculator returns couriers.
    */
   async checkDeliveryAvailability(deliveryPincode, opts = {}) {
     const pincode = String(deliveryPincode || '')
@@ -368,46 +405,43 @@ class ShipmozoService {
     const orderAmount = Math.max(0, Number(opts.orderAmount) || codAmount || 0);
 
     if (pincode.length !== 6) {
-      return {
-        isDeliverable: false,
-        deliveryCharges: 0,
-        estimatedDays: null,
-        courierName: null,
-        courierCompanyId: null,
-        message: 'Valid 6-digit pincode required',
-        provider: 'shipmozo'
-      };
+      return emptyShipmozoQuote('Valid 6-digit pincode required', { code: 'INVALID_PINCODE' });
     }
 
-    const configured = await this.isConfigured();
+    let configured = false;
+    try {
+      configured = await this.isConfigured();
+    } catch (cfgErr) {
+      logger.error('[Shipmozo] isConfigured failed during quote', { message: cfgErr.message });
+      return emptyShipmozoQuote('Shipmozo configuration check failed', {
+        code: 'SHIPMOZO_CONFIG_CHECK_FAILED'
+      });
+    }
+
     if (!configured) {
-      return {
-        isDeliverable: false,
-        deliveryCharges: 0,
-        estimatedDays: null,
-        courierName: null,
-        courierCompanyId: null,
-        message: 'Shipmozo is not fully configured (keys, warehouse, pickup pincode)',
-        provider: 'shipmozo',
-        code: 'SHIPMOZO_NOT_CONFIGURED'
-      };
+      return emptyShipmozoQuote(
+        'Shipmozo is not fully configured (keys, warehouse, pickup pincode)',
+        { code: 'SHIPMOZO_NOT_CONFIGURED' }
+      );
+    }
+
+    // Soft probe — never blocks quoting if this endpoint lies / errors.
+    let svcProbe = {
+      ok: false,
+      serviceable: false,
+      explicitlyNotServiceable: false,
+      message: null
+    };
+    try {
+      svcProbe = await this.checkPincodeServiceability(pincode);
+    } catch (svcErr) {
+      logger.warn('[Shipmozo] pincode-serviceability probe failed (continuing with rates)', {
+        pincode,
+        message: svcErr.message
+      });
     }
 
     try {
-      const svc = await this.checkPincodeServiceability(pincode);
-      if (!svc.serviceable) {
-        return {
-          isDeliverable: false,
-          deliveryCharges: 0,
-          estimatedDays: null,
-          courierName: null,
-          courierCompanyId: null,
-          message: svc.message || 'Delivery not serviceable for this pincode (Shipmozo)',
-          provider: 'shipmozo',
-          mock: false
-        };
-      }
-
       const rates = await this.rateCalculator({
         deliveryPincode: pincode,
         paymentType: codAmount > 0 ? 'COD' : 'PREPAID',
@@ -419,36 +453,64 @@ class ShipmozoService {
         heightCm
       });
 
-      if (!rates.ok || !rates.couriers?.length) {
-        return {
-          isDeliverable: false,
-          deliveryCharges: 0,
-          estimatedDays: null,
-          courierName: null,
-          courierCompanyId: null,
-          message: rates.message || 'No Shipmozo courier available for this route',
-          provider: 'shipmozo',
-          mock: false
-        };
+      if (!rates.ok) {
+        const authish = /unauthori[sz]ed|forbidden|credential|api key|private key|public key/i.test(
+          String(rates.message || '')
+        );
+        logger.warn('[Shipmozo] rate-calculator failed during quote', {
+          pincode,
+          message: rates.message,
+          code: rates.code
+        });
+        return emptyShipmozoQuote(
+          rates.message || 'Shipmozo rate calculator failed',
+          {
+            code: authish ? 'SHIPMOZO_AUTH_FAILED' : rates.code || 'SHIPMOZO_RATE_FAILED',
+            pickupPincode: rates.pickupPincode || null,
+            deliveryPincode: pincode
+          }
+        );
       }
 
-      const picked = this.pickCheapestCourier(rates.couriers, { codRequired: codAmount > 0 });
-      if (!picked) {
-        return {
-          isDeliverable: false,
-          deliveryCharges: 0,
-          estimatedDays: null,
-          courierName: null,
-          courierCompanyId: null,
-          message: 'No Shipmozo courier available for this route',
-          provider: 'shipmozo',
-          mock: false
-        };
+      const couriers = Array.isArray(rates.couriers) ? rates.couriers : [];
+      if (!couriers.length) {
+        // No bookable courier — prefer clear not-serviceable wording for customer sanitize.
+        const msg =
+          svcProbe.explicitlyNotServiceable
+            ? 'This pincode is currently not serviceable.'
+            : rates.message || 'No courier available for this route';
+        return emptyShipmozoQuote(msg, {
+          code: 'NOT_SERVICEABLE',
+          pickupPincode: rates.pickupPincode || null,
+          deliveryPincode: pincode
+        });
+      }
+
+      const picked = this.pickCheapestCourier(couriers, { codRequired: codAmount > 0 });
+      if (!picked || !Number.isFinite(picked.totalCharges)) {
+        return emptyShipmozoQuote('No courier available for this route', {
+          code: 'NOT_SERVICEABLE',
+          deliveryPincode: pincode
+        });
+      }
+
+      if (svcProbe.explicitlyNotServiceable) {
+        // Ops signal: serviceability API disagreed with rates (known Shipmozo quirk).
+        logger.info('[Shipmozo] quote OK via rates despite serviceability=false', {
+          pincode,
+          courierId: picked.courierId,
+          courierName: picked.courierName,
+          totalCharges: picked.totalCharges,
+          serviceabilityMessage: svcProbe.message || null
+        });
       }
 
       const charges = Math.max(0, roundMoney2(picked.totalCharges));
       const codFee = Math.max(0, roundMoney2(picked.codFeeInr || 0));
-      const freight = Math.max(0, roundMoney2(charges - (codFee > 0 && charges >= codFee ? codFee : 0)));
+      const freight = Math.max(
+        0,
+        roundMoney2(charges - (codFee > 0 && charges >= codFee ? codFee : 0))
+      );
 
       return {
         isDeliverable: true,
@@ -463,21 +525,27 @@ class ShipmozoService {
         codAvailable: picked.codAvailable !== false,
         message: 'Delivery available',
         provider: 'shipmozo',
+        shippingProvider: 'shipmozo',
         mock: false,
-        couriers: rates.couriers
+        couriers,
+        pickupPincode: rates.pickupPincode || null,
+        deliveryPincode: pincode,
+        serviceabilityAdvisory: {
+          ok: Boolean(svcProbe.ok),
+          serviceable: Boolean(svcProbe.serviceable),
+          explicitlyNotServiceable: Boolean(svcProbe.explicitlyNotServiceable)
+        }
       };
     } catch (err) {
-      logger.error('[Shipmozo] checkDeliveryAvailability failed', { message: err.message });
-      return {
-        isDeliverable: false,
-        deliveryCharges: 0,
-        estimatedDays: null,
-        courierName: null,
-        courierCompanyId: null,
-        message: err.message || 'Shipmozo serviceability failed',
-        provider: 'shipmozo',
-        mock: false
-      };
+      logger.error('[Shipmozo] checkDeliveryAvailability failed', {
+        pincode,
+        message: err.message,
+        stack: err.stack
+      });
+      return emptyShipmozoQuote(err.message || 'Shipmozo quote failed', {
+        code: 'SHIPMOZO_QUOTE_EXCEPTION',
+        deliveryPincode: pincode
+      });
     }
   }
 
