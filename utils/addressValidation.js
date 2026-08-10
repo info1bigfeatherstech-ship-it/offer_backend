@@ -2,19 +2,72 @@
  * Physical delivery-address validation (user + courier APIs).
  * Used by address controller on create / update when payload touches non-meta fields.
  *
- * Shiprocket enforces billing_address + billing_address_2 combined length ≥ 3; we stay well
- * above that so short placeholders ("3", ".") cannot reach the DB when users add/edit
- * addresses through the API.
+ * Shiprocket / Shipmozo compose street as:
+ *   line1 = houseNumber, building, floor, addressLine1
+ *   line2 = addressLine2, area, landmark
+ * Shiprocket rejects when len(line1) + len(line2) > 190.
+ * We enforce the same combined cap at save time (customer + admin) so Ship Now cannot fail later.
  */
 
 const MIN_ADDRESS_LINE1_LEN = 10;
+/** Per stored addressLine field (form fields); courier combined cap is stricter. */
 const MAX_ADDRESS_LINE_LEN = 200;
 /** Courier-documented floor — line1 min length already exceeds this when non-empty line2 allowed. */
 const MIN_COMBINED_STREET_CHARS = 3;
+/** Shiprocket billing_address + billing_address_2 combined character limit. */
+const MAX_COURIER_COMBINED_STREET_CHARS = 190;
 
 function trimStr(value) {
   if (value == null) return '';
   return String(value).trim();
+}
+
+/**
+ * Same composition as Shiprocket create-order / Shipmozo push-order street lines.
+ * City / state / pincode / country are separate API fields and are NOT included.
+ *
+ * @param {object} addr
+ * @returns {{ line1: string, line2: string, combinedLength: number }}
+ */
+function buildCourierStreetLines(addr = {}) {
+  const line1 = [addr.houseNumber, addr.building, addr.floor, addr.addressLine1]
+    .map(trimStr)
+    .filter(Boolean)
+    .join(', ');
+  const line2 = [addr.addressLine2, addr.area, addr.landmark]
+    .map(trimStr)
+    .filter(Boolean)
+    .join(', ');
+  return {
+    line1,
+    line2,
+    combinedLength: line1.length + line2.length
+  };
+}
+
+/**
+ * @param {object} addr
+ * @returns {{ ok: true, line1: string, line2: string, combinedLength: number } | { ok: false, code: string, message: string, combinedLength: number, max: number }}
+ */
+function validateCourierComposedStreet(addr = {}) {
+  const built = buildCourierStreetLines(addr);
+  if (built.combinedLength > MAX_COURIER_COMBINED_STREET_CHARS) {
+    return {
+      ok: false,
+      code: 'COURIER_ADDRESS_TOO_LONG',
+      message: `Delivery address is too long for courier shipping (max ${MAX_COURIER_COMBINED_STREET_CHARS} characters for street lines). Please shorten house, building, floor, landmark, or street details. Current: ${built.combinedLength}/${MAX_COURIER_COMBINED_STREET_CHARS}.`,
+      combinedLength: built.combinedLength,
+      max: MAX_COURIER_COMBINED_STREET_CHARS,
+      line1: built.line1,
+      line2: built.line2
+    };
+  }
+  return {
+    ok: true,
+    line1: built.line1,
+    line2: built.line2,
+    combinedLength: built.combinedLength
+  };
 }
 
 /**
@@ -113,6 +166,9 @@ function validatePhysicalAddressForSave(body) {
   } else if (area.length > 120) {
     errors.push({ field: 'area', code: 'TOO_LONG', message: 'Area / locality is too long.' });
   }
+  if (landmark && landmark.length > 150) {
+    errors.push({ field: 'landmark', code: 'TOO_LONG', message: 'Landmark must be at most 150 characters.' });
+  }
   if (!city) {
     errors.push({ field: 'city', code: 'REQUIRED', message: 'City is required.' });
   }
@@ -128,6 +184,26 @@ function validatePhysicalAddressForSave(body) {
   const street = validateStreetLines(body.addressLine1, body.addressLine2);
   if (!street.ok) {
     errors.push({ field: 'addressLine1', code: street.code, message: street.message });
+  }
+
+  // Courier combined street (Shiprocket / Shipmozo) — only if base street fields parsed OK
+  if (street.ok && !errors.some((e) => e.field === 'houseNumber' || e.field === 'area' || e.field === 'landmark')) {
+    const courier = validateCourierComposedStreet({
+      houseNumber,
+      building,
+      floor,
+      addressLine1: street.line1,
+      addressLine2: street.line2,
+      area,
+      landmark
+    });
+    if (!courier.ok) {
+      errors.push({
+        field: 'addressLine1',
+        code: courier.code,
+        message: courier.message
+      });
+    }
   }
 
   if (errors.length) {
@@ -181,6 +257,9 @@ module.exports = {
   MIN_ADDRESS_LINE1_LEN,
   MAX_ADDRESS_LINE_LEN,
   MIN_COMBINED_STREET_CHARS,
+  MAX_COURIER_COMBINED_STREET_CHARS,
+  buildCourierStreetLines,
+  validateCourierComposedStreet,
   validateStreetLines,
   validatePhysicalAddressForSave,
   shouldRunFullAddressValidation,

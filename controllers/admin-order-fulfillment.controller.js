@@ -9,6 +9,7 @@ const Order = require('../models/Order');
 const ShiprocketService = require('../utils/shiprocket');
 const ShipmozoService = require('../utils/shipmozo');
 const { runShipmozoAssignShip } = require('../services/shipmozoFulfillment.service');
+const { runShiprocketAssignAwb } = require('../services/shiprocketFulfillment.service');
 const {
   SHIPPING_PROVIDERS,
   resolveOrderShippingProvider,
@@ -53,10 +54,7 @@ const {
   mergeOrderScopeFilter
 } = require('../utils/adminOrderScope');
 const {
-  isCourierInactive,
-  pickCheapestActiveCourier,
-  filterActiveCouriers,
-  buildCourierSubstituteNote
+  filterActiveCouriers
 } = require('../services/courierPolicy.service');
 
 function manifestAlreadyGeneratedMessage(message) {
@@ -596,6 +594,182 @@ async function applyPickupScheduleOutcome(order, { sched, requestedPickupDate, t
 }
 
 /**
+ * Detect label file type from data-URL meta, HTTP content-type, or magic bytes.
+ * Shipmozo often returns PNG data URLs; Shiprocket returns PDF.
+ * @param {Buffer} buf
+ * @param {string} [hint] — e.g. data URL mime or axios Content-Type
+ * @returns {{ contentType: string, extension: string }}
+ */
+function resolveLabelFileMeta(buf, hint) {
+  const h = String(hint || '')
+    .trim()
+    .toLowerCase()
+    .split(';')[0]
+    .trim();
+  if (h === 'image/png' || h.includes('image/png')) {
+    return { contentType: 'image/png', extension: 'png' };
+  }
+  if (h === 'image/jpeg' || h === 'image/jpg' || h.includes('image/jpeg') || h.includes('image/jpg')) {
+    return { contentType: 'image/jpeg', extension: 'jpg' };
+  }
+  if (h === 'image/webp' || h.includes('image/webp')) {
+    return { contentType: 'image/webp', extension: 'webp' };
+  }
+  if (h === 'application/pdf' || h.includes('application/pdf')) {
+    return { contentType: 'application/pdf', extension: 'pdf' };
+  }
+
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from([]);
+  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+    return { contentType: 'image/png', extension: 'png' };
+  }
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+    return { contentType: 'image/jpeg', extension: 'jpg' };
+  }
+  if (b.length >= 4 && b.slice(0, 4).toString('ascii') === '%PDF') {
+    return { contentType: 'application/pdf', extension: 'pdf' };
+  }
+  if (b.length >= 12 && b.slice(0, 4).toString('ascii') === 'RIFF' && b.slice(8, 12).toString('ascii') === 'WEBP') {
+    return { contentType: 'image/webp', extension: 'webp' };
+  }
+  // Unknown — caller may fall back for Shipmozo
+  return { contentType: 'application/octet-stream', extension: 'bin' };
+}
+
+/**
+ * Fetch Shipmozo label bytes (data-URL / base64 / http URL). Never calls Shiprocket.
+ * @param {import('mongoose').Document} order
+ * @returns {Promise<{ buffer: Buffer, contentType: string, extension: string }>}
+ */
+async function fetchShipmozoLabelFile(order) {
+  const gate = evaluateOrderPaymentForShiprocketFulfillment(order);
+  if (!gate.ok) {
+    const e = new Error(gate.message || 'Payment rules do not allow this shipment action.');
+    e.code = gate.code || 'PAYMENT_REQUIRED';
+    e.details = gate.details || null;
+    throw e;
+  }
+  const awb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
+  if (!awb) {
+    const e = new Error('Assign AWB before downloading or opening a shipping label.');
+    e.code = 'AWB_REQUIRED';
+    throw e;
+  }
+
+  // Always fetch live from Shipmozo (do not persist/reuse huge base64 labelUrl in Mongo).
+  let labelPayload = '';
+  try {
+    const label = await ShipmozoService.getOrderLabel(awb);
+    if (!label.success || !label.labelUrl) {
+      const e = new Error(label.message || 'Could not get Shipmozo shipping label');
+      e.code = label.code || 'LABEL_FAILED';
+      e.details = label.raw || null;
+      throw e;
+    }
+    labelPayload = String(label.labelUrl).trim();
+  } catch (err) {
+    if (err.code) throw err;
+    logger.error('fetchShipmozoLabelFile', { orderId: order?.orderId, awb, message: err.message });
+    const e = new Error(err.message || 'Could not download Shipmozo label');
+    e.code = 'LABEL_FILE_FAILED';
+    throw e;
+  }
+  if (!labelPayload) {
+    const e = new Error('Could not get Shipmozo shipping label');
+    e.code = 'LABEL_FAILED';
+    throw e;
+  }
+
+  // Drop any previously cached Shipmozo base64 label from DB (keep DB lean).
+  const cached = order.shipmentInfo?.labelUrl ? String(order.shipmentInfo.labelUrl).trim() : '';
+  if (cached && (/^data:/i.test(cached) || cached.length > 500)) {
+    try {
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: {
+          labelUrl: null,
+          provider: SHIPPING_PROVIDERS.SHIPMOZO,
+          fulfillmentLabelAwb: awb,
+          providerStatus: order.shipmentInfo?.providerStatus
+        },
+        trigger: 'admin_shipping_label_clear_shipmozo_cache',
+        allowOrderStatusUpdate: false
+      });
+    } catch (_) {
+      /* non-fatal */
+    }
+  }
+
+  try {
+    if (/^data:/i.test(labelPayload)) {
+      const comma = labelPayload.indexOf(',');
+      if (comma < 0) {
+        const e = new Error('Shipmozo label data URL is invalid');
+        e.code = 'LABEL_FAILED';
+        throw e;
+      }
+      const meta = labelPayload.slice(0, comma);
+      const dataPart = labelPayload.slice(comma + 1);
+      const mimeMatch = /^data:([^;,]+)/i.exec(meta);
+      const mimeHint = mimeMatch ? mimeMatch[1].trim() : '';
+      const buf = /;base64/i.test(meta)
+        ? Buffer.from(dataPart, 'base64')
+        : Buffer.from(decodeURIComponent(dataPart), 'utf8');
+      if (!buf.length) {
+        const e = new Error('Shipmozo label download returned empty body');
+        e.code = 'LABEL_EMPTY_BODY';
+        throw e;
+      }
+      const resolved = resolveLabelFileMeta(buf, mimeHint);
+      return { buffer: buf, contentType: resolved.contentType, extension: resolved.extension };
+    }
+    if (/^https?:\/\//i.test(labelPayload)) {
+      const external = await axios.get(labelPayload, {
+        responseType: 'arraybuffer',
+        timeout: 45000,
+        maxContentLength: 25 * 1024 * 1024,
+        headers: {
+          Accept: 'application/pdf,application/octet-stream,image/*,*/*',
+          'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+        },
+        validateStatus: (s) => s >= 200 && s < 400
+      });
+      const buf = Buffer.from(external.data || []);
+      if (!buf.length) {
+        const e = new Error('Shipmozo label download returned empty body');
+        e.code = 'LABEL_EMPTY_BODY';
+        throw e;
+      }
+      const ctHeader = String(external.headers?.['content-type'] || '');
+      const resolved = resolveLabelFileMeta(buf, ctHeader);
+      return { buffer: buf, contentType: resolved.contentType, extension: resolved.extension };
+    }
+    // Raw base64 (no data: prefix) — sniff magic bytes after decode
+    const buf = Buffer.from(labelPayload.replace(/\s+/g, ''), 'base64');
+    if (!buf.length) {
+      const e = new Error('Shipmozo label payload could not be decoded');
+      e.code = 'LABEL_FAILED';
+      throw e;
+    }
+    const resolved = resolveLabelFileMeta(buf, '');
+    if (resolved.extension === 'bin') {
+      // Most Shipmozo labels are PNG when mime is omitted
+      const asPng = resolveLabelFileMeta(buf, 'image/png');
+      if (buf[0] === 0x89) {
+        return { buffer: buf, contentType: asPng.contentType, extension: asPng.extension };
+      }
+    }
+    return { buffer: buf, contentType: resolved.contentType, extension: resolved.extension };
+  } catch (err) {
+    if (err.code) throw err;
+    logger.error('fetchShipmozoLabelFile', { orderId: order?.orderId, message: err.message });
+    const e = new Error(err.message || 'Could not download Shipmozo label');
+    e.code = 'LABEL_FILE_FAILED';
+    throw e;
+  }
+}
+
+/**
  * Fetch Shiprocket label PDF bytes (same rules as single-label download).
  * @param {import('mongoose').Document} order — populated staff order
  * @returns {Promise<Buffer>}
@@ -788,106 +962,6 @@ async function mapInConcurrentWindows(ids, parallel, handler) {
 }
 
 /**
- * Resolve courier for Ship Now — honors checkout quote unless inactive, then cheapest active fallback.
- * @param {import('mongoose').Document} order
- * @param {number|null|undefined} courierIdOverride
- */
-async function resolveCourierForShipNow(order, courierIdOverride) {
-  if (courierIdOverride != null) {
-    const n = Number(courierIdOverride);
-    if (!Number.isFinite(n)) {
-      return { success: false, code: 'INVALID_COURIER_ID', message: 'courierId must be a number when provided.' };
-    }
-    if (isCourierInactive({ id: n })) {
-      return {
-        success: false,
-        code: 'COURIER_INACTIVE',
-        message: 'Selected courier is inactive in our shipping policy. Pick another active courier.'
-      };
-    }
-    return { success: true, courierId: n, substituted: false };
-  }
-
-  const quotedCourierId =
-    order.shippingSnapshot?.courierCompanyId != null &&
-    Number.isFinite(Number(order.shippingSnapshot.courierCompanyId)) &&
-    Number(order.shippingSnapshot.courierCompanyId) > 0
-      ? Number(order.shippingSnapshot.courierCompanyId)
-      : null;
-  const quotedCourierName = String(order.shippingSnapshot?.courierName || '').trim() || null;
-
-  if (quotedCourierId == null && !ShiprocketService.enabled) {
-    return { success: true, courierId: 1, courierName: quotedCourierName || 'Mock Courier', substituted: false };
-  }
-
-  if (
-    quotedCourierId != null &&
-    !isCourierInactive({ id: quotedCourierId, name: quotedCourierName, courier_name: quotedCourierName })
-  ) {
-    return {
-      success: true,
-      courierId: quotedCourierId,
-      courierName: quotedCourierName,
-      substituted: false
-    };
-  }
-
-  const parts = await ShiprocketService.buildAdhocPayloadParts(order);
-  const deliveryPin = String(parts.addr?.postalCode || '').replace(/\D/g, '').slice(0, 6);
-  if (deliveryPin.length !== 6) {
-    return {
-      success: false,
-      code: 'INVALID_DELIVERY_PINCODE',
-      message: 'Order address must include a 6-digit delivery pincode.'
-    };
-  }
-
-  const listRes = await ShiprocketService.listCouriersForRoute(deliveryPin, {
-    weightKg: parts.totalWeight,
-    lengthCm: parts.maxL,
-    widthCm: parts.maxB,
-    heightCm: parts.maxH,
-    codAmount: parts.codAmountForQuote
-  });
-  if (!listRes.success) {
-    return {
-      success: false,
-      code: 'COURIER_LIST_FAILED',
-      message: listRes.message || 'Could not load active couriers for this route.'
-    };
-  }
-
-  const picked = pickCheapestActiveCourier(listRes.couriers || [], {
-    codRequired: parts.useCodAtDoor
-  });
-  if (!picked) {
-    return {
-      success: false,
-      code: 'NO_ACTIVE_COURIER',
-      message:
-        'No active courier available for this route. Inactive couriers are excluded — enable a courier on Shiprocket or adjust shipping policy.'
-    };
-  }
-
-  const note = buildCourierSubstituteNote({
-    quotedId: quotedCourierId,
-    quotedName: quotedCourierName,
-    assignedId: picked.courierCompanyId,
-    assignedName: picked.courierName
-  });
-
-  return {
-    success: true,
-    courierId: picked.courierCompanyId,
-    courierName: picked.courierName,
-    substituted: true,
-    courierAssignNote: note,
-    courierSubstitutedFromId: quotedCourierId,
-    courierSubstitutedFromName: quotedCourierName
-  };
-}
-
-/**
  * @param {import('mongoose').Document} order
  * @param {number|null|undefined} courierIdOverride
  * @param {{ confirmSubstitute?: boolean }} [opts]
@@ -965,74 +1039,73 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
       return { success: false, code: 'AWB_ALREADY_ASSIGNED', message: 'AWB already assigned for this order.' };
     }
 
-    const parts = await ShiprocketService.buildAdhocPayloadParts(working);
-    const deliveryPin = String(parts.addr?.postalCode || '').replace(/\D/g, '').slice(0, 6);
+    const deliveryPin = String(working.addressSnapshot?.postalCode || working.shippingAddress?.postalCode || '')
+      .replace(/\D/g, '')
+      .slice(0, 6);
     if (deliveryPin.length !== 6) {
-      return { success: false, code: 'INVALID_DELIVERY_PINCODE', message: 'Order address must include a 6-digit delivery pincode.' };
+      // Soft pre-check; service also validates via buildAdhocPayloadParts
+      try {
+        const parts = await ShiprocketService.buildAdhocPayloadParts(working);
+        const pin = String(parts.addr?.postalCode || '').replace(/\D/g, '').slice(0, 6);
+        if (pin.length !== 6) {
+          return {
+            success: false,
+            code: 'INVALID_DELIVERY_PINCODE',
+            message: 'Order address must include a 6-digit delivery pincode.'
+          };
+        }
+      } catch (pinErr) {
+        return {
+          success: false,
+          code: 'INVALID_DELIVERY_PINCODE',
+          message: pinErr?.message || 'Order address must include a 6-digit delivery pincode.'
+        };
+      }
     }
 
-    const courierResolve = await resolveCourierForShipNow(working, courierIdOverride);
-    if (!courierResolve.success) {
-      return {
-        success: false,
-        code: courierResolve.code || 'COURIER_RESOLVE_FAILED',
-        message: courierResolve.message || 'Could not resolve courier for Ship Now.'
-      };
-    }
-
-    const courierId = courierResolve.courierId;
-    const quotedCourierName = String(working.shippingSnapshot?.courierName || '').trim() || null;
-
-    const assign = await ShiprocketService.assignAwb({
+    // Production policy: assign quoted first; substitute only after admin confirm. Never mutate customer bill.
+    const assignRes = await runShiprocketAssignAwb(working, {
       shipmentId,
-      courierId
+      courierIdOverride:
+        courierIdOverride != null && Number.isFinite(Number(courierIdOverride))
+          ? Number(courierIdOverride)
+          : null,
+      confirmSubstitute: Boolean(opts.confirmSubstitute)
     });
-    if (!assign.success) {
+
+    if (!assignRes.success) {
       return {
         success: false,
-        code: assign.code || 'ASSIGN_AWB_FAILED',
-        message: assign.message || 'Assign AWB failed',
-        details: assign.details || null
+        code: assignRes.code || 'ASSIGN_AWB_FAILED',
+        message: assignRes.message || 'Assign AWB failed',
+        details: assignRes.details || null,
+        quotedCourier: assignRes.quotedCourier || null,
+        suggestedCourier: assignRes.suggestedCourier || null,
+        availableCouriers: assignRes.availableCouriers || null,
+        quotedFreightInr: assignRes.quotedFreightInr ?? null,
+        customerBillUnchanged: true
       };
     }
 
-    const effectiveAwb =
-      Boolean(assign.mock) ||
-      Boolean(String(assign.awbCode || '').trim()) ||
-      Boolean(String(assign.trackingNumber || '').trim()) ||
-      Number(assign.raw?.awb_assign_status) === 1;
-    if (!effectiveAwb) {
-      const raw = assign.raw || {};
-      const nested = raw.response?.data && typeof raw.response.data === 'object' ? raw.response.data : {};
-      const walletMsg =
-        nested.awb_assign_error ||
-        raw.message ||
-        assign.message ||
-        'Shiprocket did not issue an AWB. Recharge the Shiprocket wallet or try another courier.';
-      return {
-        success: false,
-        code: 'ASSIGN_AWB_NOT_COMPLETED',
-        message: walletMsg,
-        details: raw,
-        shipment: assign
-      };
-    }
+    const assign = assignRes.assign;
+    const courierId = assignRes.courierId;
+    const quotedCourierName = String(working.shippingSnapshot?.courierName || '').trim() || null;
 
     await applyUpsertShipmentInfo({
       order: working,
       shipmentPayload: {
         ...assign,
-        courier: assign.courier || courierResolve.courierName || quotedCourierName,
+        courier: assign.courier || assignRes.courierName || quotedCourierName,
         assignedCourierId: String(courierId),
         shiprocketOrderId: working.shipmentInfo?.shiprocketOrderId || undefined,
         events: [],
         pickupDate: null,
         pickupScheduledAt: null,
-        ...(courierResolve.substituted
+        ...(assignRes.substituted
           ? {
-              courierAssignNote: courierResolve.courierAssignNote,
-              courierSubstitutedFromId: courierResolve.courierSubstitutedFromId,
-              courierSubstitutedFromName: courierResolve.courierSubstitutedFromName
+              courierAssignNote: assignRes.courierAssignNote,
+              courierSubstitutedFromId: assignRes.courierSubstitutedFromId,
+              courierSubstitutedFromName: assignRes.courierSubstitutedFromName
             }
           : {
               courierAssignNote: null,
@@ -1069,6 +1142,7 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
     }
 
     // OOS pending-edit: settle with positive freight (actual preferred, held fallback).
+    // Normal courier substitute does NOT rewrite customer checkout totals.
     let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
     try {
       fresh = fresh || (await Order.findOne({ orderId: working.orderId }));
@@ -1078,7 +1152,7 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
           actualFreightInr: freightRes.ok ? freightRes.freightInr : null,
           mock: Boolean(assign.mock) && !freightRes.ok,
           courierId,
-          courierName: courierResolve.courierName || assign.courier || null,
+          courierName: assignRes.courierName || assign.courier || null,
           assignRaw: assign?.raw || null,
           source: 'admin_assign_awb'
         });
@@ -1110,14 +1184,15 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
 
     return {
       success: true,
-      message: courierResolve.substituted
-        ? `Courier assigned (substituted): ${courierResolve.courierName || assign.courier || 'AWB generated'}`
+      message: assignRes.substituted
+        ? `Courier assigned (substituted): ${assignRes.courierName || assign.courier || 'AWB generated'} (customer bill unchanged)`
         : 'Courier assigned and AWB generated',
       courierId,
-      courierSubstituted: Boolean(courierResolve.substituted),
-      courierAssignNote: courierResolve.courierAssignNote || null,
+      courierSubstituted: Boolean(assignRes.substituted),
+      courierAssignNote: assignRes.courierAssignNote || null,
       shipment: assign,
       oosShippingSettlement,
+      customerBillUnchanged: true,
       order: fresh
     };
   } catch (err) {
@@ -1626,7 +1701,9 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
         details: assignRes.details || null,
         quotedCourier: assignRes.quotedCourier || null,
         suggestedCourier: assignRes.suggestedCourier || null,
-        availableCouriers: assignRes.availableCouriers || null
+        availableCouriers: assignRes.availableCouriers || null,
+        quotedFreightInr: assignRes.quotedFreightInr ?? null,
+        customerBillUnchanged: assignRes.customerBillUnchanged !== false
       });
     }
     return res.json({
@@ -1636,8 +1713,9 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
       shipment: assignRes.shipment,
       order: assignRes.order,
       provider: assignRes.provider || resolveOrderShippingProvider(order),
-      substituted: Boolean(assignRes.substituted),
-      pendingAwb: Boolean(assignRes.pendingAwb)
+      substituted: Boolean(assignRes.substituted || assignRes.courierSubstituted),
+      pendingAwb: Boolean(assignRes.pendingAwb),
+      customerBillUnchanged: assignRes.customerBillUnchanged !== false
     });
   } catch (error) {
     logger.error('adminFulfillmentAssignShip', { message: error.message, stack: error.stack });
@@ -1886,7 +1964,7 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
       return jsonError(res, 400, 'AWB_REQUIRED', 'Assign AWB before requesting a shipping label.');
     }
 
-    // Shipmozo label (base64 data URL from get-order-label)
+    // Shipmozo: never persist label bytes — return a file URL that proxies live fetch.
     if (isShipmozoOrder(order)) {
       const awb = String(order.shipmentInfo.awbCode || order.shipmentInfo.trackingNumber).trim();
       const label = await ShipmozoService.getOrderLabel(awb);
@@ -1898,7 +1976,10 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
       await applyUpsertShipmentInfo({
         order,
         shipmentPayload: {
-          labelUrl: label.labelUrl,
+          // Clear any previously stored base64 blob; mark availability via labelDownloaded.
+          labelUrl: null,
+          labelDownloaded: true,
+          fulfillmentLabelAwb: awb,
           provider: SHIPPING_PROVIDERS.SHIPMOZO,
           providerStatus: order.shipmentInfo?.providerStatus
         },
@@ -1906,9 +1987,10 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
         allowOrderStatusUpdate: false
       });
       const fresh = await Order.findOne({ orderId: order.orderId });
+      // Client should use shipping-label-file for open/download (correct MIME). Keep labelUrl out of JSON.
       return res.json({
         success: true,
-        labelUrl: label.labelUrl,
+        labelFilePath: `/orders/admin/items/${encodeURIComponent(String(order.orderId))}/fulfillment/shipping-label-file`,
         order: fresh,
         provider: SHIPPING_PROVIDERS.SHIPMOZO
       });
@@ -1953,7 +2035,7 @@ exports.adminFulfillmentShippingLabel = async (req, res) => {
 
 /**
  * GET /orders/admin/items/:orderId/fulfillment/shipping-label-file
- * Proxies Shiprocket label PDF so the admin can download without CORS issues.
+ * Proxies provider label file (Shiprocket PDF; Shipmozo PNG/JPEG/PDF) for admin download/open without CORS issues.
  */
 exports.adminFulfillmentShippingLabelFile = async (req, res) => {
   try {
@@ -1962,26 +2044,69 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
     if (!requireFulfillmentPaymentReady(order, res)) return;
     if (!requireShipmentOpsAction(order, 'downloadLabel', res)) return;
 
+    const isShipmozo = isShipmozoOrder(order);
     let buf;
+    let contentType = 'application/pdf';
+    let extension = 'pdf';
     try {
-      buf = await fetchShiprocketLabelPdfBuffer(order);
+      if (isShipmozo) {
+        const file = await fetchShipmozoLabelFile(order);
+        buf = file.buffer;
+        contentType = file.contentType || 'image/png';
+        extension = file.extension || 'png';
+        // Never claim PDF when payload is an image (Shipmozo default is PNG).
+        if (contentType === 'application/octet-stream' || extension === 'bin') {
+          const sniffed = resolveLabelFileMeta(buf, '');
+          contentType = sniffed.contentType;
+          extension = sniffed.extension;
+          if (extension === 'bin') {
+            contentType = 'image/png';
+            extension = 'png';
+          }
+        }
+      } else {
+        buf = await fetchShiprocketLabelPdfBuffer(order);
+        contentType = 'application/pdf';
+        extension = 'pdf';
+      }
+      const awb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
       await applyUpsertShipmentInfo({
         order,
-        shipmentPayload: { labelDownloaded: true },
-        trigger: 'admin_label_downloaded',
+        shipmentPayload: {
+          labelDownloaded: true,
+          ...(awb ? { fulfillmentLabelAwb: awb } : {}),
+          ...(isShipmozo
+            ? {
+                provider: SHIPPING_PROVIDERS.SHIPMOZO,
+                // Never keep Shipmozo base64 labels in Mongo — fetch live on each download.
+                labelUrl: null
+              }
+            : {})
+        },
+        trigger: isShipmozo ? 'admin_label_downloaded_shipmozo' : 'admin_label_downloaded',
         allowOrderStatusUpdate: false
       });
-      await evaluateAndPersistShipmentOps(order, { source: 'admin_label_downloaded' });
+      await evaluateAndPersistShipmentOps(order, {
+        source: isShipmozo ? 'admin_label_downloaded_shipmozo' : 'admin_label_downloaded'
+      });
     } catch (fetchErr) {
       logger.error('adminFulfillmentShippingLabelFile fetch', {
         message: fetchErr.message,
         stack: fetchErr.stack,
         code: fetchErr.code,
-        status: fetchErr.response?.status
+        status: fetchErr.response?.status,
+        provider: isShipmozo ? 'shipmozo' : 'shiprocket'
       });
       const code = fetchErr.code || 'LABEL_FILE_FAILED';
       if (code === 'SHIPROCKET_ORDER_ID_MISSING') {
-        return jsonError(res, 400, code, fetchErr.message || 'No Shiprocket order id on order.');
+        return jsonError(
+          res,
+          400,
+          code,
+          isShipmozo
+            ? 'Shipmozo label is not available yet. Use Ship now / Refresh, then try label again.'
+            : fetchErr.message || 'No Shiprocket order id on order.'
+        );
       }
       if (code === 'AWB_REQUIRED') {
         return jsonError(res, 400, code, fetchErr.message || 'Assign AWB first.');
@@ -1997,7 +2122,7 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
           res,
           502,
           'LABEL_FILE_FETCH_FAILED',
-          `Could not download label from Shiprocket URL (HTTP ${fetchErr.response.status}).`
+          `Could not download label from ${isShipmozo ? 'Shipmozo' : 'Shiprocket'} (HTTP ${fetchErr.response.status}).`
         );
       }
       if (code === 'LABEL_FAILED' || code === 'LABEL_EMPTY_BODY') {
@@ -2009,8 +2134,12 @@ exports.adminFulfillmentShippingLabelFile = async (req, res) => {
     }
 
     const safe = String(order.orderId || 'order').replace(/[^\w.-]+/g, '_').slice(0, 80);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="Shiprocket-label-${safe}.pdf"`);
+    const filePrefix = isShipmozo ? 'Shipmozo-label' : 'Shiprocket-label';
+    const filename = `${filePrefix}-${safe}.${extension}`;
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    // Let browsers/axios read filename + type (fixes save-as .pdf while body is PNG).
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Type');
     return res.status(200).send(buf);
   } catch (error) {
     logger.error('adminFulfillmentShippingLabelFile', {
@@ -2404,7 +2533,16 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
             message: `Cannot download label for status ${order.orderStatus}`
           };
         }
-        const pdfBuf = await fetchShiprocketLabelPdfBuffer(order);
+        let fileBuf;
+        let ext = 'pdf';
+        if (isShipmozoOrder(order)) {
+          const file = await fetchShipmozoLabelFile(order);
+          fileBuf = file.buffer;
+          ext = file.extension && file.extension !== 'bin' ? file.extension : 'png';
+        } else {
+          fileBuf = await fetchShiprocketLabelPdfBuffer(order);
+          ext = 'pdf';
+        }
         await applyUpsertShipmentInfo({
           order,
           shipmentPayload: { labelDownloaded: true },
@@ -2412,8 +2550,8 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
           allowOrderStatusUpdate: false
         });
         await evaluateAndPersistShipmentOps(order, { source: 'admin_bulk_label_downloaded' });
-        const entryName = safeZipEntryBase(oid, '-shipping-label.pdf');
-        return { orderId: oid, success: true, entryName, pdfBuf };
+        const entryName = safeZipEntryBase(oid, `-shipping-label.${ext}`);
+        return { orderId: oid, success: true, entryName, pdfBuf: fileBuf };
       } catch (err) {
         const code = err.code || 'LABEL_FAILED';
         logger.error('adminBulkShippingLabelsZip row', {

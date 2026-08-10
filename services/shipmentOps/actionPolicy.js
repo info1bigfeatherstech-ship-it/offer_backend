@@ -142,6 +142,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.downloadLabel = awb && !terminal;
         caps.refreshTracking = awb;
         caps.track = awb;
+        caps.syncShiprocket = awb && gateOk;
         caps.cancelShipment = shipmozoReady && gateOk && !terminal;
       } else {
         caps.schedulePickup = awb && shipmentId && gateOk && !inTransit && st !== 'delivered' && !terminal;
@@ -157,6 +158,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.downloadLabel = awb && !terminal;
         caps.refreshTracking = awb;
         caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
+        caps.syncShiprocket = awb && gateOk;
         caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
       } else {
         caps.generateManifest =
@@ -177,6 +179,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.downloadLabel = awb && !terminal;
         caps.refreshTracking = awb;
         caps.track = awb;
+        caps.syncShiprocket = awb && gateOk;
         caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
       } else {
         caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
@@ -195,6 +198,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.downloadLabel = awb && !terminal;
         caps.refreshTracking = awb;
         caps.track = awb;
+        caps.syncShiprocket = awb && gateOk;
         caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
       } else {
         caps.downloadManifest = awb && shipmentId && artifactsValid && Boolean(si.manifestUrl) && !terminal;
@@ -303,20 +307,35 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
   const manifestDownloaded = Boolean(si.manifestDownloaded);
   const labelDownloaded = Boolean(si.labelDownloaded);
 
-  if (caps.downloadManifest && !terminal && !inTransit && (st === 'processing' || st === 'confirmed')) {
+  // Shiprocket panel: label after manifest. Shipmozo has no manifest gate.
+  if (
+    !isShipmozo &&
+    caps.downloadManifest &&
+    !terminal &&
+    !inTransit &&
+    (st === 'processing' || st === 'confirmed')
+  ) {
     if (!manifestDownloaded) {
       caps.downloadLabel = false;
     }
   }
 
   const primaryAction = resolvePrimaryActionKey(caps);
-  const nextStepMessage = buildNextStepMessage(opsState, blockReasons, primaryAction);
+  let primaryActionLabel = ACTION_LABELS[primaryAction] || ACTION_LABELS.openDetail;
+  if (isShipmozo) {
+    if (primaryAction === ACTION_KEYS.cancelShipment) primaryActionLabel = 'Cancel on Shipmozo';
+    if (primaryAction === ACTION_KEYS.syncShiprocket) primaryActionLabel = 'Refresh Shipmozo';
+  }
+  const nextStepMessage = buildNextStepMessage(opsState, blockReasons, primaryAction, {
+    isShipmozo,
+    needsManualPickup: si.shipmozoNeedsManualPickup === true
+  });
 
   return {
     actionCapabilities: caps,
     blockReasons,
     primaryAction,
-    primaryActionLabel: ACTION_LABELS[primaryAction] || ACTION_LABELS.openDetail,
+    primaryActionLabel,
     nextStepMessage,
     riskFlags: buildRiskFlags(opsState),
   };
@@ -326,26 +345,45 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
  * @param {string} opsState
  * @param {Record<string, string>} blockReasons
  * @param {string} primaryAction
+ * @param {{ isShipmozo?: boolean, needsManualPickup?: boolean }} [opts]
  */
-function buildNextStepMessage(opsState, blockReasons, primaryAction) {
+function buildNextStepMessage(opsState, blockReasons, primaryAction, opts = {}) {
+  const isShipmozo = Boolean(opts.isShipmozo);
+  const provider = isShipmozo ? 'Shipmozo' : 'Shiprocket';
+
   switch (opsState) {
     case OPS_STATES.PICKUP_EXCEPTION:
       return (
         blockReasons.retryPickup ||
-        'Pickup failed on Shiprocket. Try Retry pickup first. If it persists, open Shiprocket support or cancel and ship again.'
+        (isShipmozo
+          ? 'Pickup needs attention on Shipmozo. Refresh tracking, schedule pickup if required, or cancel and ship again.'
+          : 'Pickup failed on Shiprocket. Try Retry pickup first. If it persists, open Shiprocket support or cancel and ship again.')
       );
     case OPS_STATES.PROVIDER_RESET:
-      return 'Shiprocket reset this shipment (e.g. auto-cancel). Refresh sync, then use Ship now to re-create the shipment.';
+      return `${provider} reset this shipment (e.g. cancel). Refresh sync, then use Ship now to re-create the shipment.`;
     case OPS_STATES.NEEDS_MANUAL_REVIEW:
-      return 'Unmapped Shiprocket status. Refresh Shiprocket, review tracking, then proceed.';
+      return isShipmozo
+        ? 'Unmapped Shipmozo status. Refresh tracking, review, then proceed.'
+        : 'Unmapped Shiprocket status. Refresh Shiprocket, review tracking, then proceed.';
     case OPS_STATES.READY_TO_SHIP:
       return primaryAction === ACTION_KEYS.shipNow
-        ? 'Assign courier and AWB on Shiprocket (Ship now).'
+        ? `Assign courier and AWB on ${provider} (Ship now).`
         : 'Complete payment or approval before shipping.';
     case OPS_STATES.PICKUP_SCHEDULED:
-      return 'Pickup booked on Shiprocket. Generate manifest next (same as Shiprocket panel).';
+      return isShipmozo
+        ? 'Courier booked on Shipmozo. Download shipping label next.'
+        : 'Pickup booked on Shiprocket. Generate manifest next (same as Shiprocket panel).';
     case OPS_STATES.AWB_ASSIGNED:
+      if (isShipmozo) {
+        return opts.needsManualPickup
+          ? 'AWB assigned. Schedule pickup on Shipmozo, then download label.'
+          : 'AWB assigned on Shipmozo. Download shipping label next (pickup is auto-scheduled).';
+      }
       return 'AWB assigned. Schedule pickup on Shiprocket.';
+    case OPS_STATES.LABEL_READY:
+      return isShipmozo
+        ? 'Label ready on Shipmozo. Open or download when packing.'
+        : '';
     default:
       return '';
   }

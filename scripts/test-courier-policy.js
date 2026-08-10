@@ -77,6 +77,28 @@ function testPickCheapestSkipsInactive() {
   });
 }
 
+function testPickCheapestRespectsMaxCharge() {
+  withEnv({ SHIPROCKET_INACTIVE_COURIER_IDS: '' }, () => {
+    const within = pickCheapestActiveCourier(
+      [
+        { courier_company_id: 1, courier_name: 'Cheap', rate: 40 },
+        { courier_company_id: 2, courier_name: 'Mid', rate: 55 },
+        { courier_company_id: 3, courier_name: 'High', rate: 90 }
+      ],
+      { codRequired: false, maxCharge: 50 }
+    );
+    assert.strictEqual(within.courierCompanyId, 1);
+    const over = pickCheapestActiveCourier(
+      [
+        { courier_company_id: 2, courier_name: 'Mid', rate: 55 },
+        { courier_company_id: 3, courier_name: 'High', rate: 90 }
+      ],
+      { codRequired: false, maxCharge: 50 }
+    );
+    assert.strictEqual(over.courierCompanyId, 2);
+  });
+}
+
 function testSubstituteNote() {
   const note = buildCourierSubstituteNote({
     quotedId: 55,
@@ -86,6 +108,7 @@ function testSubstituteNote() {
   });
   assert.ok(/inactive/i.test(note));
   assert.ok(/Delhivery Air/.test(note));
+  assert.ok(/Customer bill unchanged/i.test(note));
 }
 
 function run() {
@@ -93,6 +116,7 @@ function run() {
   testNamePatternBlockOnlyWhenEnvSet();
   testInactiveById();
   testPickCheapestSkipsInactive();
+  testPickCheapestRespectsMaxCharge();
   testSubstituteNote();
   console.log('All courier policy tests passed.');
 }

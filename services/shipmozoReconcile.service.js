@@ -137,6 +137,54 @@ async function reconcileOrderFromShipmozo(order, options = {}) {
   const providerStatus =
     tracking.currentStatus || order.shipmentInfo?.providerStatus || null;
 
+  const statusNorm = String(providerStatus || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ');
+  if (
+    /\bcancel/.test(statusNorm) ||
+    /shipment cancelled|order cancelled|awb cancel/.test(statusNorm)
+  ) {
+    try {
+      const { finalizeShipmentAfterRemoteCancel } = require('../controllers/admin-order-fulfillment.controller');
+      // Prefer local reset helper from reconcile/shiprocket path to avoid circular require issues
+    } catch (_) {
+      /* fall through */
+    }
+    try {
+      const {
+        applyLocalShipmentReset
+      } = require('./shiprocketReconcile.service');
+      const resetOrder = await applyLocalShipmentReset(order, {
+        reason: providerStatus || 'Cancelled on Shipmozo',
+        trigger: `${source}_shipmozo_cancel_detected`,
+        appendEvent: true
+      });
+      if (resetOrder) {
+        try {
+          const { evaluateAndPersistShipmentOps } = require('./shipmentOps');
+          await evaluateAndPersistShipmentOps(resetOrder, { source: `${source}_shipmozo_cancel` });
+        } catch (_) {
+          /* non-blocking */
+        }
+        const freshReset = await Order.findOne({ orderId: order.orderId });
+        return {
+          success: true,
+          cancelled: true,
+          message: 'Shipmozo reports this shipment cancelled — local AWB cleared for re-ship.',
+          order: freshReset || resetOrder,
+          tracking,
+          provider: SHIPPING_PROVIDERS.SHIPMOZO
+        };
+      }
+    } catch (cancelErr) {
+      logger.warn('[shipmozoReconcile] cancel detect reset failed', {
+        orderId: order.orderId,
+        message: cancelErr.message
+      });
+    }
+  }
+
   const { applyUpsertShipmentInfo } = require('../controllers/order.controller');
   await applyUpsertShipmentInfo({
     order,

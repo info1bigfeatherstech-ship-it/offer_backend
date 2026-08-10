@@ -1,6 +1,6 @@
 // models/Order.js
 const mongoose = require('mongoose');
-const { generateOrderId } = require('../utils/orderId');
+const { allocateUniqueOrderId, orderIdsForDigitSuffix } = require('../utils/orderId');
 
 const orderItemSchema = new mongoose.Schema(
   {
@@ -413,14 +413,19 @@ const orderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Generate order ID before saving (fallback if controller did not set orderId)
-orderSchema.pre('save', function() {
-  if (!this.orderId) {
-    this.orderId = generateOrderId({
-      storefront: this.storefront,
-      userType: this.userType
-    });
-  }
+// Generate order ID before saving (fallback if controller did not set orderId).
+// Digit suffix is unique across OWB-ECOMM and OWB-WH.
+orderSchema.pre('save', async function () {
+  if (this.orderId) return;
+  this.orderId = await allocateUniqueOrderId({
+    storefront: this.storefront,
+    userType: this.userType,
+    maxAttempts: 32,
+    isSuffixTaken: async (digits) => {
+      const ids = orderIdsForDigitSuffix(digits);
+      return Boolean(await mongoose.model('Order').exists({ orderId: { $in: ids } }));
+    }
+  });
 });
 
 orderSchema.index({ userId: 1, createdAt: -1 });

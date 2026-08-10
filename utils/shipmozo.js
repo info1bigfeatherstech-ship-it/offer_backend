@@ -1005,24 +1005,50 @@ class ShipmozoService {
   }
 
   /**
-   * List couriers for an existing pushed order (for Ship Now fallback UI).
+   * List couriers for an existing pushed order (Ship Now fallback UI / substitutes).
+   * Uses the same package + payment derivation as push-order for parity.
+   * Does NOT pass marketplace order_id into rate-calculator by default — that can
+   * return empty lists even when the pushed order is bookable in Shipmozo panel.
    */
   async listCouriersForOrder(order) {
-    const parts = await this.buildPushOrderParts(order);
-    const deliveryPin = String(parts.addr?.postalCode || '')
-      .replace(/\D/g, '')
-      .slice(0, 6);
-    return this.rateCalculator({
-      deliveryPincode: deliveryPin,
-      paymentType: parts.paymentType,
-      orderAmount: parts.orderAmount,
-      codAmount: parts.codAmount,
-      weightGrams: parts.weightGrams,
-      lengthCm: parts.lengthCm,
-      widthCm: parts.widthCm,
-      heightCm: parts.heightCm,
-      orderId: order.orderId
-    });
+    try {
+      const parts = await this.buildPushOrderParts(order);
+      const deliveryPin = String(parts.addr?.postalCode || '')
+        .replace(/\D/g, '')
+        .slice(0, 6);
+
+      const rates = await this.rateCalculator({
+        deliveryPincode: deliveryPin,
+        paymentType: parts.paymentType,
+        orderAmount: parts.orderAmount,
+        codAmount: parts.codAmount,
+        weightGrams: parts.weightGrams,
+        lengthCm: parts.lengthCm,
+        widthCm: parts.widthCm,
+        heightCm: parts.heightCm,
+        // Empty order_id matches working checkout/Postman rate calls.
+        orderId: ''
+      });
+
+      return {
+        ...rates,
+        paymentType: parts.paymentType,
+        weightGrams: parts.weightGrams,
+        deliveryPincode: deliveryPin
+      };
+    } catch (err) {
+      logger.error('[Shipmozo] listCouriersForOrder failed', {
+        orderId: order?.orderId,
+        message: err.message
+      });
+      return {
+        ok: false,
+        couriers: [],
+        message: err.message || 'Failed to list Shipmozo couriers',
+        code: 'SHIPMOZO_RATE_FAILED',
+        raw: null
+      };
+    }
   }
 
   /**
