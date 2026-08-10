@@ -475,8 +475,13 @@ function mapOrderRow(order) {
   const hasShipmentId = Boolean(si.shipmentId);
   const pickupScheduled = Boolean(si.pickupScheduledAt || si.pickupDate);
   const hasManifest = Boolean(si.manifestUrl);
-  const hasLabel = Boolean(si.labelUrl);
+  const hasLabel =
+    Boolean(si.labelUrl) ||
+    (resolveOrderShippingProvider(o) === 'shipmozo' && Boolean(si.labelDownloaded));
   const hasShiprocketOrderId = Boolean(si.shiprocketOrderId);
+  const shipmozoOrderId =
+    si.shipmozoOrderId || (resolveOrderShippingProvider(o) === 'shipmozo' ? si.shipmentId : null) || null;
+  const shipmozoOrderIdDisplay = shipmozoOrderId ? String(shipmozoOrderId).trim() : null;
   const orderStatusLower = String(o.orderStatus || '').toLowerCase();
   const isPending = orderStatusLower === 'pending';
   const fulfillmentPaymentGate = evaluateOrderPaymentForShiprocketFulfillment(o);
@@ -533,6 +538,8 @@ function mapOrderRow(order) {
     pickupDate: si.pickupDate || null,
     shiprocketPickupId: si.shiprocketPickupId || null,
     shiprocketPickupIdDisplay: formatShiprocketPickupIdDisplay(si.shiprocketPickupId),
+    shipmozoOrderId: shipmozoOrderIdDisplay,
+    shipmozoOrderIdDisplay,
     courier: si.courier || null,
     providerStatus: si.providerStatus || null,
     awbCode: si.awbCode || si.trackingNumber || null,

@@ -106,9 +106,10 @@ function filterActiveCouriers(couriers) {
 
 /**
  * Pick cheapest active courier (same logic as ShiprocketService.pickRecommendedCourierId).
+ * When maxCharge is set, prefer cheapest with rate <= maxCharge; else overall cheapest.
  * @param {Array<object>} couriers
- * @param {{ codRequired?: boolean }} [opts]
- * @returns {{ courier: object, courierCompanyId: number, courierName: string }|null}
+ * @param {{ codRequired?: boolean, maxCharge?: number|null }} [opts]
+ * @returns {{ courier: object, courierCompanyId: number, courierName: string, rate: number }|null}
  */
 function pickCheapestActiveCourier(couriers, opts = {}) {
   const active = filterActiveCouriers(couriers);
@@ -136,20 +137,29 @@ function pickCheapestActiveCourier(couriers, opts = {}) {
     return a.etd - b.etd;
   });
 
-  const top = scored[0]?.c;
+  let chosen = scored[0];
+  const maxCharge = opts.maxCharge;
+  if (maxCharge != null && Number.isFinite(Number(maxCharge))) {
+    const cap = Number(maxCharge) + 0.05;
+    const under = scored.filter((s) => s.rate <= cap);
+    if (under.length) chosen = under[0];
+  }
+
+  const top = chosen?.c;
   if (!top) return null;
   const courierCompanyId = getCourierCompanyIdFromRow(top);
   if (courierCompanyId == null) return null;
   return {
     courier: top,
     courierCompanyId,
-    courierName: getCourierNameFromRow(top) || 'Courier'
+    courierName: getCourierNameFromRow(top) || 'Courier',
+    rate: Number.isFinite(chosen.rate) ? chosen.rate : null
   };
 }
 
 /**
  * Build admin-facing note when checkout courier was skipped at assign time.
- * @param {{ quotedId?: number|null, quotedName?: string|null, assignedId: number, assignedName: string }} params
+ * @param {{ quotedId?: number|null, quotedName?: string|null, assignedId: number, assignedName: string, reason?: string|null }} params
  */
 function buildCourierSubstituteNote(params) {
   const quotedLabel = params.quotedName
@@ -157,9 +167,22 @@ function buildCourierSubstituteNote(params) {
     : params.quotedId
       ? `ID ${params.quotedId}`
       : 'checkout courier';
+  const reason = String(params.reason || 'inactive_policy').trim();
+  if (reason === 'inactive_policy') {
+    return (
+      `Quoted courier ${quotedLabel} is inactive in our shipping policy. ` +
+      `Assigned next cheapest active courier: "${params.assignedName}" (ID ${params.assignedId}). Customer bill unchanged.`
+    );
+  }
+  if (reason === 'assign_failed' || reason === 'admin_confirm') {
+    return (
+      `Quoted courier ${quotedLabel} could not be assigned on Shiprocket. ` +
+      `Assigned substitute "${params.assignedName}" (ID ${params.assignedId}) after admin confirm. Customer bill unchanged.`
+    );
+  }
   return (
-    `Quoted courier ${quotedLabel} is inactive in our shipping policy. ` +
-    `Assigned next cheapest active courier: "${params.assignedName}" (ID ${params.assignedId}).`
+    `Quoted courier ${quotedLabel} was not used. ` +
+    `Assigned "${params.assignedName}" (ID ${params.assignedId}). Customer bill unchanged.`
   );
 }
 

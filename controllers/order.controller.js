@@ -46,7 +46,7 @@ const {
     isAdvanceBalanceCodCheckout,
     assertStorePolicyAllowsCheckout
 } = require('../utils/checkoutPaymentPolicy');
-const { generateOrderId } = require('../utils/orderId');
+const { allocateUniqueOrderId, orderIdsForDigitSuffix } = require('../utils/orderId');
 const { mergeReturnInfo } = require('../services/rtoRefund.service');
 const {
     mergeAdminOrderFilter
@@ -1432,17 +1432,20 @@ exports.createOrder = async (req, res) => {
         }
 
         // Allocate orderId before stock reserve (inventory API keys holds by orderId).
+        // 6-digit suffix must be unique across BOTH OWB-ECOMM and OWB-WH.
         let candidateOrderId = null;
-        for (let idAttempt = 0; idAttempt < 8; idAttempt++) {
-            const candidate = generateOrderId({
+        try {
+            candidateOrderId = await allocateUniqueOrderId({
                 storefront,
-                userType: finalUserType
+                userType: finalUserType,
+                maxAttempts: 32,
+                isSuffixTaken: async (digits) => {
+                    const ids = orderIdsForDigitSuffix(digits);
+                    return Boolean(await Order.exists({ orderId: { $in: ids } }).session(session));
+                }
             });
-            const exists = await Order.exists({ orderId: candidate }).session(session);
-            if (!exists) {
-                candidateOrderId = candidate;
-                break;
-            }
+        } catch (_) {
+            candidateOrderId = null;
         }
         if (!candidateOrderId) {
             throw createCheckoutFlowError({

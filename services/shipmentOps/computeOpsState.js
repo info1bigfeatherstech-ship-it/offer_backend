@@ -46,10 +46,19 @@ function isPickupBooked(shipmentInfo, signalClassification) {
   ) {
     return false;
   }
+  const si = shipmentInfo || {};
   if (signalClassification === CLASSIFICATION.AWB_ASSIGNED) {
+    // Shipmozo auto-pickup: assign flow persists pickupScheduledAt / pickupDate.
+    // Do not treat those as "still need schedule" when manual pickup is not required.
+    if (
+      si.shipmozoNeedsManualPickup !== true &&
+      (si.pickupScheduledAt || si.pickupDate) &&
+      String(si.provider || '').toLowerCase() === 'shipmozo'
+    ) {
+      return true;
+    }
     return false;
   }
-  const si = shipmentInfo || {};
   const snap = si.providerSnapshot;
   if (snap && snap.pickupScheduled === false) {
     return false;
@@ -198,7 +207,19 @@ function computeOpsState(order) {
     }
 
     const hasManifest = artifactsValid && Boolean(si.manifestUrl);
-    const hasLabel = artifactsValid && Boolean(si.labelUrl);
+    const isShipmozo =
+      String(si.provider || '').toLowerCase() === 'shipmozo' ||
+      Boolean(si.shipmozoOrderId);
+    // Shipmozo labels are fetched live (not stored as labelUrl). labelDownloaded marks completion.
+    const hasLabel =
+      artifactsValid &&
+      (Boolean(si.labelUrl) || (isShipmozo && Boolean(si.labelDownloaded)));
+
+    // Shipmozo has no Shiprocket-style manifest gate — label alone is LABEL_READY.
+    if (isShipmozo) {
+      if (hasLabel) return OPS_STATES.LABEL_READY;
+      return OPS_STATES.PICKUP_SCHEDULED;
+    }
 
     // Shiprocket: AWB often creates label early — manifest is still the next panel step.
     if (hasManifest && hasLabel) return OPS_STATES.LABEL_READY;
