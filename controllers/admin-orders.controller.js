@@ -134,7 +134,8 @@ exports.getOrdersList = async (req, res) => {
     const { backfillShiprocketPickupIdsForListPage } = require('../services/shiprocketReconcile.service');
     const {
       repairOrderStatusForShiprocketRto,
-      repairOrderStatusForFalseDeliveredNdr
+      repairOrderStatusForFalseDeliveredNdr,
+      repairOrderStatusForFalseRtoLatch
     } = require('../constants/rtoOrderQuery');
 
     for (const doc of orders) {
@@ -166,6 +167,31 @@ exports.getOrdersList = async (req, res) => {
         { _id: { $in: ndrFalseDeliveredIds } },
         { $set: { orderStatus: 'shipped' }, $unset: { 'shipmentInfo.deliveredAt': '' } }
       );
+    }
+
+    const falseRtoLatchDocs = orders.filter((doc) => repairOrderStatusForFalseRtoLatch(doc));
+    if (falseRtoLatchDocs.length) {
+      try {
+        await Order.bulkWrite(
+          falseRtoLatchDocs.map((doc) => ({
+            updateOne: {
+              filter: { _id: doc._id },
+              update: {
+                $set: {
+                  orderStatus: 'delivered',
+                  ...(doc.shipmentInfo?.deliveredAt
+                    ? { 'shipmentInfo.deliveredAt': doc.shipmentInfo.deliveredAt }
+                    : {})
+                }
+              }
+            }
+          }))
+        );
+      } catch (repairErr) {
+        logger.warn('[admin-orders] false RTO latch persist skipped', {
+          message: repairErr?.message || String(repairErr)
+        });
+      }
     }
 
     await backfillShiprocketPickupIdsForListPage(orders, { max: 20 });

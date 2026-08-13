@@ -5,7 +5,11 @@ const Razorpay = require('razorpay');
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
 const { roundMoney2 } = require('../services/checkoutComputation.service');
-const { buildRtoBucketMatch, repairOrderStatusForShiprocketRto } = require('../constants/rtoOrderQuery');
+const {
+  buildRtoBucketMatch,
+  repairOrderStatusForShiprocketRto,
+  repairOrderStatusForFalseRtoLatch
+} = require('../constants/rtoOrderQuery');
 const {
   resolveDateRange,
   buildScopedDateMatch,
@@ -457,11 +461,16 @@ exports.getRtoOrders = async (req, res) => {
     ]);
 
     const repairIds = [];
+    const falseRtoLatchIds = [];
     const syncSets = [];
     const pendingInitIds = [];
     const insightSets = [];
 
     for (const doc of orders) {
+      if (repairOrderStatusForFalseRtoLatch(doc)) {
+        falseRtoLatchIds.push(doc._id);
+        continue;
+      }
       if (repairOrderStatusForShiprocketRto(doc)) repairIds.push(doc._id);
 
       const beforeStatus = doc.returnInfo?.rtoStatus;
@@ -497,6 +506,34 @@ exports.getRtoOrders = async (req, res) => {
       }
     }
 
+    let persistedFalseRtoLatch = false;
+    if (falseRtoLatchIds.length) {
+      const latchDocs = orders.filter((doc) =>
+        falseRtoLatchIds.some((id) => String(id) === String(doc._id))
+      );
+      try {
+        await Order.bulkWrite(
+          latchDocs.map((doc) => ({
+            updateOne: {
+              filter: { _id: doc._id },
+              update: {
+                $set: {
+                  orderStatus: 'delivered',
+                  ...(doc.shipmentInfo?.deliveredAt
+                    ? { 'shipmentInfo.deliveredAt': doc.shipmentInfo.deliveredAt }
+                    : {})
+                }
+              }
+            }
+          }))
+        );
+        persistedFalseRtoLatch = true;
+      } catch (repairErr) {
+        logger.warn('[admin-rto] false RTO latch persist skipped', {
+          message: repairErr?.message || String(repairErr)
+        });
+      }
+    }
     if (repairIds.length) {
       await Order.updateMany({ _id: { $in: repairIds } }, { $set: { orderStatus: 'rto' } });
     }
@@ -515,12 +552,24 @@ exports.getRtoOrders = async (req, res) => {
 
     // Read-only Shiprocket freight enrich for this page (missing RTO reverse charges only).
     try {
-      await enrichRtoOrdersFreightCharges(orders, { concurrency: 3, maxOrders: 8 });
+      const enrichList =
+        persistedFalseRtoLatch && falseRtoLatchIds.length
+          ? orders.filter(
+              (doc) => !falseRtoLatchIds.some((id) => String(id) === String(doc._id))
+            )
+          : orders;
+      await enrichRtoOrdersFreightCharges(enrichList, { concurrency: 3, maxOrders: 8 });
     } catch (enrichErr) {
       logger.warn('[admin-rto] freight enrich skipped', { message: enrichErr?.message });
     }
 
-    const rows = orders.map((doc) => mapRtoOrderRow(doc));
+    const rows = orders
+      .filter(
+        (doc) =>
+          !persistedFalseRtoLatch ||
+          !falseRtoLatchIds.some((id) => String(id) === String(doc._id))
+      )
+      .map((doc) => mapRtoOrderRow(doc));
 
     const summaryCounts = {
       total,

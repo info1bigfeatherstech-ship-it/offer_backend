@@ -526,6 +526,120 @@ function testRtoFulfillmentLabel() {
     fulfillmentLabelForAdminListRow('processing', 'PICKUP SCHEDULED', 'ready_to_ship'),
     'Ready to Ship'
   );
+  assert.strictEqual(fulfillmentLabelFromOrderStatus('rto', 'Delivered'), 'RTO Delivered');
+  assert.strictEqual(
+    fulfillmentLabelForAdminListRow('rto', 'Delivered', 'rto'),
+    'RTO Delivered'
+  );
+}
+
+function testRtoJourneyClassifierStickyAndFalseLatch() {
+  const {
+    canApplyProviderOrderStatus,
+    repairOrderStatusForFalseRtoLatch,
+    fulfillmentLabelForRtoAwareOrder
+  } = require('../constants/rtoOrderQuery');
+  const {
+    canClearFalseRtoLatch,
+    hasCourierRtoEvidence,
+    resolveRtoDisplayLabel
+  } = require('../services/shipmentOps/rtoJourneyClassifier');
+
+  const rtoDelivered = {
+    orderStatus: 'rto',
+    shipmentInfo: {
+      providerStatus: 'RTO Delivered',
+      rawEvents: [{ status: 'RTO Delivered', activity: 'Shipment RTO Delivered' }]
+    }
+  };
+  assert.strictEqual(hasCourierRtoEvidence(rtoDelivered), true);
+  assert.strictEqual(canClearFalseRtoLatch(rtoDelivered), false);
+  assert.strictEqual(repairOrderStatusForFalseRtoLatch({ ...rtoDelivered }), false);
+  assert.strictEqual(rtoDelivered.orderStatus, 'rto');
+  assert.strictEqual(resolveRtoDisplayLabel('RTO Delivered', rtoDelivered), 'RTO Delivered');
+
+  const reverseLegBareDelivered = {
+    orderStatus: 'rto',
+    shipmentInfo: {
+      providerStatus: 'Delivered',
+      rawEvents: [
+        { status: 'RTO Initiated' },
+        { status: 'RTO In Transit' },
+        { status: 'Delivered', activity: 'Delivered to warehouse' }
+      ]
+    }
+  };
+  assert.strictEqual(hasCourierRtoEvidence(reverseLegBareDelivered), true);
+  assert.strictEqual(canClearFalseRtoLatch(reverseLegBareDelivered), false);
+  assert.strictEqual(repairOrderStatusForFalseRtoLatch(reverseLegBareDelivered), false);
+  assert.strictEqual(reverseLegBareDelivered.orderStatus, 'rto');
+  assert.strictEqual(resolveRtoDisplayLabel('Delivered', reverseLegBareDelivered), 'RTO Delivered');
+  assert.strictEqual(
+    fulfillmentLabelForRtoAwareOrder('rto', 'Delivered', reverseLegBareDelivered),
+    'RTO Delivered'
+  );
+  assert.strictEqual(
+    canApplyProviderOrderStatus('rto', 'delivered', 'Delivered', reverseLegBareDelivered),
+    false
+  );
+
+  const warehouseLatch = {
+    orderStatus: 'rto',
+    shipmentInfo: { providerStatus: 'Delivered', rawEvents: [{ status: 'Delivered' }] },
+    returnInfo: { rtoWarehouseDeliveredAt: new Date() }
+  };
+  assert.strictEqual(canClearFalseRtoLatch(warehouseLatch), false);
+
+  const refundedRto = {
+    orderStatus: 'rto',
+    shipmentInfo: { providerStatus: 'Delivered', rawEvents: [{ status: 'Delivered' }] },
+    returnInfo: { rtoStatus: 'refunded', rtoRefundId: 'rfnd_1' }
+  };
+  assert.strictEqual(canClearFalseRtoLatch(refundedRto), false);
+
+  const emptyTimeline = {
+    orderStatus: 'rto',
+    shipmentInfo: { providerStatus: 'Delivered', rawEvents: [] }
+  };
+  assert.strictEqual(canClearFalseRtoLatch(emptyTimeline), false);
+  assert.strictEqual(repairOrderStatusForFalseRtoLatch(emptyTimeline), false);
+  assert.strictEqual(emptyTimeline.orderStatus, 'rto');
+  assert.strictEqual(fulfillmentLabelForRtoAwareOrder('rto', 'Delivered'), 'RTO Delivered');
+  assert.strictEqual(canApplyProviderOrderStatus('rto', 'delivered', 'Delivered'), false);
+
+  const falseLatch = {
+    orderStatus: 'rto',
+    shipmentInfo: {
+      providerStatus: 'Delivered',
+      rawEvents: [
+        { status: 'In Transit' },
+        { status: 'Out for Delivery' },
+        { status: 'Delivered' }
+      ]
+    }
+  };
+  assert.strictEqual(hasCourierRtoEvidence(falseLatch), false);
+  assert.strictEqual(canClearFalseRtoLatch(falseLatch), true);
+  assert.strictEqual(canApplyProviderOrderStatus('rto', 'delivered', 'Delivered', falseLatch), true);
+  assert.strictEqual(repairOrderStatusForFalseRtoLatch(falseLatch), true);
+  assert.strictEqual(falseLatch.orderStatus, 'delivered');
+  assert.ok(falseLatch.shipmentInfo.deliveredAt);
+
+  const view = buildShipmentOpsView(
+    {
+      orderStatus: 'rto',
+      shipmentInfo: {
+        awbCode: '14112365632460',
+        courier: 'Delhivery Surface',
+        providerStatus: 'Delivered',
+        rawEvents: [{ status: 'RTO Initiated' }, { status: 'Delivered' }]
+      }
+    },
+    { fulfillmentPaymentGate: { ok: true, reason: 'paid' } }
+  );
+  assert.strictEqual(view.opsState, OPS_STATES.RTO);
+  assert.strictEqual(view.courierOpsLine1, 'RTO Delivered');
+  assert.strictEqual(view.opsStateLabel, 'RTO Delivered');
 }
 
 function run() {
@@ -550,6 +664,7 @@ function run() {
   testRtoOpsStateUsesShiprocketLabel();
   testLegacyCancelledWithRtoProviderStatus();
   testRtoFulfillmentLabel();
+  testRtoJourneyClassifierStickyAndFalseLatch();
   console.log('All shipment ops tests passed.');
 }
 

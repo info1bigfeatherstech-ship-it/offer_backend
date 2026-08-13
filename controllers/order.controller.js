@@ -393,7 +393,8 @@ function mapExternalShipmentStatusToOrderStatus(rawStatus) {
 const {
     canApplyProviderOrderStatus,
     repairOrderStatusForShiprocketRto,
-    repairOrderStatusForFalseDeliveredNdr
+    repairOrderStatusForFalseDeliveredNdr,
+    repairOrderStatusForFalseRtoLatch
 } = require('../constants/rtoOrderQuery');
 
 function normalizeShipmentEventTimestamp(value) {
@@ -575,9 +576,19 @@ async function upsertShipmentInfo({
     if (allowOrderStatusUpdate) {
         const previousOrderStatus = String(order.orderStatus || '').toLowerCase();
         const mappedOrderStatus = mapExternalShipmentStatusToOrderStatus(providerStatus);
+        const statusView = {
+            orderStatus: order.orderStatus,
+            shipmentInfo: nextShipmentInfo,
+            returnInfo: order.returnInfo
+        };
         if (
             mappedOrderStatus &&
-            canApplyProviderOrderStatus(order.orderStatus, mappedOrderStatus, providerStatus)
+            canApplyProviderOrderStatus(
+                order.orderStatus,
+                mappedOrderStatus,
+                providerStatus,
+                statusView
+            )
         ) {
             order.orderStatus = mappedOrderStatus;
             if (mappedOrderStatus === 'shipped' && !nextShipmentInfo.shippedAt) {
@@ -594,9 +605,18 @@ async function upsertShipmentInfo({
                 nextShipmentInfo.deliveredAt = null;
             }
         } else {
-            repairOrderStatusForShiprocketRto(order);
-            if (repairOrderStatusForFalseDeliveredNdr(order)) {
+            if (repairOrderStatusForShiprocketRto(statusView)) {
+                order.orderStatus = statusView.orderStatus;
+            }
+            if (repairOrderStatusForFalseDeliveredNdr(statusView)) {
+                order.orderStatus = statusView.orderStatus;
                 nextShipmentInfo.deliveredAt = null;
+            }
+            if (repairOrderStatusForFalseRtoLatch(statusView)) {
+                order.orderStatus = statusView.orderStatus;
+                if (!nextShipmentInfo.deliveredAt) {
+                    nextShipmentInfo.deliveredAt = statusView.shipmentInfo?.deliveredAt || new Date();
+                }
             }
         }
     }

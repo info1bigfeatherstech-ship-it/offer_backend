@@ -521,7 +521,7 @@ function mapOrderRow(order) {
     currency: 'INR',
     orderStatus: o.orderStatus,
     shippingProvider: resolveOrderShippingProvider(o),
-    fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey),
+    fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey, o),
     fulfillmentBucket: bucketKey,
     itemCount,
     paymentStatus: o.paymentStatus,
