@@ -92,8 +92,8 @@ function fulfillmentBucketKeyFromOrderStatus(orderStatus) {
  * @param {string} orderStatus
  * @param {string} [providerStatus]
  */
-function fulfillmentLabelFromOrderStatus(orderStatus, providerStatus) {
-  const rtoLabel = fulfillmentLabelForRtoAwareOrder(orderStatus, providerStatus);
+function fulfillmentLabelFromOrderStatus(orderStatus, providerStatus, order) {
+  const rtoLabel = fulfillmentLabelForRtoAwareOrder(orderStatus, providerStatus, order);
   if (rtoLabel) return rtoLabel;
 
   const pickupExceptionLabel = fulfillmentLabelForPickupExceptionAwareOrder(
@@ -130,8 +130,8 @@ function fulfillmentLabelFromOrderStatus(orderStatus, providerStatus) {
  * @param {string|null|undefined} providerStatus
  * @param {string} bucketKey
  */
-function fulfillmentLabelForAdminListRow(orderStatus, providerStatus, bucketKey) {
-  const rtoLabel = fulfillmentLabelForRtoAwareOrder(orderStatus, providerStatus);
+function fulfillmentLabelForAdminListRow(orderStatus, providerStatus, bucketKey, order) {
+  const rtoLabel = fulfillmentLabelForRtoAwareOrder(orderStatus, providerStatus, order);
   if (rtoLabel) return rtoLabel;
 
   const pickupExceptionLabel = fulfillmentLabelForPickupExceptionAwareOrder(
@@ -144,7 +144,7 @@ function fulfillmentLabelForAdminListRow(orderStatus, providerStatus, bucketKey)
   if (bucket === 'ready_to_ship') return 'Ready to Ship';
   if (bucket === 'pickup_exception') return 'Pickup Exception';
 
-  return fulfillmentLabelFromOrderStatus(orderStatus, providerStatus);
+  return fulfillmentLabelFromOrderStatus(orderStatus, providerStatus, order);
 }
 
 /**

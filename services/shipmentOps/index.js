@@ -4,8 +4,10 @@
 
 const {
   repairOrderStatusForShiprocketRto,
-  repairOrderStatusForFalseDeliveredNdr
+  repairOrderStatusForFalseDeliveredNdr,
+  repairOrderStatusForFalseRtoLatch
 } = require('../../constants/rtoOrderQuery');
+const { resolveRtoDisplayLabel } = require('./rtoJourneyClassifier');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../../utils/orderFulfillmentPaymentGate');
 const { OPS_STATE_LABELS, ACTION_KEYS, OPS_STATES } = require('./constants');
 const { computeOpsState, hasAwb } = require('./computeOpsState');
@@ -65,8 +67,8 @@ function buildShipmentOpsView(orderInput, options = {}) {
   return {
     opsState,
     opsStateLabel:
-      opsState === OPS_STATES.RTO && providerStatusRaw
-        ? String(providerStatusRaw).trim()
+      opsState === OPS_STATES.RTO
+        ? resolveRtoDisplayLabel(providerStatusRaw, order)
         : OPS_STATE_LABELS[opsState] || opsState,
     providerStatusRaw,
     courierOpsLine1: courierOps.line1,
@@ -130,6 +132,7 @@ async function evaluateAndPersistShipmentOps(orderDoc, options = {}) {
   maybeRevertOrderStatusForProviderReset(orderDoc);
   repairOrderStatusForShiprocketRto(orderDoc);
   repairOrderStatusForFalseDeliveredNdr(orderDoc);
+  repairOrderStatusForFalseRtoLatch(orderDoc);
   const view = buildShipmentOpsView(orderDoc, options);
   orderDoc.shipmentOps = view;
   orderDoc.markModified('shipmentOps');

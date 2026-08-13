@@ -5,6 +5,7 @@
 const { OPS_STATES } = require('./constants');
 const { hasAwb } = require('./computeOpsState');
 const { isRtoProviderStatus } = require('./shiprocketStatusMap');
+const { resolveRtoDisplayLabel } = require('./rtoJourneyClassifier');
 
 /**
  * @param {Date|string|null|undefined} dt
@@ -118,7 +119,7 @@ function buildCourierOpsDisplay({ opsState, order }) {
     case OPS_STATES.OUT_FOR_DELIVERY:
       return { line1: 'Out for delivery', line2: courier || null };
     case OPS_STATES.RTO: {
-      const line1 = providerStatus || 'RTO';
+      const line1 = resolveRtoDisplayLabel(providerStatus, o);
       const parts = [];
       if (courier) parts.push(courier);
       if (awb) parts.push(`AWB ${maskAwb(awb)}`);
