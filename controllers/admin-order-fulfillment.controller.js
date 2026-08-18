@@ -56,6 +56,9 @@ const {
 const {
   filterActiveCouriers
 } = require('../services/courierPolicy.service');
+const shipmozoLabelSettingsService = require('../services/shipmozoLabelSettings.service');
+const { buildLabelViewModel } = require('../services/shipmozoLabelViewModel.service');
+const { renderLabelPdf } = require('../services/shipmozoLabelPdf.service');
 
 function manifestAlreadyGeneratedMessage(message) {
   return /manifest already generated|already been generated/i.test(String(message || ''));
@@ -654,6 +657,30 @@ async function fetchShipmozoLabelFile(order) {
     const e = new Error('Assign AWB before downloading or opening a shipping label.');
     e.code = 'AWB_REQUIRED';
     throw e;
+  }
+
+  try {
+    const storefront =
+      String(order.storefront || '').toLowerCase() === 'wholesale' ? 'wholesale' : 'ecomm';
+    const saved = await shipmozoLabelSettingsService.getPublicSettings(storefront);
+    const vm = await buildLabelViewModel(order, saved.settings);
+    const pdfBuf = await renderLabelPdf(vm);
+    if (pdfBuf && Buffer.isBuffer(pdfBuf) && pdfBuf.length > 80) {
+      return { buffer: pdfBuf, contentType: 'application/pdf', extension: 'pdf' };
+    }
+    logger.warn('custom Shipmozo label PDF empty, falling back to provider PNG', {
+      orderId: order?.orderId,
+      awb
+    });
+  } catch (customErr) {
+    if (customErr?.code === 'AWB_REQUIRED' || customErr?.code === 'PAYMENT_REQUIRED') {
+      throw customErr;
+    }
+    logger.error('custom Shipmozo 4x6 label failed; falling back to Shipmozo PNG', {
+      orderId: order?.orderId,
+      awb,
+      message: customErr?.message
+    });
   }
 
   // Always fetch live from Shipmozo (do not persist/reuse huge base64 labelUrl in Mongo).
