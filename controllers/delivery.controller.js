@@ -114,7 +114,8 @@ exports.checkDeliveryAvailability = async (req, res) => {
       weightKg: totalWeight,
       lengthCm: dims.lengthCm,
       widthCm: dims.widthCm,
-      heightCm: dims.heightCm
+      heightCm: dims.heightCm,
+      storefront: req.storefront || 'ecomm'
     });
 
     return res.status(200).json({
@@ -148,7 +149,9 @@ exports.getDeliveryCharges = async (req, res) => {
       });
     }
 
-    const result = await getDeliveryChargesForActiveProvider(pincode, parseFloat(weight));
+    const result = await getDeliveryChargesForActiveProvider(pincode, parseFloat(weight), {
+      storefront: req.storefront || 'ecomm'
+    });
 
     return res.status(200).json({
       success: true,

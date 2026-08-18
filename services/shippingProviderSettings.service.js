@@ -6,7 +6,27 @@ const {
 } = require('../constants/shippingProviders');
 const logger = require('../utils/logger');
 
-const SINGLETON_KEY = 'default';
+const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
+const LEGACY_SINGLETON_KEY = 'default';
+
+function normalizeStorefront(value) {
+  const s = String(value || 'ecomm').toLowerCase().trim();
+  return VALID_STOREFRONTS.has(s) ? s : 'ecomm';
+}
+
+function cloneShipmozo(src) {
+  return {
+    enabled: src?.enabled !== false,
+    publicKey: null,
+    privateKey: null,
+    warehouseId: src?.warehouseId || String(process.env.SHIPMOZO_WAREHOUSE_ID || '').trim() || null,
+    pickupPincode:
+      String(src?.pickupPincode || process.env.SHIPMOZO_PICKUP_PINCODE || '')
+        .replace(/\D/g, '')
+        .slice(0, 6) || null,
+    warehouseAddressTitle: src?.warehouseAddressTitle || null
+  };
+}
 
 /**
  * API keys are env-only (never accepted from admin panel / DB write path).
@@ -102,43 +122,61 @@ function toRuntimeConfig(doc) {
   };
 }
 
-async function getOrCreateSettings() {
-  let doc = await ShippingProviderSettings.findOne({ key: SINGLETON_KEY });
+async function getOrCreateSettings(storefront) {
+  const sf = normalizeStorefront(storefront);
+  let doc = await ShippingProviderSettings.findOne({ storefront: sf });
   if (doc) return doc;
 
-  try {
-    doc = await ShippingProviderSettings.create({
-      key: SINGLETON_KEY,
-      activeProvider: DEFAULT_SHIPPING_PROVIDER,
-      shipmozo: {
-        enabled: true,
-        publicKey: null,
-        privateKey: null,
-        warehouseId: String(process.env.SHIPMOZO_WAREHOUSE_ID || '').trim() || null,
-        pickupPincode:
-          String(process.env.SHIPMOZO_PICKUP_PINCODE || '')
-            .replace(/\D/g, '')
-            .slice(0, 6) || null,
-        warehouseAddressTitle: null
+  const legacy = await ShippingProviderSettings.findOne({
+    $or: [{ key: LEGACY_SINGLETON_KEY }, { storefront: { $exists: false } }, { storefront: null }]
+  }).sort({ updatedAt: -1 });
+
+  if (sf === 'ecomm' && legacy && !legacy.storefront) {
+    try {
+      legacy.storefront = 'ecomm';
+      legacy.key = null;
+      await legacy.save();
+      logger.info('[shippingProviderSettings] Migrated legacy singleton to storefront=ecomm');
+      return legacy;
+    } catch (err) {
+      if (err?.code === 11000) {
+        return ShippingProviderSettings.findOne({ storefront: 'ecomm' });
       }
+      throw err;
+    }
+  }
+
+  const template = (await ShippingProviderSettings.findOne({ storefront: 'ecomm' })) || legacy;
+  const seed = {
+    storefront: sf,
+    activeProvider: normalizeShippingProvider(template?.activeProvider) || DEFAULT_SHIPPING_PROVIDER,
+    shipmozo: cloneShipmozo(template?.shipmozo)
+  };
+
+  try {
+    doc = await ShippingProviderSettings.create(seed);
+    logger.info('[shippingProviderSettings] Created storefront settings', {
+      storefront: sf,
+      clonedFrom: template?.storefront || 'legacy-or-defaults'
     });
-    logger.info('[shippingProviderSettings] Created default settings (active=shiprocket)');
     return doc;
   } catch (err) {
     if (err?.code === 11000) {
-      return ShippingProviderSettings.findOne({ key: SINGLETON_KEY });
+      return ShippingProviderSettings.findOne({ storefront: sf });
     }
     throw err;
   }
 }
 
-async function getPublicConfig() {
-  const doc = await getOrCreateSettings();
-  return toPublicConfig(doc);
+async function getPublicConfig(storefront) {
+  const doc = await getOrCreateSettings(storefront);
+  const config = toPublicConfig(doc);
+  config.storefront = normalizeStorefront(storefront);
+  return config;
 }
 
-async function getRuntimeConfig() {
-  const doc = await getOrCreateSettings();
+async function getRuntimeConfig(storefront) {
+  const doc = await getOrCreateSettings(storefront);
   return toRuntimeConfig(doc);
 }
 
@@ -146,8 +184,8 @@ async function getRuntimeConfig() {
  * Provider used for NEW checkout / place-order. Falls back to shiprocket if
  * shipmozo is active but not ready (keys/warehouse/pin missing).
  */
-async function getActiveProviderForNewOrders() {
-  const runtime = await getRuntimeConfig();
+async function getActiveProviderForNewOrders(storefront) {
+  const runtime = await getRuntimeConfig(storefront);
   if (runtime.activeProvider === SHIPPING_PROVIDERS.SHIPMOZO) {
     const sm = runtime.shipmozo;
     if (
@@ -176,8 +214,9 @@ async function getActiveProviderForNewOrders() {
 /**
  * @param {object} body
  * @param {string|null} updatedByUserId
+ * @param {string} storefront
  */
-async function applyAdminPatch(body, updatedByUserId) {
+async function applyAdminPatch(body, updatedByUserId, storefront) {
   if (!body || typeof body !== 'object') {
     return { ok: false, errors: ['Request body is required'] };
   }
@@ -236,7 +275,7 @@ async function applyAdminPatch(body, updatedByUserId) {
     return { ok: false, errors };
   }
 
-  const current = await getOrCreateSettings();
+  const current = await getOrCreateSettings(storefront);
   const $set = {
     updatedBy: updatedByUserId || null
   };
@@ -315,7 +354,7 @@ async function applyAdminPatch(body, updatedByUserId) {
   }
 
   const doc = await ShippingProviderSettings.findOneAndUpdate(
-    { key: SINGLETON_KEY },
+    { storefront: normalizeStorefront(storefront) },
     { $set },
     { new: true, runValidators: true }
   );
@@ -328,11 +367,35 @@ async function applyAdminPatch(body, updatedByUserId) {
   }
 
   logger.info('[shippingProviderSettings] Updated', {
+    storefront: normalizeStorefront(storefront),
     activeProvider: doc.activeProvider,
     updatedBy: updatedByUserId || null
   });
 
-  return { ok: true, config: toPublicConfig(doc) };
+  return { ok: true, config: { ...toPublicConfig(doc), storefront: normalizeStorefront(storefront) } };
+}
+
+async function ensurePerStorefrontIndexes(mongooseConnection) {
+  const db = mongooseConnection?.connection?.db;
+  if (!db) return;
+  const col = db.collection('shippingprovidersettings');
+  let indexes = [];
+  try {
+    indexes = await col.indexes();
+  } catch (_) {
+    return;
+  }
+  for (const idx of indexes) {
+    const keys = Object.keys(idx.key || {});
+    if (idx.unique && keys.length === 1 && keys[0] === 'key') {
+      try {
+        await col.dropIndex(idx.name);
+        logger.info('[shippingProviderSettings] dropped legacy unique key index', { name: idx.name });
+      } catch (err) {
+        logger.warn('[shippingProviderSettings] could not drop key index', { message: err?.message });
+      }
+    }
+  }
 }
 
 module.exports = {
@@ -347,5 +410,6 @@ module.exports = {
   resolveShipmozoKeysFromEnv,
   resolveShipmozoPickupPincode,
   resolveShipmozoWarehouseId,
-  SINGLETON_KEY
+  normalizeStorefront,
+  ensurePerStorefrontIndexes
 };

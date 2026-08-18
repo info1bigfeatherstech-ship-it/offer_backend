@@ -17,7 +17,8 @@ function jsonError(res, status, code, message, extra = {}) {
  */
 exports.getAdminShippingProviderSettings = async (req, res) => {
   try {
-    const config = await shippingProviderSettingsService.getPublicConfig();
+    const storefront = req.adminScope?.storefront || req.storefront || 'ecomm';
+    const config = await shippingProviderSettingsService.getPublicConfig(storefront);
     return res.json({ success: true, data: config });
   } catch (error) {
     logger.error(
@@ -33,9 +34,11 @@ exports.getAdminShippingProviderSettings = async (req, res) => {
  */
 exports.updateAdminShippingProviderSettings = async (req, res) => {
   try {
+    const storefront = req.adminScope?.storefront || req.storefront || 'ecomm';
     const result = await shippingProviderSettingsService.applyAdminPatch(
       req.body || {},
-      req.userId || null
+      req.userId || null,
+      storefront
     );
     if (!result.ok) {
       return jsonError(res, 400, 'SHIPPING_SETTINGS_INVALID', result.errors?.[0] || 'Invalid settings', {
@@ -79,7 +82,8 @@ exports.listShipmozoWarehouses = async (req, res) => {
  */
 exports.testShipmozoConnection = async (req, res) => {
   try {
-    const configured = await ShipmozoService.isConfigured();
+    const storefront = req.adminScope?.storefront || req.storefront || 'ecomm';
+    const configured = await ShipmozoService.isConfigured(storefront);
     if (!configured) {
       return jsonError(
         res,

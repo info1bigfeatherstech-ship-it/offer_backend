@@ -44,30 +44,46 @@ function evaluateWholesaleTransactionalAccess(req) {
   return { allowed: false, reason: 'denied' };
 }
 
+function evaluateEcommTransactionalAccess(req) {
+  const userType = String(req?.userType || '').trim().toLowerCase();
+  if (userType === 'wholesaler') {
+    return { allowed: false, reason: 'wholesaler_on_ecomm' };
+  }
+  return { allowed: true, reason: 'ecomm_customer' };
+}
+
 /**
  * Option B policy (updated):
  * Wholesale storefront transactional APIs are for wholesaler buyers OR order staff.
- * Prevents retail / product_manager identity from using wholesale cart/checkout/order flows.
+ * Ecomm storefront transactional APIs reject wholesale customer tokens.
  */
 function requireWholesaleUserForWholesaleStorefront(req, res, next) {
   try {
     const storefront = req.storefront || resolveStorefront(req);
     req.storefront = storefront;
 
-    if (storefront !== 'wholesale') {
-      return next();
+    if (storefront === 'wholesale') {
+      const decision = evaluateWholesaleTransactionalAccess(req);
+      if (decision.allowed) {
+        return next();
+      }
+      return res.status(403).json({
+        success: false,
+        code: 'STOREFRONT_SCOPE_FORBIDDEN',
+        message: 'Wholesale storefront checkout is allowed only for wholesaler accounts.'
+      });
     }
 
-    const decision = evaluateWholesaleTransactionalAccess(req);
-    if (decision.allowed) {
-      return next();
+    const ecommDecision = evaluateEcommTransactionalAccess(req);
+    if (!ecommDecision.allowed) {
+      return res.status(403).json({
+        success: false,
+        code: 'STOREFRONT_SCOPE_FORBIDDEN',
+        message: 'This wholesale account cannot use the e-commerce storefront. Please login on the wholesale app.'
+      });
     }
 
-    return res.status(403).json({
-      success: false,
-      code: 'STOREFRONT_SCOPE_FORBIDDEN',
-      message: 'Wholesale storefront checkout is allowed only for wholesaler accounts.'
-    });
+    return next();
   } catch (err) {
     logger.error('[storefront] requireWholesaleUserForWholesaleStorefront failed', {
       message: err?.message || String(err),
@@ -84,5 +100,6 @@ function requireWholesaleUserForWholesaleStorefront(req, res, next) {
 module.exports = {
   resolveStorefrontMiddleware,
   requireWholesaleUserForWholesaleStorefront,
-  evaluateWholesaleTransactionalAccess
+  evaluateWholesaleTransactionalAccess,
+  evaluateEcommTransactionalAccess
 };

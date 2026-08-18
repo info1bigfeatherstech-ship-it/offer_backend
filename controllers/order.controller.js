@@ -1033,8 +1033,8 @@ exports.createOrder = async (req, res) => {
         }
 
         const userId = req.userId;
-        const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
         const storefront = req.storefront || 'ecomm';
+        const finalUserType = storefront === 'wholesale' ? 'wholesaler' : 'normal';
         const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
         if (!normalizedPaymentMethod) {
             throw createInvalidPaymentMethodError();
@@ -1423,7 +1423,7 @@ exports.createOrder = async (req, res) => {
             null;
         if (orderShippingProvider !== 'shipmozo' && orderShippingProvider !== 'shiprocket') {
             try {
-                orderShippingProvider = await shippingProviderSettingsService.getActiveProviderForNewOrders();
+                orderShippingProvider = await shippingProviderSettingsService.getActiveProviderForNewOrders(storefront);
             } catch (_) {
                 orderShippingProvider = SHIPPING_PROVIDERS.SHIPROCKET;
             }

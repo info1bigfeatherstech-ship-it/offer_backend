@@ -2,19 +2,24 @@ const mongoose = require('mongoose');
 const { SHIPPING_PROVIDERS } = require('../constants/shippingProviders');
 
 /**
- * Singleton shipping-partner settings (one doc).
- * activeProvider applies only to NEW checkout / place-order flows.
+ * Per-storefront shipping-partner settings.
+ * activeProvider applies only to NEW checkout / place-order on that storefront.
  * Existing orders keep order.shippingProvider forever.
  */
 const shippingProviderSettingsSchema = new mongoose.Schema(
   {
-    /** Singleton key — always "default" */
-    key: {
+    storefront: {
       type: String,
+      enum: ['ecomm', 'wholesale'],
       required: true,
       unique: true,
-      default: 'default',
-      immutable: true
+      index: true
+    },
+    /** @deprecated singleton leftover — no longer unique */
+    key: {
+      type: String,
+      default: null,
+      trim: true
     },
     activeProvider: {
       type: String,
@@ -23,20 +28,11 @@ const shippingProviderSettingsSchema = new mongoose.Schema(
       required: true
     },
     shipmozo: {
-      /** When false, cannot activate shipmozo even if keys exist in env */
       enabled: { type: Boolean, default: true },
-      /** Optional override; env SHIPMOZO_PUBLIC_KEY used when empty */
       publicKey: { type: String, default: null, trim: true },
-      /** Optional override; env SHIPMOZO_PRIVATE_KEY used when empty */
       privateKey: { type: String, default: null, trim: true },
-      /** Shipmozo warehouse id from get-warehouses / create-warehouse */
       warehouseId: { type: String, default: null, trim: true },
-      /**
-       * Pickup pincode for Shipmozo rate/serviceability.
-       * Independent from STORE_PINCODE / PICKUP_PINCODE (Shiprocket-only).
-       */
       pickupPincode: { type: String, default: null, trim: true },
-      /** Optional warehouse address title for create-warehouse */
       warehouseAddressTitle: { type: String, default: null, trim: true }
     },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }

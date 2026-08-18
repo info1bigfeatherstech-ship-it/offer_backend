@@ -11,6 +11,16 @@ const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
 const { setOrUnsetUniqueString } = require('../utils/optionalUniqueContact');
+const {
+  ACCOUNT_SCOPES,
+  PRIVILEGED_OPERATIONAL_ROLES,
+  isPrivilegedAccount: isPrivilegedAccountByScope,
+  isWholesalerAccount,
+  buildCustomerLookup,
+  buildCustomerContactLookup,
+  buildStaffContactLookup,
+  customerScopeFromStorefront
+} = require('../utils/accountScope');
 
 // Import from OTP service
 const {
@@ -89,12 +99,6 @@ const PASSWORD_RESET_FIND_MAX_ATTEMPTS = 3;
 const PASSWORD_RESET_FIND_WINDOW_SECONDS = 24 * 60 * 60;
 const PASSWORD_RESET_FIND_GENERIC_MESSAGE =
   'If this phone number is registered with us, you can continue to reset your password.';
-const PRIVILEGED_OPERATIONAL_ROLES = new Set([
-  'admin',
-  'product_manager',
-  'order_manager',
-  'marketing_manager'
-]);
 const SUPPORTED_LOGIN_PORTALS = new Set(['ecomm', 'wholesale', 'admin-ecomm', 'admin-wholesale']);
 const respondAuthError = (res, statusCode, code, message, extras = {}) =>
   res.status(statusCode).json({
@@ -128,7 +132,8 @@ const generateRefreshToken = (userId) => {
 
 const hashToken = refreshTokenSession.hashRefreshToken;
 
-const getPasswordResetFindKey = (phone) => `pwd_reset_find:${phone}`;
+const getPasswordResetFindKey = (phone, scope = ACCOUNT_SCOPES.ECOMM) =>
+  `pwd_reset_find:${scope}:${phone}`;
 const getPasswordResetTokenKey = (jti) => `pwd_reset_token:${jti}`;
 
 /**
@@ -143,7 +148,7 @@ const consumePasswordResetFindAttempt = async (phone) => {
   }
 
   const redis = redisManager.getClient();
-  const key = getPasswordResetFindKey(phone);
+  const key = getPasswordResetFindKey(phone, ACCOUNT_SCOPES.ECOMM);
   const count = await redis.incr(key);
   if (count === 1) {
     await redis.expire(key, PASSWORD_RESET_FIND_WINDOW_SECONDS);
@@ -159,7 +164,7 @@ const consumePasswordResetFindAttempt = async (phone) => {
 const clearPasswordResetFindAttempts = async (phone) => {
   if (!phone || !redisManager.isReady()) return;
   try {
-    await redisManager.getClient().del(getPasswordResetFindKey(phone));
+    await redisManager.getClient().del(getPasswordResetFindKey(phone, ACCOUNT_SCOPES.ECOMM));
   } catch (err) {
     console.error('[ForgotPassword] Failed clearing find-user rate limit:', err?.message || err);
   }
@@ -351,15 +356,29 @@ const listRefreshCookieCandidates = (req, preferredPortal) => {
 
 const resolveRefreshSession = (refreshToken) => refreshTokenSession.lookupSession(refreshToken);
 
-const isPrivilegedRole = (role) => {
-  return PRIVILEGED_OPERATIONAL_ROLES.has(String(role || '').trim().toLowerCase());
+const isPrivilegedAccount = (user) => isPrivilegedAccountByScope(user);
+
+const resolveCustomerAuthScope = (req) => {
+  const portal = normalizePortal(req?.body?.portal || req?.headers?.['x-auth-portal']);
+  if (portal === 'wholesale' || portal === 'admin-wholesale') return ACCOUNT_SCOPES.WHOLESALE;
+  if (portal === 'ecomm' || portal === 'admin-ecomm') return ACCOUNT_SCOPES.ECOMM;
+  return customerScopeFromStorefront(req?.storefront);
 };
 
-const isPrivilegedAccount = (user) => {
-  if (!user) return false;
-  const userType = String(user.userType || '').trim().toLowerCase();
-  if (userType === 'admin') return true;
-  return isPrivilegedRole(user.role);
+const handleDuplicateContactError = (res, error, fallbackMessage) => {
+  if (error?.code !== 11000) return false;
+  const key = Object.keys(error.keyPattern || {})[0] || 'contact';
+  respondAuthError(
+    res,
+    409,
+    'DUPLICATE_CONTACT',
+    key === 'phone'
+      ? 'An account with this phone number already exists on this storefront.'
+      : key === 'email'
+        ? 'An account with this email already exists on this storefront.'
+        : fallbackMessage || 'This contact is already registered on this storefront.'
+  );
+  return true;
 };
 
 /**
@@ -384,36 +403,42 @@ const logPrivilegedPasswordResetBlocked = (flow, user) => {
 
 const buildLoginUserLookup = (identifier, portal) => {
   const trimmedIdentifier = String(identifier || '').trim();
-  const query = {
-    $or: [{ email: trimmedIdentifier }, { phone: trimmedIdentifier }]
-  };
+  const looksLikeEmail = trimmedIdentifier.includes('@');
+  const normalizedIdentifier = looksLikeEmail ? trimmedIdentifier.toLowerCase() : trimmedIdentifier;
+  const identifierClause = looksLikeEmail
+    ? { email: normalizedIdentifier }
+    : /^\d{10}$/.test(normalizedIdentifier)
+      ? { phone: normalizedIdentifier }
+      : { $or: [{ email: normalizedIdentifier.toLowerCase() }, { phone: normalizedIdentifier }] };
 
   if (portal === 'admin-ecomm' || portal === 'admin-wholesale') {
     const requestedStorefront = portal === 'admin-wholesale' ? 'wholesale' : 'ecomm';
-    query.$and = [
-      {
-        $or: [
-          { userType: 'admin' },
-          { role: { $in: Array.from(PRIVILEGED_OPERATIONAL_ROLES) } }
-        ]
-      },
-      {
-        $or: [
-          { allowedStorefronts: requestedStorefront },
-          { allowedStorefronts: { $exists: false } },
-          { allowedStorefronts: [] }
-        ]
-      }
-    ];
-  } else if (portal === 'wholesale') {
-    query.$and = [
-      {
-        $or: [{ userType: 'wholesaler' }, { role: 'wholesaler' }]
-      }
-    ];
+    return {
+      $and: [
+        identifierClause,
+        {
+          $or: [
+            { accountScope: ACCOUNT_SCOPES.STAFF },
+            { userType: 'admin' },
+            { role: { $in: Array.from(PRIVILEGED_OPERATIONAL_ROLES) } }
+          ]
+        },
+        {
+          $or: [
+            { allowedStorefronts: requestedStorefront },
+            { allowedStorefronts: { $exists: false } },
+            { allowedStorefronts: [] }
+          ]
+        }
+      ]
+    };
   }
 
-  return query;
+  if (portal === 'wholesale') {
+    return buildCustomerLookup(normalizedIdentifier, ACCOUNT_SCOPES.WHOLESALE);
+  }
+
+  return buildCustomerLookup(normalizedIdentifier, ACCOUNT_SCOPES.ECOMM);
 };
 
 const canLoginForPortal = (user, portal) => {
@@ -437,7 +462,7 @@ const canLoginForPortal = (user, portal) => {
   const normalizedAllowedStorefronts = normalizeAllowedStorefronts(user.allowedStorefronts);
 
   if (portal === 'ecomm') {
-    if (privileged) {
+    if (privileged || isWholesalerAccount(user)) {
       return {
         allowed: false,
         code: 'PORTAL_ACCESS_DENIED',
@@ -448,10 +473,7 @@ const canLoginForPortal = (user, portal) => {
   }
 
   if (portal === 'wholesale') {
-    const isWholesaler =
-      String(user.userType || '').trim().toLowerCase() === 'wholesaler' ||
-      String(user.role || '').trim().toLowerCase() === 'wholesaler';
-    if (!isWholesaler || privileged) {
+    if (!isWholesalerAccount(user) || privileged) {
       return {
         allowed: false,
         code: 'PORTAL_ACCESS_DENIED',
@@ -563,16 +585,29 @@ const register = async (req, res) => {
         are rejected with ACCOUNT_CONFLICT instead of unsafe auto-merge
     */
 
-    const [existingPhoneUser, existingEmailUser] = await Promise.all([
-      User.findOne({ phone: normalizedPhone }).select(
-        "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
+    const [existingPhoneUser, existingEmailUser, reservedPhone, reservedEmail] = await Promise.all([
+      User.findOne(buildCustomerContactLookup({ phone: normalizedPhone }, ACCOUNT_SCOPES.ECOMM)).select(
+        "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role accountScope isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
       ),
       normalizedEmail
-        ? User.findOne({ email: normalizedEmail }).select(
-            "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
+        ? User.findOne(buildCustomerContactLookup({ email: normalizedEmail }, ACCOUNT_SCOPES.ECOMM)).select(
+            "+phoneVerificationOTP +phoneVerificationOTPExpires +emailVerificationOTP +emailVerificationOTPExpires name email phone userType role accountScope isPhoneVerified isEmailVerified status isProfileComplete registrationMethod"
           )
+        : Promise.resolve(null),
+      User.findOne(buildStaffContactLookup({ phone: normalizedPhone })).select('_id userType role accountScope'),
+      normalizedEmail
+        ? User.findOne(buildStaffContactLookup({ email: normalizedEmail })).select('_id userType role accountScope')
         : Promise.resolve(null)
     ]);
+
+    if (reservedPhone || reservedEmail) {
+      return respondAuthError(
+        res,
+        409,
+        'IDENTITY_RESERVED_FOR_PRIVILEGED',
+        'This email or phone belongs to a staff account and cannot be used here.'
+      );
+    }
 
     if (existingPhoneUser && isVerifiedUserRecord(existingPhoneUser)) {
       return respondAuthError(res, 409, 'PHONE_ALREADY_REGISTERED', 'User with this phone number already exists. Please login.');
@@ -596,15 +631,17 @@ const register = async (req, res) => {
 
     const user = phoneOrphan || emailOrphan || new User({
       userType: 'user',
-      role: 'user'
+      role: 'user',
+      accountScope: ACCOUNT_SCOPES.ECOMM
     });
 
     user.name = name;
     setOrUnsetUniqueString(user, 'email', normalizedEmail);
     user.phone = normalizedPhone;
     user.password = password;
-    user.userType = user.userType || 'user';
-    user.role = user.role || 'user';
+    user.userType = 'user';
+    user.role = user.role && user.role !== 'wholesaler' ? user.role : 'user';
+    user.accountScope = ACCOUNT_SCOPES.ECOMM;
     user.status = 'active';
     user.isPhoneVerified = true;
     user.isEmailVerified = Boolean(normalizedEmail);
@@ -632,6 +669,9 @@ const register = async (req, res) => {
     return res.status(200).json(buildRegisterLoginPayload(user, accessToken));
 
   } catch (error) {
+    if (handleDuplicateContactError(res, error, 'This contact is already registered on this storefront.')) {
+      return;
+    }
     console.error('Registration error:', error);
     return respondAuthError(res, 500, 'REGISTRATION_FAILED', 'Error during registration', { error: error.message });
   }
@@ -800,8 +840,13 @@ const login = async (req, res) => {
     const { identifier, password } = req.body;
     const portal = normalizePortal(req.body.portal || req.headers['x-auth-portal']);
 
-    const user = await User.findOne(buildLoginUserLookup(identifier, portal))
-      .select("+password name email phone userType role allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
+    const loginQuery = buildLoginUserLookup(identifier, portal);
+    if (!loginQuery) {
+      return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
+    }
+
+    const user = await User.findOne(loginQuery)
+      .select("+password name email phone userType role accountScope allowedStorefronts isPhoneVerified isEmailVerified status isProfileComplete");
 
     if (!user) {
       return respondAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
@@ -910,7 +955,7 @@ const findUserForPasswordReset = async (req, res) => {
       );
     }
 
-    const user = await User.findOne({ phone }).select('_id phone email name status userType role');
+    const user = await User.findOne(buildCustomerContactLookup({ phone }, ACCOUNT_SCOPES.ECOMM)).select('_id phone email name status userType role accountScope');
 
     // Generic response whether or not the account exists (anti-enumeration).
     // Privileged/staff accounts are treated as "not found" on customer UI —
@@ -1044,6 +1089,13 @@ const resetPasswordDirect = async (req, res) => {
 
 // Live wrappers kept so wholesaleFrontend OTP forgot-password continues to work
 // until that app is migrated. Ecomm no longer uses these.
+const findScopedCustomerForReset = (identifier, req, extraSelect = '') => {
+  const scope = resolveCustomerAuthScope(req);
+  const query = buildCustomerLookup(identifier, scope);
+  if (!query) return Promise.resolve(null);
+  return User.findOne(query).select(extraSelect);
+};
+
 const sendPasswordResetOTP = async (req, res) => {
   try {
     const { identifier } = req.body;
@@ -1052,12 +1104,11 @@ const sendPasswordResetOTP = async (req, res) => {
       return respondAuthError(res, 400, 'IDENTIFIER_REQUIRED', 'Email or phone number is required');
     }
 
-    const user = await User.findOne({
-      $or: [
-        { email: identifier },
-        { phone: identifier }
-      ]
-    }).select('_id email phone userType role +passwordResetOTP +passwordResetOTPExpires');
+    const user = await findScopedCustomerForReset(
+      identifier,
+      req,
+      '_id email phone userType role accountScope +passwordResetOTP +passwordResetOTPExpires'
+    );
 
     // Generic success whether missing OR privileged — never send OTP to staff
     // via customer forgot-password UI.
@@ -1118,12 +1169,11 @@ const verifyPasswordResetOTP = async (req, res) => {
       return respondAuthError(res, 400, 'IDENTIFIER_OTP_REQUIRED', 'Identifier and OTP are required');
     }
 
-    const user = await User.findOne({
-      $or: [
-        { email: identifier },
-        { phone: identifier }
-      ]
-    }).select("+passwordResetOTP +passwordResetOTPExpires userType role");
+    const user = await findScopedCustomerForReset(
+      identifier,
+      req,
+      '+passwordResetOTP +passwordResetOTPExpires userType role accountScope'
+    );
 
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
@@ -1174,12 +1224,11 @@ const resetPasswordWithOTP = async (req, res) => {
       return respondAuthError(res, 400, 'PASSWORD_TOO_SHORT', 'Password must be at least 6 characters');
     }
 
-    const user = await User.findOne({
-      $or: [
-        { email: identifier },
-        { phone: identifier }
-      ]
-    }).select("+passwordResetOTP +passwordResetOTPExpires +password userType role");
+    const user = await findScopedCustomerForReset(
+      identifier,
+      req,
+      '+passwordResetOTP +passwordResetOTPExpires +password userType role accountScope'
+    );
 
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
@@ -1543,33 +1592,63 @@ const googleAuth = async (req, res) => {
     }
 
     const { sub: googleId, email, name = "" } = payload;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
-    let user = await User.findOne({ email });
+    const reserved = await User.findOne(buildStaffContactLookup({ email: normalizedEmail })).select('_id');
+    if (reserved) {
+      return respondAuthError(
+        res,
+        409,
+        'IDENTITY_RESERVED_FOR_PRIVILEGED',
+        'This Google email belongs to a staff account and cannot be used here.'
+      );
+    }
+
+    let user = await User.findOne(
+      buildCustomerContactLookup({ email: normalizedEmail }, ACCOUNT_SCOPES.ECOMM)
+    );
 
     if (user) {
+      if (isWholesalerAccount(user) || isPrivilegedAccount(user)) {
+        return respondAuthError(
+          res,
+          403,
+          'PORTAL_ACCESS_DENIED',
+          'This account is not allowed to login from the ecomm user portal.'
+        );
+      }
       if (!user.googleId) user.googleId = googleId;
       user.isEmailVerified = true;
       user.status = "active";
+      user.accountScope = ACCOUNT_SCOPES.ECOMM;
     } else {
       user = new User({
         googleId,
-        email,
+        email: normalizedEmail,
         name,
         isEmailVerified: true,
         status: "active",
         userType: "user",
+        role: "user",
+        accountScope: ACCOUNT_SCOPES.ECOMM,
         registrationMethod: "google"
       });
     }
 
-  const accessToken = generateAccessToken(user._id, user.userType, user.role);
-const refreshToken = generateRefreshToken(user._id);
-const hashedRefreshToken = hashToken(refreshToken);
+  const accessToken = generateAccessToken(user._id, user.userType, user.role, 'ecomm');
+  const refreshToken = generateRefreshToken(user._id);
+  const hashedRefreshToken = hashToken(refreshToken);
 
-// Get device info
-const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
+  const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
 
-await user.save();
+  try {
+    await user.save();
+  } catch (saveErr) {
+    if (handleDuplicateContactError(res, saveErr, 'This Google email is already registered on e-commerce.')) {
+      return;
+    }
+    throw saveErr;
+  }
 
 await refreshTokenSession.appendSession(user._id, {
   hashedToken: hashedRefreshToken,
