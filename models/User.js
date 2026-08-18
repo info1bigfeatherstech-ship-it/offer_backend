@@ -1,6 +1,7 @@
 
 const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
+const { deriveAccountScope, ACCOUNT_SCOPES } = require("../utils/accountScope");
 
 const userSchema = new mongoose.Schema(
   {
@@ -171,6 +172,17 @@ const userSchema = new mongoose.Schema(
       default: "user"
     },
 
+    /**
+     * Identity partition: ecomm / wholesale / staff.
+     * Same email+phone may exist on ecomm AND wholesale as two documents.
+     */
+    accountScope: {
+      type: String,
+      enum: Object.values(ACCOUNT_SCOPES),
+      default: ACCOUNT_SCOPES.ECOMM,
+      index: true
+    },
+
     role: {
       type: String,
       enum: [
@@ -198,33 +210,43 @@ const userSchema = new mongoose.Schema(
 );
 
 // ================= INDEXES =================
-// Partial unique: many users may omit email/phone; only real non-empty values collide.
+// Unique per storefront/staff scope — NOT globally unique.
 userSchema.index(
-  { email: 1 },
+  { email: 1, accountScope: 1 },
   {
     unique: true,
-    name: 'email_unique_partial',
-    partialFilterExpression: { email: { $type: 'string', $gt: '' } }
+    name: "email_accountScope_unique_partial",
+    partialFilterExpression: {
+      email: { $type: "string", $gt: "" },
+      accountScope: { $type: "string", $gt: "" }
+    }
   }
 );
 userSchema.index(
-  { phone: 1 },
+  { phone: 1, accountScope: 1 },
   {
     unique: true,
-    name: 'phone_unique_partial',
-    partialFilterExpression: { phone: { $type: 'string', $gt: '' } }
+    name: "phone_accountScope_unique_partial",
+    partialFilterExpression: {
+      phone: { $type: "string", $gt: "" },
+      accountScope: { $type: "string", $gt: "" }
+    }
   }
 );
 userSchema.index(
-  { googleId: 1 },
+  { googleId: 1, accountScope: 1 },
   {
     unique: true,
-    name: 'googleId_unique_partial',
-    partialFilterExpression: { googleId: { $type: 'string', $gt: '' } }
+    name: "googleId_accountScope_unique_partial",
+    partialFilterExpression: {
+      googleId: { $type: "string", $gt: "" },
+      accountScope: { $type: "string", $gt: "" }
+    }
   }
 );
-userSchema.index({ email: 1, phone: 1 }); // Compound index for login lookup
+userSchema.index({ email: 1, phone: 1 });
 userSchema.index({ registrationMethod: 1 });
+userSchema.index({ accountScope: 1, userType: 1 });
 
 /**
  * Never persist empty/null on unique contact fields — otherwise a legacy
@@ -240,6 +262,7 @@ userSchema.pre('save', function clearEmptyUniqueContacts() {
       }
     }
   }
+  this.accountScope = deriveAccountScope(this);
 });
 
 // ================= PASSWORD HASH =================
@@ -258,13 +281,11 @@ userSchema.methods.comparePassword = async function (enteredPassword) {
 };
 
 // ================= HELPER: Find user by email or phone =================
-userSchema.statics.findByIdentifier = async function(identifier) {
-  return await this.findOne({
-    $or: [
-      { email: identifier.toLowerCase() },
-      { phone: identifier }
-    ]
-  });
+userSchema.statics.findByIdentifier = async function(identifier, scope = ACCOUNT_SCOPES.ECOMM) {
+  const { buildCustomerLookup } = require("../utils/accountScope");
+  const query = buildCustomerLookup(identifier, scope);
+  if (!query) return null;
+  return this.findOne(query);
 };
 
 module.exports = mongoose.model("User", userSchema);

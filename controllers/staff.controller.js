@@ -556,6 +556,7 @@ const createStaff = async (req, res) => {
       password,
       role,
       userType: 'user',
+      accountScope: 'staff',
       isEmailVerified: true,
       isPhoneVerified: true,
       isProfileComplete: true,

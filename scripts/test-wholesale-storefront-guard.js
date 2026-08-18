@@ -4,7 +4,8 @@
  */
 const assert = require('assert');
 const {
-  evaluateWholesaleTransactionalAccess
+  evaluateWholesaleTransactionalAccess,
+  evaluateEcommTransactionalAccess
 } = require('../middlewares/storefront.middleware');
 
 function req(partial = {}) {
@@ -40,5 +41,7 @@ assert.strictEqual(
   false
 );
 assert.strictEqual(evaluateWholesaleTransactionalAccess(req({ userType: 'user', role: 'user' })).allowed, false);
+assert.strictEqual(evaluateEcommTransactionalAccess(req({ userType: 'user' })).allowed, true);
+assert.strictEqual(evaluateEcommTransactionalAccess(req({ userType: 'wholesaler' })).allowed, false);
 
 console.log('OK: wholesale storefront guard (wholesaler + order staff only)');

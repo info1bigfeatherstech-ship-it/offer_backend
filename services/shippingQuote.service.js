@@ -85,17 +85,22 @@ function sanitizeCustomerFacingDeliveryResult(result, provider) {
  */
 async function checkDeliveryAvailabilityForActiveProvider(deliveryPincode, opts = {}) {
   let provider = SHIPPING_PROVIDERS.SHIPROCKET;
+  const storefront = opts.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
   try {
-    provider = await shippingProviderSettingsService.getActiveProviderForNewOrders();
+    provider = await shippingProviderSettingsService.getActiveProviderForNewOrders(storefront);
   } catch (err) {
     logger.error('[shippingQuote] Failed to resolve active provider — using shiprocket', {
-      message: err.message
+      message: err.message,
+      storefront
     });
     provider = SHIPPING_PROVIDERS.SHIPROCKET;
   }
 
   if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {
-    const result = await ShipmozoService.checkDeliveryAvailability(deliveryPincode, opts);
+    const result = await ShipmozoService.checkDeliveryAvailability(deliveryPincode, {
+      ...opts,
+      storefront
+    });
     return sanitizeCustomerFacingDeliveryResult({
       ...result,
       provider: SHIPPING_PROVIDERS.SHIPMOZO,
@@ -123,7 +128,8 @@ async function getDeliveryChargesForActiveProvider(pincode, weightKg = 1, dimens
     widthCm: dimensionOpts.widthCm,
     heightCm: dimensionOpts.heightCm,
     codAmount: dimensionOpts.codAmount,
-    orderAmount: dimensionOpts.orderAmount
+    orderAmount: dimensionOpts.orderAmount,
+    storefront: dimensionOpts.storefront
   });
   return {
     deliveryCharges: r.deliveryCharges,

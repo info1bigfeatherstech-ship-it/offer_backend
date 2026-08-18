@@ -21,6 +21,13 @@ const {
   looksLikeFullWholesalerPayload,
   wholesalerOnboardingFlags
 } = require('../utils/wholesalerOnboarding');
+const {
+  ACCOUNT_SCOPES,
+  isPrivilegedAccount,
+  isWholesalerAccount,
+  buildCustomerContactLookup,
+  buildStaffContactLookup
+} = require('../utils/accountScope');
 
 // Wholesaler activation OTP follows the same global expiry window as every
 // other OTP flow. Driven by OTP_EXPIRY_MINUTES env (default: 5 minutes).
@@ -31,7 +38,6 @@ const REFRESH_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || '7d';
 
 const OWNER_REVIEW_PURPOSE = 'wholesaler_owner_review';
 const OWNER_REVIEW_TOKEN_EXPIRES = process.env.OWNER_REVIEW_TOKEN_EXPIRES || '48h';
-const PRIVILEGED_OPERATIONAL_ROLES = new Set(['admin', 'product_manager', 'order_manager', 'marketing_manager']);
 const razorpay = new Razorpay({
   key_id: String(process.env.RAZORPAY_KEY_ID || '').trim(),
   key_secret: String(process.env.RAZORPAY_KEY_SECRET || '').trim()
@@ -527,24 +533,6 @@ function generateAccessToken(userId, userType = 'user', role = 'user', portal = 
   );
 }
 
-function isPrivilegedOperationalRole(role) {
-  return PRIVILEGED_OPERATIONAL_ROLES.has(String(role || '').trim().toLowerCase());
-}
-
-function isPrivilegedAccount(user) {
-  if (!user) return false;
-  const normalizedUserType = String(user.userType || '').trim().toLowerCase();
-  if (normalizedUserType === 'admin') return true;
-  return isPrivilegedOperationalRole(user.role);
-}
-
-function isWholesalerAccount(user) {
-  if (!user) return false;
-  const normalizedUserType = String(user.userType || '').trim().toLowerCase();
-  const normalizedRole = String(user.role || '').trim().toLowerCase();
-  return normalizedUserType === 'wholesaler' || normalizedRole === 'wholesaler';
-}
-
 function buildPrivilegedConflictPayload() {
   return {
     success: false,
@@ -681,15 +669,19 @@ exports.submitWholesalerRequest = async (req, res) => {
 
     const isLegacyFull = looksLikeFullWholesalerPayload(req.body, proofHolder);
 
-    const existingUser = await User.findOne({
-      $or: [{ phone: mobileNumber }, { email }]
-    }).select('userType role status');
+    const existingWholesaler = await User.findOne(
+      buildCustomerContactLookup({ phone: mobileNumber, email }, ACCOUNT_SCOPES.WHOLESALE)
+    ).select('userType role status accountScope');
 
-    if (isPrivilegedAccount(existingUser)) {
+    const existingStaff = await User.findOne(
+      buildStaffContactLookup({ phone: mobileNumber, email })
+    ).select('userType role status accountScope');
+
+    if (isPrivilegedAccount(existingStaff)) {
       return res.status(409).json(buildPrivilegedConflictPayload());
     }
 
-    if (isWholesalerAccount(existingUser)) {
+    if (isWholesalerAccount(existingWholesaler)) {
       return res.status(409).json(buildExistingWholesalerConflictPayload('activated'));
     }
 
@@ -1858,13 +1850,35 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       return authContractError(res, 400, 'OTP_INVALID', 'Invalid OTP');
     }
 
-    let user = await User.findOne({
-      $or: [{ phone: doc.mobileNumber }, { email: doc.email }]
-    }).select('+password +refreshTokens');
+    const reserved = await User.findOne(
+      buildStaffContactLookup({ phone: doc.mobileNumber, email: doc.email })
+    ).select('userType role accountScope');
 
-    if (isPrivilegedAccount(user)) {
+    if (isPrivilegedAccount(reserved)) {
       return res.status(409).json(buildPrivilegedConflictPayload());
     }
+
+    const existingWholesalerByPhone = await User.findOne(
+      buildCustomerContactLookup({ phone: doc.mobileNumber }, ACCOUNT_SCOPES.WHOLESALE)
+    ).select('+password +refreshTokens userType role accountScope name email phone');
+    const existingWholesalerByEmail = await User.findOne(
+      buildCustomerContactLookup({ email: doc.email }, ACCOUNT_SCOPES.WHOLESALE)
+    ).select('+password +refreshTokens userType role accountScope name email phone');
+
+    if (
+      existingWholesalerByPhone &&
+      existingWholesalerByEmail &&
+      !existingWholesalerByPhone._id.equals(existingWholesalerByEmail._id)
+    ) {
+      return authContractError(
+        res,
+        409,
+        'ACCOUNT_CONFLICT',
+        'This email and mobile belong to different wholesale accounts. Please contact support.'
+      );
+    }
+
+    let user = existingWholesalerByPhone || existingWholesalerByEmail;
 
     if (!user) {
       user = new User({
@@ -1874,20 +1888,22 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
         password,
         userType: 'wholesaler',
         role: 'wholesaler',
+        accountScope: ACCOUNT_SCOPES.WHOLESALE,
         status: 'active',
         isPhoneVerified: true,
-        isEmailVerified: false,
+        isEmailVerified: Boolean(doc.email),
         registrationMethod: 'phone',
         isProfileComplete: true,
         lastLoginMethod: 'otp'
       });
     } else {
       user.name = user.name || doc.fullName;
-      user.email = user.email || doc.email;
-      user.phone = user.phone || doc.mobileNumber;
+      if (!user.email && doc.email) user.email = doc.email;
+      if (!user.phone && doc.mobileNumber) user.phone = doc.mobileNumber;
       user.password = password;
       user.userType = 'wholesaler';
       user.role = 'wholesaler';
+      user.accountScope = ACCOUNT_SCOPES.WHOLESALE;
       user.status = 'active';
       user.isPhoneVerified = true;
       user.isProfileComplete = true;
@@ -1929,6 +1945,15 @@ exports.verifyWholesalerActivationOtp = async (req, res) => {
       }
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      return authContractError(
+        res,
+        409,
+        'WHOLESALER_CONTACT_IN_USE',
+        'A wholesale account with this email or mobile already exists.'
+      );
+    }
+    console.error('Wholesaler activation verify failed:', error?.message || error);
     return authContractError(res, 500, 'WHOLESALER_ACTIVATION_VERIFY_FAILED', 'Error verifying activation OTP');
   }
 };

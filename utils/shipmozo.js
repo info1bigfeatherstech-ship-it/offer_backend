@@ -65,12 +65,12 @@ class ShipmozoService {
     this.baseURL = String(process.env.SHIPMOZO_BASE_URL || DEFAULT_BASE).replace(/\/+$/, '');
   }
 
-  async getConfig() {
-    return shippingProviderSettingsService.getRuntimeConfig();
+  async getConfig(storefront) {
+    return shippingProviderSettingsService.getRuntimeConfig(storefront);
   }
 
-  async isConfigured() {
-    const cfg = await this.getConfig();
+  async isConfigured(storefront) {
+    const cfg = await this.getConfig(storefront);
     const sm = cfg.shipmozo || {};
     return Boolean(sm.enabled && sm.publicKey && sm.privateKey && sm.warehouseId && sm.pickupPincode);
   }
@@ -165,8 +165,8 @@ class ShipmozoService {
   /**
    * Pincode serviceability between Shipmozo warehouse pin and delivery pin.
    */
-  async checkPincodeServiceability(deliveryPincode) {
-    const cfg = await this.getConfig();
+  async checkPincodeServiceability(deliveryPincode, storefront = 'ecomm') {
+    const cfg = await this.getConfig(storefront);
     const pickup = String(cfg.shipmozo?.pickupPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
@@ -231,9 +231,10 @@ class ShipmozoService {
     lengthCm,
     widthCm,
     heightCm,
-    orderId = ''
+    orderId = '',
+    storefront = 'ecomm'
   } = {}) {
-    const cfg = await this.getConfig();
+    const cfg = await this.getConfig(storefront);
     const pickup = String(cfg.shipmozo?.pickupPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
@@ -394,6 +395,7 @@ class ShipmozoService {
    * result=1 with serviceable=false even when rate-calculator returns couriers.
    */
   async checkDeliveryAvailability(deliveryPincode, opts = {}) {
+    const storefront = opts.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
     const pincode = String(deliveryPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
@@ -433,7 +435,7 @@ class ShipmozoService {
       message: null
     };
     try {
-      svcProbe = await this.checkPincodeServiceability(pincode);
+      svcProbe = await this.checkPincodeServiceability(pincode, storefront);
     } catch (svcErr) {
       logger.warn('[Shipmozo] pincode-serviceability probe failed (continuing with rates)', {
         pincode,
@@ -450,7 +452,8 @@ class ShipmozoService {
         weightGrams: kgToGrams(weightKg),
         lengthCm,
         widthCm,
-        heightCm
+        heightCm,
+        storefront
       });
 
       if (!rates.ok) {
@@ -669,7 +672,8 @@ class ShipmozoService {
    * Push order to Shipmozo panel (admin accept).
    */
   async createShipment(order) {
-    const configured = await this.isConfigured();
+    const storefront = order?.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+    const configured = await this.isConfigured(storefront);
     if (!configured) {
       return {
         success: false,
@@ -677,7 +681,7 @@ class ShipmozoService {
       };
     }
 
-    const cfg = await this.getConfig();
+    const cfg = await this.getConfig(storefront);
     const warehouseId = String(cfg.shipmozo.warehouseId || '').trim();
     const parts = await this.buildPushOrderParts(order);
     const { addr, productDetail } = parts;
@@ -1026,6 +1030,7 @@ class ShipmozoService {
         lengthCm: parts.lengthCm,
         widthCm: parts.widthCm,
         heightCm: parts.heightCm,
+        storefront: order?.storefront === 'wholesale' ? 'wholesale' : 'ecomm',
         // Empty order_id matches working checkout/Postman rate calls.
         orderId: ''
       });
@@ -1064,7 +1069,7 @@ class ShipmozoService {
     const pin = String(addr.postalCode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
-    const cfg = await this.getConfig();
+    const cfg = await this.getConfig(order?.storefront === 'wholesale' ? 'wholesale' : 'ecomm');
     const warehouseId = String(cfg.shipmozo?.warehouseId || '').trim();
 
     const returnReasonId = Number(opts.returnReasonId || returnInfo.shipmozoReturnReasonId || 14);

@@ -272,7 +272,8 @@ const validateCoupon = async (req, res) => {
     try {
         const { couponCode, subtotal, useServercart } = req.body;
         const userId = req.userId;
-        const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
+        const storefront = req.storefront || 'ecomm';
+        const finalUserType = storefront === 'wholesale' ? 'wholesaler' : 'normal';
 
         if (!couponCode) {
             return couponError(res, 400, 'COUPON_CODE_REQUIRED', 'Coupon code is required');

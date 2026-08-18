@@ -56,6 +56,18 @@
       mongoConnection = connection;
       console.log('[MongoDB] ✓ Connected successfully');
       console.log(`[MongoDB] Database: ${connection.connection.db.databaseName}`);
+
+      try {
+        const { ensureAccountScopeIndexes } = require('../services/accountScopeIndexes.service');
+        await ensureAccountScopeIndexes(connection);
+        console.log('[MongoDB] ✓ Account-scope identity indexes ready');
+        const { ensurePerStorefrontIndexes } = require('../services/shippingProviderSettings.service');
+        await ensurePerStorefrontIndexes(connection);
+        console.log('[MongoDB] ✓ Shipping-provider storefront indexes ready');
+      } catch (indexErr) {
+        console.error('[MongoDB] Identity/shipping index migration failed:', indexErr.message);
+        throw indexErr;
+      }
       // console.log(`[MongoDB] Read Preference: secondaryPreferred`);
       // console.log(`[MongoDB] Read Preference: ${connection.connection.readPreference.mode}`);
 

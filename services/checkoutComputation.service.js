@@ -368,7 +368,8 @@ async function computeCheckoutTotals({
       widthCm: evaluated.dims.widthCm,
       heightCm: evaluated.dims.heightCm,
       codAmount: codAmountForShiprocket,
-      orderAmount: Math.max(0, evaluated.subtotal - discount)
+      orderAmount: Math.max(0, evaluated.subtotal - discount),
+      storefront
     });
 
     if (!ship.isDeliverable) {

@@ -319,14 +319,20 @@ async function sendRestockEmail(inquiry, ctx) {
 async function resolveUserIdForInquiry(inquiry) {
   if (inquiry.userId) return inquiry.userId;
   const User = require('../models/User');
+  const { buildCustomerContactLookup, customerScopeFromStorefront } = require('../utils/accountScope');
+  const scope = customerScopeFromStorefront(inquiry.storefront);
   if (inquiry.email) {
-    const byEmail = await User.findOne({ email: String(inquiry.email).toLowerCase() })
+    const byEmail = await User.findOne(
+      buildCustomerContactLookup({ email: String(inquiry.email).toLowerCase() }, scope)
+    )
       .select('_id')
       .lean();
     if (byEmail?._id) return byEmail._id;
   }
   if (inquiry.phone) {
-    const byPhone = await User.findOne({ phone: String(inquiry.phone).trim() })
+    const byPhone = await User.findOne(
+      buildCustomerContactLookup({ phone: String(inquiry.phone).trim() }, scope)
+    )
       .select('_id')
       .lean();
     if (byPhone?._id) return byPhone._id;

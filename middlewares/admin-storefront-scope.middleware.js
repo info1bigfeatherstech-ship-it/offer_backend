@@ -53,7 +53,24 @@ function _enforceAdminStorefrontScope(req, res, next, options = {}) {
     allowedStorefronts,
     /** Orders: userType + storefront (ecomm includes legacy missing storefront). */
     orderMatch: buildOrderMatchForStorefront(requestedStorefront),
-    userMatch: requestedStorefront === 'wholesale' ? { userType: 'wholesaler' } : { userType: 'user' }
+    userMatch:
+      requestedStorefront === 'wholesale'
+        ? {
+            $or: [{ accountScope: 'wholesale' }, { userType: 'wholesaler' }, { role: 'wholesaler' }]
+          }
+        : {
+            $and: [
+              {
+                $or: [
+                  { accountScope: 'ecomm' },
+                  { accountScope: { $exists: false } },
+                  { accountScope: null }
+                ]
+              },
+              { userType: { $nin: ['wholesaler', 'admin'] } },
+              { role: { $nin: ['wholesaler', 'admin', 'product_manager', 'order_manager', 'marketing_manager'] } }
+            ]
+          }
   };
 
   return next();

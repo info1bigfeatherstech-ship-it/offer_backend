@@ -20,6 +20,7 @@ const {
   buildRequestLogContext
 } = require('../utils/checkoutFlow');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const { pricingUserTypeForStorefront } = require('../utils/accountScope');
 const {
   isAdvanceBalanceCodCheckout,
   assertStorePolicyAllowsCheckout,
@@ -158,8 +159,8 @@ async function buildFinalTotals({
 exports.quoteCheckout = async (req, res) => {
   try {
     const userId = req.userId;
-    const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
+    const finalUserType = pricingUserTypeForStorefront(storefront);
     const {
       addressId,
       couponCode,
@@ -464,8 +465,8 @@ exports.quoteCheckout = async (req, res) => {
 exports.confirmCheckout = async (req, res) => {
   try {
     const userId = req.userId;
-    const finalUserType = req.userType === 'wholesaler' ? 'wholesaler' : 'normal';
     const storefront = req.storefront || 'ecomm';
+    const finalUserType = pricingUserTypeForStorefront(storefront);
     const { quoteId, paymentMethod, paymentPlan, paymentAdvancePercent, balanceCollection } = req.body || {};
 
     if (!quoteId) {
