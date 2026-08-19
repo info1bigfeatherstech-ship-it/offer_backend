@@ -3,8 +3,9 @@
  * {@link Order#orderStatus} values. Adjust here if your ops workflow changes.
  *
  * Note: `ready_to_ship` / `ready_to_pick` both map to `processing` and are split by
- * manifest/label download flags in the dashboard service. `pickup_exception` and `rto`
- * tabs are providerStatus-aware (see pickupExceptionOrderQuery / rtoOrderQuery).
+ * whether the shipping label has been downloaded (`shipmentInfo.labelDownloaded`).
+ * `pickup_exception` and `rto` tabs are providerStatus-aware
+ * (see pickupExceptionOrderQuery / rtoOrderQuery).
  */
 
 const { fulfillmentLabelForRtoAwareOrder } = require('./rtoOrderQuery');

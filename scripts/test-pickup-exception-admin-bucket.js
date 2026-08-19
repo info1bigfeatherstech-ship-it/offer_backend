@@ -95,6 +95,11 @@ function testBucketMatchShape() {
 
   const pick = buildBucketMatch('ready_to_pick');
   assert.ok(JSON.stringify(pick).includes('pickup'));
+  assert.ok(JSON.stringify(pick).includes('labelDownloaded'), 'Processing tab is keyed by label download');
+  assert.ok(
+    JSON.stringify(buildBucketMatch('ready_to_ship')).includes('labelDownloaded'),
+    'Ready to Ship excludes downloaded labels'
+  );
 
   const confirmed = buildBucketMatch('bill_sent');
   assert.ok(JSON.stringify(confirmed).includes('pickup'));
@@ -172,7 +177,7 @@ function testMapOrderRowBucketsAndLabels() {
       pickupDate: '2026-07-12',
       courier: 'Delhivery Air',
       manifestDownloaded: false,
-      labelDownloaded: true
+      labelDownloaded: false
     },
     createdAt: new Date()
   });
@@ -193,7 +198,7 @@ function testMapOrderRowBucketsAndLabels() {
       shipmentId: '5',
       shiprocketOrderId: '6',
       providerStatus: 'PICKUP SCHEDULED',
-      manifestDownloaded: true,
+      manifestDownloaded: false,
       labelDownloaded: true
     },
     createdAt: new Date()

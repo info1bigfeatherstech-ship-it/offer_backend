@@ -1,4 +1,11 @@
 const shippingProviderSettingsService = require('../services/shippingProviderSettings.service');
+const shipmozoLabelSettingsService = require('../services/shipmozoLabelSettings.service');
+const {
+  uploadLabelLogo,
+  removeLabelLogo
+} = require('../services/shipmozoLabelLogo.service');
+const { buildSampleViewModel, resolvePickupWarehouse } = require('../services/shipmozoLabelViewModel.service');
+const { renderLabelHtml } = require('../services/shipmozoLabelPdf.service');
 const ShipmozoService = require('../utils/shipmozo');
 const logger = require('../utils/logger');
 const { buildRequestLogContext } = require('../utils/checkoutFlow');
@@ -101,5 +108,146 @@ exports.testShipmozoConnection = async (req, res) => {
   } catch (error) {
     logger.error('testShipmozoConnection failed', { message: error.message });
     return jsonError(res, 500, 'SHIPMOZO_TEST_FAILED', error.message || 'Server error');
+  }
+};
+
+function resolveSettingsStorefront(req) {
+  if (req.adminScope?.storefront === 'wholesale' || req.adminScope?.storefront === 'ecomm') {
+    return req.adminScope.storefront;
+  }
+  return req.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+}
+
+/**
+ * GET /api/shipping-provider/admin/shipmozo-label-settings
+ * Storefront-scoped: ecomm panel ↔ ecomm settings, wholesale panel ↔ wholesale settings.
+ */
+exports.getShipmozoLabelSettings = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    const data = await shipmozoLabelSettingsService.getPublicSettings(storefront);
+    const pickup = await resolvePickupWarehouse(storefront, data.settings?.pickup?.sellerName);
+    data.pickupIdentity = {
+      name: pickup?.name || '',
+      source: pickup?.source || 'env'
+    };
+    return res.json({ success: true, data });
+  } catch (error) {
+    logger.error('getShipmozoLabelSettings failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 500, 'SHIPMOZO_LABEL_SETTINGS_FETCH_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * PUT /api/shipping-provider/admin/shipmozo-label-settings
+ */
+exports.updateShipmozoLabelSettings = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    const patch = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : req.body;
+    const data = await shipmozoLabelSettingsService.saveSettings(storefront, patch, req.userId || null);
+    const pickup = await resolvePickupWarehouse(storefront, data.settings?.pickup?.sellerName);
+    data.pickupIdentity = {
+      name: pickup?.name || '',
+      source: pickup?.source || 'env'
+    };
+    return res.json({
+      success: true,
+      message: 'Shipmozo label settings saved for this storefront',
+      data
+    });
+  } catch (error) {
+    logger.error('updateShipmozoLabelSettings failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 500, 'SHIPMOZO_LABEL_SETTINGS_UPDATE_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * POST /api/shipping-provider/admin/shipmozo-label-settings/preview
+ * Live 4×6 HTML preview from draft (unsaved) or saved settings. Never touches Shiprocket.
+ */
+exports.previewShipmozoLabelSettings = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    const draft = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : req.body;
+    const saved = await shipmozoLabelSettingsService.getPublicSettings(storefront);
+    const settings = shipmozoLabelSettingsService.sanitizeSettings(
+      draft && Object.keys(draft || {}).length ? draft : saved.settings
+    );
+    const vm = buildSampleViewModel(settings, storefront);
+    try {
+      const pickup = await resolvePickupWarehouse(storefront, settings.pickup?.sellerName);
+      if (pickup?.name) {
+        vm.pickup = { ...vm.pickup, ...pickup };
+        vm.rto = vm.pickup;
+      }
+    } catch {
+      /* keep sample pickup */
+    }
+    const html = await renderLabelHtml(vm);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('X-Storefront', storefront);
+    return res.status(200).send(html);
+  } catch (error) {
+    logger.error('previewShipmozoLabelSettings failed', { message: error.message });
+    return jsonError(res, 500, 'SHIPMOZO_LABEL_PREVIEW_FAILED', error.message || 'Preview failed');
+  }
+};
+
+/**
+ * POST /api/shipping-provider/admin/shipmozo-label-settings/logo
+ * Multipart field: logo — replaces logo for this storefront only.
+ */
+exports.uploadShipmozoLabelLogo = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    if (!req.file?.buffer) {
+      return jsonError(res, 400, 'LOGO_FILE_REQUIRED', 'Upload a logo image (PNG, JPG, or WebP, max 1 MB).');
+    }
+    const result = await uploadLabelLogo(storefront, req.file.buffer, req.userId || null);
+    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    return res.json({
+      success: true,
+      message: `Label logo saved for ${storefront} storefront`,
+      data: {
+        storefront: result.storefront,
+        settings: result.settings,
+        logoUrl: result.logoUrl,
+        logoPublicId: result.logoPublicId,
+        pickupIdentity: {
+          name: pickup?.name || '',
+          source: pickup?.source || 'env'
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('uploadShipmozoLabelLogo failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 400, 'SHIPMOZO_LABEL_LOGO_UPLOAD_FAILED', error.message || 'Logo upload failed');
+  }
+};
+
+/**
+ * DELETE /api/shipping-provider/admin/shipmozo-label-settings/logo
+ */
+exports.removeShipmozoLabelLogo = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    const result = await removeLabelLogo(storefront, req.userId || null);
+    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    return res.json({
+      success: true,
+      message: `Label logo removed for ${storefront} storefront`,
+      data: {
+        storefront: result.storefront,
+        settings: result.settings,
+        pickupIdentity: {
+          name: pickup?.name || '',
+          source: pickup?.source || 'env'
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('removeShipmozoLabelLogo failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 500, 'SHIPMOZO_LABEL_LOGO_REMOVE_FAILED', error.message || 'Logo remove failed');
   }
 };

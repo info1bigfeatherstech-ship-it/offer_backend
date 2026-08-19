@@ -202,6 +202,20 @@ const uploadReviewImages = reviewImageUpload.fields([
   { name: 'reviewImages', maxCount: 5 }
 ]);
 
+// ===============================
+// SHIPMOZO LABEL LOGO (admin, per storefront)
+// ===============================
+const labelLogoUpload = multer({
+  storage: multer.memoryStorage(),
+  fileFilter: imageFileFilter,
+  limits: {
+    files: 1,
+    fileSize: 1024 * 1024
+  }
+});
+
+const uploadLabelLogoFile = labelLogoUpload.single('logo');
+
 
 module.exports = {
   uploadProductImages,
@@ -210,5 +224,6 @@ module.exports = {
   uploadBulkNewProductFiles,
   uploadWholesalerProofs,
   uploadReturnProofs,
-  uploadReviewImages
+  uploadReviewImages,
+  uploadLabelLogoFile
 };
