@@ -1,5 +1,9 @@
 const shippingProviderSettingsService = require('../services/shippingProviderSettings.service');
 const shipmozoLabelSettingsService = require('../services/shipmozoLabelSettings.service');
+const {
+  uploadLabelLogo,
+  removeLabelLogo
+} = require('../services/shipmozoLabelLogo.service');
 const { buildSampleViewModel, resolvePickupWarehouse } = require('../services/shipmozoLabelViewModel.service');
 const { renderLabelHtml } = require('../services/shipmozoLabelPdf.service');
 const ShipmozoService = require('../utils/shipmozo');
@@ -187,5 +191,63 @@ exports.previewShipmozoLabelSettings = async (req, res) => {
   } catch (error) {
     logger.error('previewShipmozoLabelSettings failed', { message: error.message });
     return jsonError(res, 500, 'SHIPMOZO_LABEL_PREVIEW_FAILED', error.message || 'Preview failed');
+  }
+};
+
+/**
+ * POST /api/shipping-provider/admin/shipmozo-label-settings/logo
+ * Multipart field: logo — replaces logo for this storefront only.
+ */
+exports.uploadShipmozoLabelLogo = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    if (!req.file?.buffer) {
+      return jsonError(res, 400, 'LOGO_FILE_REQUIRED', 'Upload a logo image (PNG, JPG, or WebP, max 1 MB).');
+    }
+    const result = await uploadLabelLogo(storefront, req.file.buffer, req.userId || null);
+    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    return res.json({
+      success: true,
+      message: `Label logo saved for ${storefront} storefront`,
+      data: {
+        storefront: result.storefront,
+        settings: result.settings,
+        logoUrl: result.logoUrl,
+        logoPublicId: result.logoPublicId,
+        pickupIdentity: {
+          name: pickup?.name || '',
+          source: pickup?.source || 'env'
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('uploadShipmozoLabelLogo failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 400, 'SHIPMOZO_LABEL_LOGO_UPLOAD_FAILED', error.message || 'Logo upload failed');
+  }
+};
+
+/**
+ * DELETE /api/shipping-provider/admin/shipmozo-label-settings/logo
+ */
+exports.removeShipmozoLabelLogo = async (req, res) => {
+  try {
+    const storefront = resolveSettingsStorefront(req);
+    const result = await removeLabelLogo(storefront, req.userId || null);
+    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    return res.json({
+      success: true,
+      message: `Label logo removed for ${storefront} storefront`,
+      data: {
+        storefront: result.storefront,
+        settings: result.settings,
+        pickupIdentity: {
+          name: pickup?.name || '',
+          source: pickup?.source || 'env'
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('removeShipmozoLabelLogo failed', buildRequestLogContext(req, { message: error.message }));
+    return jsonError(res, 500, 'SHIPMOZO_LABEL_LOGO_REMOVE_FAILED', error.message || 'Logo remove failed');
   }
 };

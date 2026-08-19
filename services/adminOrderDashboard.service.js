@@ -35,6 +35,23 @@ const DEFAULT_RANGE_DAYS = 30;
 const ALL_TAB_EXCLUDED_ORDER_STATUSES = BUCKET_TO_ORDER_STATUSES.others;
 
 /**
+ * Tab split for orderStatus=processing (provider-agnostic).
+ * Processing tab = label downloaded at least once. Ready to Ship = label not downloaded yet.
+ * Manifest download stays a Shiprocket-only artifact and does not move tabs.
+ */
+function processingTabMongoMatch() {
+  return { orderStatus: 'processing', 'shipmentInfo.labelDownloaded': true };
+}
+
+function readyToShipTabMongoMatch() {
+  return { orderStatus: 'processing', 'shipmentInfo.labelDownloaded': { $ne: true } };
+}
+
+function isProcessingTabByLabelDownload(shipmentInfo) {
+  return Boolean(shipmentInfo?.labelDownloaded);
+}
+
+/**
  * @param {string | undefined} s
  */
 function escapeRegex(s) {
@@ -232,27 +249,15 @@ function buildBucketMatch(bucket) {
     );
   }
   if (b === 'ready_to_pick') {
-    const match = {
-      orderStatus: 'processing',
-      'shipmentInfo.manifestDownloaded': true,
-      'shipmentInfo.labelDownloaded': true
-    };
     return andFilters(
-      match,
+      processingTabMongoMatch(),
       buildRtoExclusionForNonRtoBucket(b),
       buildPickupExceptionExclusionForNonExceptionBucket(b)
     );
   }
   if (b === 'ready_to_ship') {
-    const match = {
-      orderStatus: 'processing',
-      $or: [
-        { 'shipmentInfo.manifestDownloaded': { $ne: true } },
-        { 'shipmentInfo.labelDownloaded': { $ne: true } }
-      ]
-    };
     return andFilters(
-      match,
+      readyToShipTabMongoMatch(),
       buildRtoExclusionForNonRtoBucket(b),
       buildPickupExceptionExclusionForNonExceptionBucket(b)
     );
@@ -373,20 +378,10 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
       $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': ndrProviderMatch }]
     }),
     Order.countDocuments(
-      andFilters(baseMatch, {
-        orderStatus: 'processing',
-        'shipmentInfo.manifestDownloaded': true,
-        'shipmentInfo.labelDownloaded': true
-      }, pickupExceptionExclude)
+      andFilters(baseMatch, processingTabMongoMatch(), pickupExceptionExclude)
     ),
     Order.countDocuments(
-      andFilters(baseMatch, {
-        orderStatus: 'processing',
-        $or: [
-          { 'shipmentInfo.manifestDownloaded': { $ne: true } },
-          { 'shipmentInfo.labelDownloaded': { $ne: true } }
-        ]
-      }, pickupExceptionExclude)
+      andFilters(baseMatch, readyToShipTabMongoMatch(), pickupExceptionExclude)
     ),
     Order.countDocuments(
       andFilters(baseMatch, { orderStatus: 'confirmed' }, confirmedPickupExceptionExclude)
@@ -462,13 +457,7 @@ function mapOrderRow(order) {
         ? 'pickup_exception'
         : fulfillmentBucketKeyFromOrderStatus(o.orderStatus);
   if (bucketKey === 'ready_to_pick' || bucketKey === 'ready_to_ship') {
-    const manifestDownloaded = Boolean(si.manifestDownloaded);
-    const labelDownloaded = Boolean(si.labelDownloaded);
-    if (manifestDownloaded && labelDownloaded) {
-      bucketKey = 'ready_to_pick';
-    } else {
-      bucketKey = 'ready_to_ship';
-    }
+    bucketKey = isProcessingTabByLabelDownload(si) ? 'ready_to_pick' : 'ready_to_ship';
   }
   const financials = normalizeFinancialView(o);
   const hasAwb = Boolean(si.awbCode || si.trackingNumber);

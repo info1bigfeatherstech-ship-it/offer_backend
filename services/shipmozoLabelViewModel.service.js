@@ -19,8 +19,8 @@ function trimText(value, max) {
 
 function formatInr(n) {
   const v = roundMoney2(n);
-  if (!Number.isFinite(v)) return '₹0';
-  return `₹${v.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+  if (!Number.isFinite(v)) return 'Rs.0';
+  return `Rs.${v.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 }
 
 function formatYmd(d) {
@@ -117,6 +117,21 @@ function paymentAndCollectable(order) {
     orderTotal: totalInr,
     shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0)
   };
+}
+
+/** Assigned courier for the label header. Skip aggregator brand; keep original casing. */
+function displayCourierName(order) {
+  const candidates = [
+    order?.shipmentInfo?.courier,
+    order?.shippingSnapshot?.courierName
+  ];
+  for (const raw of candidates) {
+    const name = String(raw || '').trim();
+    if (!name) continue;
+    if (/^ship\s*mozo$/i.test(name)) continue;
+    return name;
+  }
+  return 'Courier';
 }
 
 function dimsAndWeight(order) {
@@ -267,11 +282,7 @@ async function buildLabelViewModel(order, settingsPatch) {
   const pickup = await resolvePickupWarehouse(storefront, settings.pickup?.sellerName);
   const { lines, totalQty, hiddenCount } = buildLineItems(order, settings.products);
   const awb = String(order?.shipmentInfo?.awbCode || order?.shipmentInfo?.trackingNumber || '').trim();
-  const courier = String(
-    order?.shipmentInfo?.courier || order?.shippingSnapshot?.courierName || 'SHIPMOZO'
-  )
-    .trim()
-    .toUpperCase();
+  const courier = displayCourierName(order);
   const routingCode = String(
     order?.shipmentInfo?.routingCode || order?.shipmentInfo?.sortCode || ''
   ).trim();
@@ -322,7 +333,41 @@ async function buildLabelViewModel(order, settingsPatch) {
     totalQty,
     hiddenCount,
     gstin: settings.pickup.gstin || String(process.env.STORE_GSTIN || '').trim(),
-    poweredBy: 'OfferWale Baba'
+    poweredBy: 'Offer Wale Baba'
+  };
+}
+
+const SAMPLE_ITEMS = [
+  { name: 'SP 312 Wireless Bluetooth Speaker', sku: 'SKU-2734-1', qty: 1, price: 1900, total: 1900, hsn: '85182200', discount: 0 },
+  { name: 'Portable Mini Hair Dryer 1800W', sku: 'SKU-2823-1', qty: 1, price: 1200, total: 1200, hsn: '85163200', discount: 0 },
+  { name: 'Migraine Relief Head Massager', sku: 'SKU-2682-1', qty: 2, price: 850, total: 1700, hsn: '90191090', discount: 0 },
+  { name: '3 in 1 Multi Charging Cable', sku: 'SKU-2659-1', qty: 1, price: 450, total: 450, hsn: '85444900', discount: 0 },
+  { name: 'Travel Neck Pillow Memory Foam', sku: 'SKU-0643-1', qty: 1, price: 650, total: 650, hsn: '94049090', discount: 0 },
+  { name: '2-in-1 Bedside Lamp with Wireless Charger', sku: 'SKU-0057-1', qty: 1, price: 2100, total: 2100, hsn: '94054090', discount: 0 },
+  { name: 'Neev Electra Smart Watch Band', sku: 'SKU-0004-1', qty: 1, price: 990, total: 990, hsn: '91021200', discount: 0 },
+  { name: 'Premium Stainless Steel Water Bottle 1L', sku: 'SKU-1188-1', qty: 2, price: 399, total: 798, hsn: '73239390', discount: 0 },
+  { name: 'Organic Bamboo Toothbrush Set of 4', sku: 'SKU-3021-1', qty: 1, price: 299, total: 299, hsn: '96032100', discount: 0 },
+  { name: 'LED Desk Lamp Adjustable Brightness', sku: 'SKU-4455-1', qty: 1, price: 1550, total: 1550, hsn: '94054020', discount: 0 }
+];
+
+function buildSampleLineItems(settings) {
+  const p = settings.products || {};
+  const nameMax = Number(p.trimProductNameUpto) || 999;
+  const skuMax = Number(p.trimSkuUpto) || 999;
+  const maxItems = p.showAllItems
+    ? SAMPLE_ITEMS.length
+    : Math.max(1, Number(p.maxLineItems) || 5);
+  const visible = SAMPLE_ITEMS.slice(0, maxItems);
+  const hiddenCount = Math.max(0, SAMPLE_ITEMS.length - visible.length);
+  const lines = visible.map((item) => ({
+    ...item,
+    name: trimText(item.name, nameMax),
+    sku: trimText(item.sku, skuMax)
+  }));
+  return {
+    lines,
+    totalQty: visible.reduce((sum, l) => sum + l.qty, 0),
+    hiddenCount
   };
 }
 
@@ -333,7 +378,7 @@ function buildSampleViewModel(settingsPatch, storefront) {
     settings,
     storefront: sf,
     labelSize: '4x6',
-    courier: 'SHIPMOZO',
+    courier: 'XpressBees 10Kg',
     awb: 'SM1234567890',
     shipmozoId: '86543821',
     orderId: sf === 'wholesale' ? 'OWB-WH-865438' : 'OWB-ECOMM-865438',
@@ -366,17 +411,9 @@ function buildSampleViewModel(settingsPatch, storefront) {
     invoiceDate: '2025/01/03',
     orderDate: '2025/01/01',
     ewayBill: '1234567890',
-    lines: [
-      { name: trimText('Free Magic Comb', settings.products.trimProductNameUpto), sku: 'SKU1', qty: 1, price: 1900, total: 1900, hsn: '', discount: 0 },
-      { name: trimText('Free Magic Comb', settings.products.trimProductNameUpto), sku: 'SKU1', qty: 1, price: 1900, total: 1900, hsn: '', discount: 0 },
-      { name: trimText('Free Magic Comb', settings.products.trimProductNameUpto), sku: 'SKU1', qty: 1, price: 1900, total: 1900, hsn: '', discount: 0 },
-      { name: trimText('Free Magic Comb', settings.products.trimProductNameUpto), sku: 'SKU1', qty: 1, price: 1900, total: 1900, hsn: '', discount: 0 },
-      { name: trimText('Free Magic Comb', settings.products.trimProductNameUpto), sku: 'SKU1', qty: 1, price: 1900, total: 1900, hsn: '', discount: 0 }
-    ],
-    totalQty: 5,
-    hiddenCount: 0,
+    ...buildSampleLineItems(settings),
     gstin: settings.pickup.gstin,
-    poweredBy: 'OfferWale Baba'
+    poweredBy: 'Offer Wale Baba'
   };
 }
 
