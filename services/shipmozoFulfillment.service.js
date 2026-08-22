@@ -13,6 +13,10 @@ const Order = require('../models/Order');
 const ShipmozoService = require('../utils/shipmozo');
 const logger = require('../utils/logger');
 const { SHIPPING_PROVIDERS } = require('../constants/shippingProviders');
+const {
+  isShipmozoPanelBooked,
+  syncShipmentFromShipmozo
+} = require('./shipmozoPanelSync.service');
 
 function quotedCourierFromOrder(order) {
   const snap = order?.shippingSnapshot || {};
@@ -127,6 +131,72 @@ async function loadLiveRatesSafe(order) {
 }
 
 /**
+ * Shipmozo assign-courier often fails when courier was already booked on their panel.
+ * @param {string|null|undefined} message
+ */
+function isShipmozoAlreadyBookedAssignError(message) {
+  const m = String(message || '').toLowerCase();
+  if (!m) return false;
+  return (
+    /already\s*(assigned|booked|scheduled)|courier\s*already|pickup\s*already|order\s*already/.test(m) ||
+    /invalid\s*order|wrong\s*order|order\s*id\s*(is\s*)?(wrong|invalid|not\s*found)/.test(m) ||
+    /\bscheduled\b/.test(m)
+  );
+}
+
+/**
+ * Pull AWB/status from Shipmozo panel instead of re-assigning courier.
+ * @param {import('mongoose').Document} order
+ * @param {{ evaluateAndPersistShipmentOps?: function }} [opts]
+ */
+async function syncFromPanelInsteadOfAssign(order, opts = {}) {
+  const syncResult = await syncShipmentFromShipmozo(order, {
+    source: 'admin_shipmozo_panel_already_booked',
+    allowOrderStatusUpdate: true,
+    notify: false
+  });
+
+  if (!syncResult.success) {
+    return {
+      success: false,
+      code: syncResult.code || 'SHIPMOZO_PANEL_SYNC_FAILED',
+      message:
+        syncResult.message ||
+        'Courier appears booked on Shipmozo already. Refresh Shipmozo sync failed — try again from admin.',
+      details: syncResult
+    };
+  }
+
+  const fresh = syncResult.order || (await Order.findOne({ orderId: order.orderId })) || order;
+  const hasAwb = Boolean(
+    String(fresh.shipmentInfo?.awbCode || fresh.shipmentInfo?.trackingNumber || '').trim()
+  );
+
+  if (opts.evaluateAndPersistShipmentOps) {
+    try {
+      await opts.evaluateAndPersistShipmentOps(fresh, { source: 'shipmozo_panel_sync_instead_of_assign' });
+    } catch (_) {
+      /* non-blocking */
+    }
+  }
+
+  return {
+    success: true,
+    code: syncResult.partial ? 'SHIPMOZO_PANEL_BOOKED_AWB_PENDING' : 'SHIPMOZO_PANEL_SYNCED',
+    message:
+      syncResult.message ||
+      (hasAwb
+        ? 'Courier was already booked on Shipmozo — synced AWB and tracking.'
+        : 'Courier already booked on Shipmozo — status synced. Refresh again shortly for AWB.'),
+    order: fresh,
+    shipment: fresh.shipmentInfo || null,
+    panelSynced: true,
+    partial: Boolean(syncResult.partial),
+    tracking: syncResult.tracking || null
+  };
+}
+
+/**
  * @param {import('mongoose').Document} order
  * @param {object} opts
  * @param {number|null} [opts.courierIdOverride]
@@ -162,6 +232,15 @@ async function runShipmozoAssignShip(order, opts = {}) {
         code: 'SHIPMENT_ID_MISSING',
         message: 'Push order to Shipmozo first (missing shipmozo order id).'
       };
+    }
+
+    if (isShipmozoPanelBooked(order.shipmentInfo)) {
+      logger.info('[Shipmozo] Ship now skipped — panel already booked; syncing instead', {
+        orderId: order.orderId,
+        smOrderId,
+        providerStatus: order.shipmentInfo?.providerStatus || null
+      });
+      return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
     }
 
     const quoted = quotedCourierFromOrder(order);
@@ -226,6 +305,15 @@ async function runShipmozoAssignShip(order, opts = {}) {
           applyUpsertShipmentInfo,
           evaluateAndPersistShipmentOps
         });
+      }
+
+      if (isShipmozoAlreadyBookedAssignError(direct.message)) {
+        logger.info('[Shipmozo] Quoted assign failed — panel likely booked; syncing', {
+          orderId: order.orderId,
+          smOrderId,
+          assignMessage: direct.message
+        });
+        return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
       }
 
       // Assign failed — load rates only to suggest alternatives (never claim "unavailable"
@@ -352,6 +440,14 @@ async function runShipmozoAssignShip(order, opts = {}) {
     });
 
     if (!assign.success) {
+      if (isShipmozoAlreadyBookedAssignError(assign.message)) {
+        logger.info('[Shipmozo] Assign failed — panel likely booked; syncing', {
+          orderId: order.orderId,
+          smOrderId,
+          assignMessage: assign.message
+        });
+        return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
+      }
       if (!ratesLoaded) await ensureRates();
       // If override/substitute failed, surface clearly (do not infinite-loop confirm)
       if (!hasOverride && !confirmSubstitute && quoted.courierId != null) {
