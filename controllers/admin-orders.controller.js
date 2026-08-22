@@ -231,7 +231,7 @@ exports.getOrdersList = async (req, res) => {
 
 /**
  * POST /api/admin/orders/auto-sync-statuses
- * Background sync: reconcile all stale in-range orders from Shiprocket → DB (admin Orders tab).
+ * Background sync: reconcile stale in-range forward orders (Shiprocket + Shipmozo) → DB.
  * Query: from, to, rangePreset, presetDays — same as summary/list; optional staleMinutes, concurrency, maxRunMs
  */
 exports.autoSyncOrderStatuses = async (req, res) => {

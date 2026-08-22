@@ -19,6 +19,8 @@ const Order = require('../models/Order');
 const logger = require('../utils/logger');
 const { roundMoney2 } = require('./checkoutComputation.service');
 const ShiprocketService = require('../utils/shiprocket');
+const ShipmozoService = require('../utils/shipmozo');
+const { isShipmozoOrder } = require('../constants/shippingProviders');
 const { mergeReturnInfo } = require('./rtoRefund.service');
 const { pickCheapestActiveCourier } = require('./courierPolicy.service');
 
@@ -192,12 +194,93 @@ function buildOosShippingSettlementMeta(order, priced) {
 }
 
 /**
+ * Resolve live Shipmozo courier freight for an assigned courier id (Ship Now / sync retry).
+ */
+async function resolveShipmozoActualFreightForCourier(order, courierId) {
+  const cid = Number(courierId);
+  if (!Number.isFinite(cid)) {
+    return { ok: false, freightInr: null, mock: false, message: 'courierId required' };
+  }
+
+  try {
+    const storefront = order?.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+    const configured = await ShipmozoService.isConfigured(storefront);
+    if (!configured) {
+      return {
+        ok: false,
+        freightInr: null,
+        mock: true,
+        message: 'Shipmozo not configured — cannot resolve live freight'
+      };
+    }
+
+    const rates = await ShipmozoService.listCouriersForOrder(order);
+    if (!rates?.ok || !Array.isArray(rates.couriers)) {
+      return {
+        ok: false,
+        freightInr: null,
+        mock: Boolean(rates?.mock),
+        message: rates?.message || 'Shipmozo courier list failed'
+      };
+    }
+    if (rates.mock) {
+      return { ok: false, freightInr: null, mock: true, message: 'mock Shipmozo courier list' };
+    }
+
+    const match =
+      rates.couriers.find((c) => Number(c?.courierId) === cid) || null;
+    const cheapest =
+      rates.couriers
+        .filter((c) => c?.courierId != null && Number.isFinite(Number(c.totalCharges)))
+        .sort((a, b) => Number(a.totalCharges) - Number(b.totalCharges))[0] || null;
+    const courierRow = match || cheapest;
+
+    if (!courierRow) {
+      return {
+        ok: false,
+        freightInr: null,
+        mock: false,
+        message: 'Courier not found in Shipmozo rate list'
+      };
+    }
+
+    const freightInr = pickPositiveFreightInr(courierRow.totalCharges);
+    if (freightInr == null) {
+      return {
+        ok: false,
+        freightInr: null,
+        mock: false,
+        message: 'Shipmozo courier rate missing or zero'
+      };
+    }
+
+    return {
+      ok: true,
+      freightInr,
+      mock: false,
+      message: match ? 'matched_courier' : 'used_cheapest_fallback'
+    };
+  } catch (err) {
+    logger.error('[oosShippingSettlement] resolveShipmozoActualFreightForCourier failed', {
+      orderId: order?.orderId,
+      message: err?.message || String(err),
+      stack: err?.stack
+    });
+    return { ok: false, freightInr: null, mock: false, message: err?.message || String(err) };
+  }
+}
+
+/**
  * Resolve live courier freight for an assigned courier id (Ship Now).
  */
 async function resolveActualFreightForCourier(order, courierId) {
   const cid = Number(courierId);
   if (!Number.isFinite(cid)) {
     return { ok: false, freightInr: null, mock: false, message: 'courierId required' };
+  }
+
+  if (isShipmozoOrder(order)) {
+    return resolveShipmozoActualFreightForCourier(order, courierId);
   }
 
   if (!ShiprocketService.enabled) {

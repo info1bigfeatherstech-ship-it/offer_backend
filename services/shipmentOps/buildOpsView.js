@@ -6,6 +6,10 @@ const { OPS_STATES } = require('./constants');
 const { hasAwb } = require('./computeOpsState');
 const { isRtoProviderStatus } = require('./shiprocketStatusMap');
 const { resolveRtoDisplayLabel } = require('./rtoJourneyClassifier');
+const {
+  resolveOrderShippingProvider,
+  SHIPPING_PROVIDERS
+} = require('../../constants/shippingProviders');
 
 /**
  * @param {Date|string|null|undefined} dt
@@ -56,6 +60,8 @@ function buildCourierOpsDisplay({ opsState, order }) {
   const courier = String(si.courier || '').trim();
   const pickupDate = si.pickupDate ? String(si.pickupDate).trim() : null;
   const awb = String(si.awbCode || si.trackingNumber || '').trim();
+  const isShipmozo = resolveOrderShippingProvider(o) === SHIPPING_PROVIDERS.SHIPMOZO;
+  const providerLabel = isShipmozo ? 'Shipmozo' : 'Shiprocket';
 
   if (st === 'cancelled' && !isRtoProviderStatus(providerStatus)) {
     return { line1: 'Cancelled', line2: null };
@@ -77,17 +83,17 @@ function buildCourierOpsDisplay({ opsState, order }) {
       if (courier) parts.push(courier);
       return {
         line1: 'Pickup exception — action required',
-        line2: parts.length ? parts.join(' · ') : 'Open Shiprocket support if retry fails',
+        line2: parts.length ? parts.join(' · ') : `Open ${providerLabel} support if retry fails`,
       };
     }
     case OPS_STATES.PROVIDER_RESET:
       return {
-        line1: 'Shipment reset on Shiprocket',
+        line1: `Shipment reset on ${providerLabel}`,
         line2: si.providerSnapshot?.resetReason || providerStatus || 'Refresh sync, then Ship now',
       };
     case OPS_STATES.NEEDS_MANUAL_REVIEW:
       return {
-        line1: 'Review Shiprocket status',
+        line1: `Review ${providerLabel} status`,
         line2: providerStatus || 'Sync required',
       };
     case OPS_STATES.PICKUP_SCHEDULED: {

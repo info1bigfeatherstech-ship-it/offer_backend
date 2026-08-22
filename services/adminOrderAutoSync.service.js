@@ -1,14 +1,19 @@
 /**
- * Background status sync for admin Orders tab — pulls Shiprocket state into our DB
- * via existing reconcileOrderFromShiprocket (no Shiprocket logic changes).
+ * Background status sync for admin Orders tab — reconciles stale forward shipments into Mongo.
+ * Shiprocket: reconcileOrderFromShiprocket. Shipmozo: reconcileOrderFromShipmozo (AWB track).
  */
 const Order = require('../models/Order');
+const logger = require('../utils/logger');
 const {
   ACTIVE_FORWARD_SYNC_STATUSES,
   isActiveForwardSyncOrderStatus,
 } = require('../constants/adminOrderFulfillmentBuckets');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
-const { isShipmozoOrder } = require('../constants/shippingProviders');
+const { reconcileOrderFromShipmozo } = require('./shipmozoReconcile.service');
+const {
+  isShipmozoOrder,
+  SHIPPING_PROVIDERS,
+} = require('../constants/shippingProviders');
 
 const DEFAULT_STALE_MS = 5 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 4;
@@ -27,6 +32,27 @@ function hasShiprocketReference(shipmentInfo) {
 }
 
 /**
+ * @param {object | null | undefined} shipmentInfo
+ */
+function hasShipmozoAwb(shipmentInfo) {
+  const si = shipmentInfo || {};
+  return Boolean(String(si.awbCode || si.trackingNumber || '').trim());
+}
+
+/**
+ * @param {Date} cutoff
+ */
+function buildStaleLastSyncClause(cutoff) {
+  return {
+    $or: [
+      { 'shipmentInfo.lastSyncAt': { $exists: false } },
+      { 'shipmentInfo.lastSyncAt': null },
+      { 'shipmentInfo.lastSyncAt': { $lt: cutoff } },
+    ],
+  };
+}
+
+/**
  * @param {{ from: Date, to: Date, scopeMatch?: object, staleMs?: number }} opts
  */
 function buildAutoSyncCandidateFilter(opts) {
@@ -35,43 +61,63 @@ function buildAutoSyncCandidateFilter(opts) {
   const dateMatch = { createdAt: { $gte: opts.from, $lte: opts.to } };
   const scopeMatch = opts.scopeMatch && Object.keys(opts.scopeMatch).length ? opts.scopeMatch : null;
   const base = scopeMatch ? { $and: [dateMatch, scopeMatch] } : dateMatch;
+  const staleClause = buildStaleLastSyncClause(cutoff);
 
   return {
     $and: [
       base,
       { orderStatus: { $in: [...ACTIVE_FORWARD_SYNC_STATUSES] } },
-      // Never bulk-poll Shipmozo orders (on-demand track only)
       {
-        $and: [
+        $or: [
           {
-            $or: [
-              { shippingProvider: { $exists: false } },
-              { shippingProvider: null },
-              { shippingProvider: 'shiprocket' }
-            ]
+            $and: [
+              {
+                $and: [
+                  {
+                    $or: [
+                      { shippingProvider: { $exists: false } },
+                      { shippingProvider: null },
+                      { shippingProvider: SHIPPING_PROVIDERS.SHIPROCKET },
+                    ],
+                  },
+                  {
+                    $or: [
+                      { 'shipmentInfo.shipmozoOrderId': { $exists: false } },
+                      { 'shipmentInfo.shipmozoOrderId': null },
+                      { 'shipmentInfo.shipmozoOrderId': '' },
+                    ],
+                  },
+                ],
+              },
+              {
+                $or: [
+                  { 'shipmentInfo.shiprocketOrderId': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.shipmentId': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.awbCode': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.trackingNumber': { $exists: true, $nin: [null, ''] } },
+                ],
+              },
+              staleClause,
+            ],
           },
           {
-            $or: [
-              { 'shipmentInfo.shipmozoOrderId': { $exists: false } },
-              { 'shipmentInfo.shipmozoOrderId': null },
-              { 'shipmentInfo.shipmozoOrderId': '' }
-            ]
-          }
-        ]
-      },
-      {
-        $or: [
-          { 'shipmentInfo.shiprocketOrderId': { $exists: true, $nin: [null, ''] } },
-          { 'shipmentInfo.shipmentId': { $exists: true, $nin: [null, ''] } },
-          { 'shipmentInfo.awbCode': { $exists: true, $nin: [null, ''] } },
-          { 'shipmentInfo.trackingNumber': { $exists: true, $nin: [null, ''] } },
-        ],
-      },
-      {
-        $or: [
-          { 'shipmentInfo.lastSyncAt': { $exists: false } },
-          { 'shipmentInfo.lastSyncAt': null },
-          { 'shipmentInfo.lastSyncAt': { $lt: cutoff } },
+            $and: [
+              {
+                $or: [
+                  { shippingProvider: SHIPPING_PROVIDERS.SHIPMOZO },
+                  { 'shipmentInfo.shipmozoOrderId': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.provider': SHIPPING_PROVIDERS.SHIPMOZO },
+                ],
+              },
+              {
+                $or: [
+                  { 'shipmentInfo.awbCode': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.trackingNumber': { $exists: true, $nin: [null, ''] } },
+                ],
+              },
+              staleClause,
+            ],
+          },
         ],
       },
     ],
@@ -96,6 +142,7 @@ async function mapInConcurrentWindows(ids, parallel, handler) {
           success: false,
           updated: false,
           skipped: false,
+          provider: null,
           code: 'UNHANDLED',
           message: err?.message || String(err),
         }))
@@ -107,51 +154,87 @@ async function mapInConcurrentWindows(ids, parallel, handler) {
 }
 
 /**
- * @param {string} orderId
+ * @param {import('mongoose').Document} order
+ * @param {string} id
  */
-async function runAutoSyncSingle(orderId) {
-  const id = String(orderId || '').trim();
-  if (!id) {
-    return {
-      orderId: orderId || '',
-      success: false,
-      updated: false,
-      skipped: true,
-      code: 'ORDER_ID_REQUIRED',
-      message: 'orderId is required',
-    };
-  }
+async function runShipmozoAutoSyncSingle(order, id) {
+  const previousStatus = String(order.orderStatus || '').toLowerCase();
+  const previousProviderStatus = String(order.shipmentInfo?.providerStatus || '');
 
-  const order = await Order.findOne({ orderId: id });
-  if (!order) {
+  if (!hasShipmozoAwb(order.shipmentInfo)) {
     return {
       orderId: id,
       success: false,
       updated: false,
       skipped: true,
-      code: 'ORDER_NOT_FOUND',
-      message: 'Order not found',
+      provider: SHIPPING_PROVIDERS.SHIPMOZO,
+      code: 'SHIPMOZO_AWB_MISSING',
+      message: 'No AWB on this Shipmozo order yet',
     };
   }
 
-  // Production guard: never Shiprocket-reconcile Shipmozo orders (even if AWB exists)
-  if (isShipmozoOrder(order)) {
+  if (!isActiveForwardSyncOrderStatus(previousStatus)) {
     return {
       orderId: id,
       success: false,
       updated: false,
       skipped: true,
-      code: 'SHIPMOZO_ON_DEMAND_ONLY',
-      message: 'Shipmozo orders are excluded from forward list auto-sync',
+      provider: SHIPPING_PROVIDERS.SHIPMOZO,
+      code: 'NOT_ELIGIBLE',
+      message: 'Order status is not eligible for auto sync',
     };
   }
 
+  const reconcileResult = await reconcileOrderFromShipmozo(order, {
+    source: 'admin_auto_sync_shipmozo',
+    allowOrderStatusUpdate: true,
+    notify: true,
+  });
+
+  if (!reconcileResult.success) {
+    return {
+      orderId: id,
+      success: false,
+      updated: false,
+      skipped: false,
+      provider: SHIPPING_PROVIDERS.SHIPMOZO,
+      code: reconcileResult.code || 'SYNC_FAILED',
+      message: reconcileResult.message || 'Shipmozo sync failed',
+    };
+  }
+
+  const fresh = await Order.findOne({ orderId: id })
+    .select('orderStatus shipmentInfo.providerStatus')
+    .lean();
+  const currentStatus = String(fresh?.orderStatus || '').toLowerCase();
+  const currentProviderStatus = String(fresh?.shipmentInfo?.providerStatus || '');
+
+  return {
+    orderId: id,
+    success: true,
+    updated:
+      currentStatus !== previousStatus || currentProviderStatus !== previousProviderStatus,
+    skipped: false,
+    provider: SHIPPING_PROVIDERS.SHIPMOZO,
+    previousStatus,
+    currentStatus,
+    previousProviderStatus,
+    currentProviderStatus,
+  };
+}
+
+/**
+ * @param {import('mongoose').Document} order
+ * @param {string} id
+ */
+async function runShiprocketAutoSyncSingle(order, id) {
   if (!hasShiprocketReference(order.shipmentInfo)) {
     return {
       orderId: id,
       success: false,
       updated: false,
       skipped: true,
+      provider: SHIPPING_PROVIDERS.SHIPROCKET,
       code: 'SHIPROCKET_ORDER_MISSING',
       message: 'No Shiprocket reference on order',
     };
@@ -164,6 +247,7 @@ async function runAutoSyncSingle(orderId) {
       success: false,
       updated: false,
       skipped: true,
+      provider: SHIPPING_PROVIDERS.SHIPROCKET,
       code: 'NOT_ELIGIBLE',
       message: 'Order status is not eligible for auto sync',
     };
@@ -181,6 +265,7 @@ async function runAutoSyncSingle(orderId) {
       success: false,
       updated: false,
       skipped: false,
+      provider: SHIPPING_PROVIDERS.SHIPROCKET,
       code: reconcileResult.code || 'SYNC_FAILED',
       message: reconcileResult.message || 'Sync failed',
     };
@@ -194,13 +279,68 @@ async function runAutoSyncSingle(orderId) {
     success: true,
     updated: currentStatus !== previousStatus,
     skipped: false,
+    provider: SHIPPING_PROVIDERS.SHIPROCKET,
     previousStatus,
     currentStatus,
   };
 }
 
 /**
- * Sync all stale in-range orders from Shiprocket into our DB (loops until queue empty or time budget).
+ * @param {string} orderId
+ */
+async function runAutoSyncSingle(orderId) {
+  const id = String(orderId || '').trim();
+  if (!id) {
+    return {
+      orderId: orderId || '',
+      success: false,
+      updated: false,
+      skipped: true,
+      provider: null,
+      code: 'ORDER_ID_REQUIRED',
+      message: 'orderId is required',
+    };
+  }
+
+  try {
+    const order = await Order.findOne({ orderId: id });
+    if (!order) {
+      return {
+        orderId: id,
+        success: false,
+        updated: false,
+        skipped: true,
+        provider: null,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Order not found',
+      };
+    }
+
+    if (isShipmozoOrder(order)) {
+      return runShipmozoAutoSyncSingle(order, id);
+    }
+
+    return runShiprocketAutoSyncSingle(order, id);
+  } catch (err) {
+    logger.error('[adminOrderAutoSync] runAutoSyncSingle threw', {
+      orderId: id,
+      message: err?.message || String(err),
+      stack: err?.stack,
+    });
+    return {
+      orderId: id,
+      success: false,
+      updated: false,
+      skipped: false,
+      provider: null,
+      code: 'SYNC_EXCEPTION',
+      message: err?.message || String(err),
+    };
+  }
+}
+
+/**
+ * Sync all stale in-range forward orders from shipping providers into our DB.
  * @param {{
  *   from: Date,
  *   to: Date,
@@ -257,6 +397,8 @@ async function autoSyncStaleOrdersInRange(options) {
   const updated = allResults.filter((r) => r.success && r.updated);
   const failed = allResults.filter((r) => !r.success && !r.skipped);
   const skipped = allResults.filter((r) => r.skipped);
+  const shiprocketSynced = synced.filter((r) => r.provider === SHIPPING_PROVIDERS.SHIPROCKET).length;
+  const shipmozoSynced = synced.filter((r) => r.provider === SHIPPING_PROVIDERS.SHIPMOZO).length;
 
   return {
     summary: {
@@ -265,6 +407,8 @@ async function autoSyncStaleOrdersInRange(options) {
       updated: updated.length,
       failed: failed.length,
       skipped: skipped.length,
+      shiprocketSynced,
+      shipmozoSynced,
       remainingStale,
       complete: remainingStale === 0,
       rounds,
@@ -278,4 +422,6 @@ module.exports = {
   autoSyncStaleOrdersInRange,
   buildAutoSyncCandidateFilter,
   hasShiprocketReference,
+  hasShipmozoAwb,
+  runAutoSyncSingle,
 };

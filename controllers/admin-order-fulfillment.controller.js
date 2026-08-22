@@ -997,12 +997,76 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
   try {
     // Shipmozo orders: never call Shiprocket assign APIs
     if (isShipmozoOrder(order)) {
-      return runShipmozoAssignShip(order, {
+      const assignRes = await runShipmozoAssignShip(order, {
         courierIdOverride,
         confirmSubstitute: Boolean(opts.confirmSubstitute),
         applyUpsertShipmentInfo,
         evaluateAndPersistShipmentOps
       });
+      if (!assignRes.success) {
+        return assignRes;
+      }
+
+      const hasAwb = Boolean(
+        assignRes.shipment?.awbCode ||
+          assignRes.shipment?.trackingNumber ||
+          assignRes.order?.shipmentInfo?.awbCode ||
+          assignRes.order?.shipmentInfo?.trackingNumber
+      );
+
+      let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
+      if (hasAwb) {
+        try {
+          const orderId = order.orderId;
+          let fresh = assignRes.order || (await Order.findOne({ orderId }));
+          if (fresh?.paymentInfo?.oosShippingSettlement?.pending === true) {
+            const courierId = assignRes.courierId;
+            const freightRes = await resolveActualFreightForCourier(fresh, courierId);
+            oosShippingSettlement = await settleOosShippingAfterActualFreight(fresh, {
+              actualFreightInr: freightRes.ok ? freightRes.freightInr : null,
+              mock: Boolean(freightRes.mock) && !freightRes.ok,
+              courierId,
+              courierName:
+                assignRes.shipment?.courier ||
+                fresh.shipmentInfo?.courier ||
+                fresh.shippingSnapshot?.courierName ||
+                null,
+              assignRaw: null,
+              source: 'admin_shipmozo_assign'
+            });
+            if (oosShippingSettlement.settled) {
+              fresh = await Order.findOne({ orderId });
+              if (fresh) {
+                await evaluateAndPersistShipmentOps(fresh, { source: 'oos_shipping_settled' });
+              }
+            } else if (fresh?.paymentInfo?.oosShippingSettlement?.pending === true) {
+              logger.warn('[oosShippingSettlement] still pending after Shipmozo Ship Now', {
+                orderId: fresh.orderId,
+                reason: oosShippingSettlement.reason || freightRes.message || null,
+                courierId
+              });
+            }
+          }
+        } catch (settleErr) {
+          logger.error('oos shipping settlement after Shipmozo ship now failed', {
+            orderId: order?.orderId,
+            message: settleErr?.message || String(settleErr)
+          });
+          oosShippingSettlement = {
+            settled: false,
+            skipped: false,
+            reason: 'settlement_error',
+            message: settleErr?.message || String(settleErr)
+          };
+        }
+      }
+
+      const finalOrder = (await Order.findOne({ orderId: order.orderId })) || assignRes.order;
+      return {
+        ...assignRes,
+        order: finalOrder,
+        oosShippingSettlement
+      };
     }
 
     const { computeOpsState } = require('../services/shipmentOps/computeOpsState');
@@ -1782,14 +1846,43 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
           reconcileResult.message || 'Track failed'
         );
       }
-      const freshOrder = reconcileResult.order || (await Order.findOne({ orderId: order.orderId }));
+      let freshOrder = reconcileResult.order || (await Order.findOne({ orderId: order.orderId }));
+
+      let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
+      try {
+        if (freshOrder?.paymentInfo?.oosShippingSettlement?.pending === true) {
+          oosShippingSettlement = await trySettlePendingOosOrder(freshOrder, {
+            source: 'admin_manual_sync_shipmozo'
+          });
+          if (oosShippingSettlement.settled) {
+            const afterSettle = await Order.findOne({ orderId: order.orderId });
+            if (afterSettle) {
+              await evaluateAndPersistShipmentOps(afterSettle, { source: 'oos_shipping_settled_sync' });
+            }
+          }
+        }
+      } catch (settleErr) {
+        logger.error('oos shipping settlement after Shipmozo sync failed', {
+          orderId: order?.orderId,
+          message: settleErr?.message || String(settleErr)
+        });
+        oosShippingSettlement = {
+          settled: false,
+          skipped: false,
+          reason: 'settlement_error',
+          message: settleErr?.message || String(settleErr)
+        };
+      }
+
+      freshOrder = (await Order.findOne({ orderId: order.orderId })) || freshOrder;
       return res.json({
         success: true,
         message: 'Shipmozo tracking refreshed for this order.',
         order: freshOrder,
         provider: SHIPPING_PROVIDERS.SHIPMOZO,
         tracking: reconcileResult.tracking || null,
-        warehouseDelivered: Boolean(reconcileResult.warehouseDelivered)
+        warehouseDelivered: Boolean(reconcileResult.warehouseDelivered),
+        oosShippingSettlement
       });
     }
 
