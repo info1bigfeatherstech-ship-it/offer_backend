@@ -11,6 +11,7 @@ const {
   isRtoProviderStatus
 } = require('./shiprocketStatusMap');
 const { isMoneyCapturedPaymentStatus } = require('../../utils/orderPaymentState');
+const { isShipmozoPanelBooked } = require('../shipmozoPanelSync.service');
 
 /**
  * @param {object|null|undefined} shipmentInfo
@@ -18,6 +19,16 @@ const { isMoneyCapturedPaymentStatus } = require('../../utils/orderPaymentState'
 function hasAwb(shipmentInfo) {
   const si = shipmentInfo || {};
   return Boolean(si.awbCode || si.trackingNumber);
+}
+
+/**
+ * @param {object|null|undefined} shipmentInfo
+ */
+function isShipmozoShipmentInfo(shipmentInfo) {
+  const si = shipmentInfo || {};
+  return (
+    String(si.provider || '').toLowerCase() === 'shipmozo' || Boolean(si.shipmozoOrderId)
+  );
 }
 
 /**
@@ -197,7 +208,12 @@ function computeOpsState(order) {
   const awb = hasAwb(si);
   const artifactsValid = areFulfillmentArtifactsValid(si, effectiveClass);
 
-  if (orderStatus === 'confirmed' && !awb) return OPS_STATES.READY_TO_SHIP;
+  if (orderStatus === 'confirmed' && !awb) {
+    if (isShipmozoShipmentInfo(si) && isShipmozoPanelBooked(si)) {
+      return OPS_STATES.PICKUP_SCHEDULED;
+    }
+    return OPS_STATES.READY_TO_SHIP;
+  }
 
   if (awb) {
     const pickupBooked = isPickupBooked(si, effectiveClass);

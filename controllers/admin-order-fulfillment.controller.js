@@ -1883,18 +1883,23 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
       }
 
       freshOrder = (await Order.findOne({ orderId: order.orderId })) || freshOrder;
+      const syncMessage =
+        syncResult.message ||
+        (syncResult.partial
+          ? 'Courier booked on Shipmozo — status synced. AWB may appear after a short delay; refresh again if needed.'
+          : syncResult.hydrated
+            ? 'Synced from Shipmozo panel and refreshed tracking.'
+            : 'Shipmozo tracking refreshed for this order.');
       return res.json({
         success: true,
-        message:
-          syncResult.message ||
-          (syncResult.hydrated
-            ? 'Synced from Shipmozo panel and refreshed tracking.'
-            : 'Shipmozo tracking refreshed for this order.'),
+        message: syncMessage,
         order: freshOrder,
         provider: SHIPPING_PROVIDERS.SHIPMOZO,
         tracking: syncResult.tracking || null,
         warehouseDelivered: Boolean(syncResult.warehouseDelivered),
         panelHydrated: Boolean(syncResult.hydrated),
+        partialSync: Boolean(syncResult.partial),
+        syncCode: syncResult.code || null,
         oosShippingSettlement
       });
     }

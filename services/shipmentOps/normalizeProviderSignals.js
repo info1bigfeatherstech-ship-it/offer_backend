@@ -121,6 +121,14 @@ function classifySignalTexts(texts) {
     return CLASSIFICATION.PICKUP_SCHEDULED;
   }
 
+  if (/\bscheduled\b/.test(combined) && !/unscheduled|not\s*scheduled/.test(combined)) {
+    return CLASSIFICATION.PICKUP_SCHEDULED;
+  }
+
+  if (/data\s*received|pick\s*done|pickdone/.test(combined)) {
+    return CLASSIFICATION.PICKUP_SCHEDULED;
+  }
+
   if (/manifest/.test(combined)) {
     return CLASSIFICATION.MANIFEST;
   }

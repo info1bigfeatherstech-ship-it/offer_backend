@@ -22,6 +22,7 @@ const {
   resolveOrderShippingProvider,
   SHIPPING_PROVIDERS,
 } = require('../../constants/shippingProviders');
+const { isShipmozoPanelBooked } = require('../shipmozoPanelSync.service');
 
 /**
  * @param {string} orderStatus
@@ -74,6 +75,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     signals.classification !== CLASSIFICATION.PICKUP_EXCEPTION &&
     signals.classification !== CLASSIFICATION.PROVIDER_RESET;
   const artifactsValid = providerSignalsValid && areFulfillmentArtifactsValid(si, signals.classification);
+  const shipmozoPanelBooked = isShipmozo && isShipmozoPanelBooked(si);
 
   /** @type {Record<string, boolean>} */
   const caps = {
@@ -119,6 +121,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     case OPS_STATES.READY_TO_SHIP:
       caps.shipNow =
         !awb &&
+        !shipmozoPanelBooked &&
         gateOk &&
         (st === 'confirmed' ||
           (st === 'processing' &&
@@ -128,6 +131,9 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         (isShipmozo && gateOk && (Boolean(si.shipmozoOrderId) || Boolean(shipmentId)));
       if (!gateOk && fulfillmentPaymentGate?.message) {
         blockReasons.shipNow = fulfillmentPaymentGate.message;
+      } else if (shipmozoPanelBooked && !awb) {
+        blockReasons.shipNow =
+          'Courier already booked on Shipmozo panel. Use Refresh Shipmozo to sync AWB and tracking.';
       }
       break;
 
@@ -160,7 +166,8 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.downloadLabel = awb && !terminal;
         caps.refreshTracking = awb;
         caps.track = awb && (inTransit || st === 'processing' || st === 'delivered');
-        caps.syncShiprocket = awb && gateOk;
+        caps.syncShiprocket =
+          gateOk && (awb || Boolean(si.shipmozoOrderId) || Boolean(shipmentId) || shipmozoPanelBooked);
         caps.cancelShipment = shipmozoReady && gateOk && !terminal && !inTransit;
       } else {
         caps.generateManifest =
@@ -236,8 +243,14 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
 
     case OPS_STATES.PROVIDER_RESET:
       if (isShipmozo) {
-        caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk;
+        caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk && !shipmozoPanelBooked;
         caps.refreshTracking = awb;
+        caps.syncShiprocket =
+          gateOk && (awb || Boolean(si.shipmozoOrderId) || Boolean(shipmentId) || shipmozoPanelBooked);
+        if (shipmozoPanelBooked && !awb) {
+          blockReasons.shipNow =
+            'Courier already booked on Shipmozo panel. Use Refresh Shipmozo to sync AWB and tracking.';
+        }
       } else {
         caps.shipNow = ['confirmed', 'processing'].includes(st) && gateOk;
         enableSupportLink();
