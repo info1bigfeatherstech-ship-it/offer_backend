@@ -123,7 +123,9 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         (st === 'confirmed' ||
           (st === 'processing' &&
             (Boolean(si.shiprocketOrderId) || Boolean(si.shipmozoOrderId) || shipmentId)));
-      caps.syncShiprocket = shiprocket && gateOk;
+      caps.syncShiprocket =
+        (shiprocket && gateOk) ||
+        (isShipmozo && gateOk && (Boolean(si.shipmozoOrderId) || Boolean(shipmentId)));
       if (!gateOk && fulfillmentPaymentGate?.message) {
         blockReasons.shipNow = fulfillmentPaymentGate.message;
       }
@@ -271,6 +273,8 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       caps.refreshTracking = awb;
       if (isShipmozo) {
         caps.downloadLabel = awb && !terminal;
+        caps.syncShiprocket =
+          gateOk && (awb || Boolean(si.shipmozoOrderId) || Boolean(shipmentId));
       } else {
         caps.syncShiprocket = shiprocket;
         caps.downloadManifest = awb && Boolean(si.manifestUrl);

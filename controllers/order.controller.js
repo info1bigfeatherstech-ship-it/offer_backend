@@ -3538,19 +3538,19 @@ exports.trackOrder = async (req, res) => {
         let trackingSource = 'internal';
         const provider = resolveOrderShippingProvider(orderDoc);
 
-        // ——— Shipmozo: on-demand track + Case-1 RTO reconcile (no list polling / no Shiprocket APIs) ———
+        // ——— Shipmozo: panel hydrate + track reconcile (Shiprocket parity) ———
         if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {
-            if (awbCode) {
-                const { reconcileOrderFromShipmozo } = require('../services/shipmozoReconcile.service');
-                const reconcileResult = await reconcileOrderFromShipmozo(orderDoc, {
+            const { syncShipmentFromShipmozo, hasShipmozoSyncReference } = require('../services/shipmozoPanelSync.service');
+            if (hasShipmozoSyncReference(orderDoc.shipmentInfo)) {
+                const syncResult = await syncShipmentFromShipmozo(orderDoc, {
                     source: isOrderStaffRequest(req) ? 'admin_track_order_shipmozo' : 'track_order_shipmozo',
                     allowOrderStatusUpdate: true,
                     notify: true
                 });
-                if (reconcileResult.success) {
-                    orderDoc = reconcileResult.order || (await Order.findOne({ orderId: orderDoc.orderId }));
+                if (syncResult.success) {
+                    orderDoc = syncResult.order || (await Order.findOne({ orderId: orderDoc.orderId }));
                     trackingSource = 'shipmozo';
-                    const trackingResult = reconcileResult.tracking;
+                    const trackingResult = syncResult.tracking;
                     if (trackingResult) {
                         const providerStatus =
                             orderDoc.shipmentInfo?.providerStatus ||
@@ -3562,12 +3562,15 @@ exports.trackOrder = async (req, res) => {
                             currentStatus: providerStatus || trackingResult.currentStatus
                         };
                     }
-                } else if (reconcileResult.message) {
+                } else if (syncResult.message && syncResult.code !== 'SHIPMOZO_AWB_MISSING') {
                     logger.warn('Shipmozo live tracking fallback to internal timeline', {
                         orderId: orderDoc.orderId,
-                        reason: reconcileResult.message,
-                        code: reconcileResult.code
+                        reason: syncResult.message,
+                        code: syncResult.code
                     });
+                } else if (syncResult.hydrated && syncResult.order) {
+                    orderDoc = syncResult.order;
+                    trackingSource = 'shipmozo';
                 }
             }
         } else if (awbCode || shipmentId || orderDoc.shipmentInfo?.shiprocketOrderId) {

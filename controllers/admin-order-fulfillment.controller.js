@@ -1822,31 +1822,39 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
     if (!requireFulfillmentPaymentReady(order, res)) return;
 
     if (isShipmozoOrder(order)) {
-      // On-demand Case-1 RTO-aware reconcile — never call Shiprocket
-      const awb = order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber;
-      if (!awb) {
+      const { syncShipmentFromShipmozo, hasShipmozoSyncReference } = require('../services/shipmozoPanelSync.service');
+      if (!hasShipmozoSyncReference(order.shipmentInfo)) {
         return jsonError(
           res,
           400,
-          'SHIPMOZO_AWB_MISSING',
-          'No AWB on this Shipmozo order yet. Use Track after AWB is assigned.'
+          'SHIPMOZO_REFERENCE_MISSING',
+          'No Shipmozo order id on this order yet. Confirm the order for fulfilment first.'
         );
       }
-      const { reconcileOrderFromShipmozo } = require('../services/shipmozoReconcile.service');
-      const reconcileResult = await reconcileOrderFromShipmozo(order, {
+
+      const syncResult = await syncShipmentFromShipmozo(order, {
         source: 'admin_manual_sync_shipmozo',
         allowOrderStatusUpdate: true,
         notify: true
       });
-      if (!reconcileResult.success) {
+
+      if (!syncResult.success) {
+        const httpStatus =
+          syncResult.code === 'SHIPMOZO_DETAIL_FAILED' || syncResult.code === 'SHIPMOZO_TRACK_FAILED'
+            ? 502
+            : syncResult.code === 'SHIPMOZO_REFERENCE_MISSING' ||
+                syncResult.code === 'SHIPMOZO_ORDER_ID_MISSING'
+              ? 400
+              : 502;
         return jsonError(
           res,
-          502,
-          reconcileResult.code || 'SHIPMOZO_TRACK_FAILED',
-          reconcileResult.message || 'Track failed'
+          httpStatus,
+          syncResult.code || 'SHIPMOZO_SYNC_FAILED',
+          syncResult.message || 'Shipmozo sync failed'
         );
       }
-      let freshOrder = reconcileResult.order || (await Order.findOne({ orderId: order.orderId }));
+
+      let freshOrder = syncResult.order || (await Order.findOne({ orderId: order.orderId }));
 
       let oosShippingSettlement = { settled: false, skipped: true, reason: 'not_run' };
       try {
@@ -1877,11 +1885,16 @@ exports.adminFulfillmentSyncShiprocket = async (req, res) => {
       freshOrder = (await Order.findOne({ orderId: order.orderId })) || freshOrder;
       return res.json({
         success: true,
-        message: 'Shipmozo tracking refreshed for this order.',
+        message:
+          syncResult.message ||
+          (syncResult.hydrated
+            ? 'Synced from Shipmozo panel and refreshed tracking.'
+            : 'Shipmozo tracking refreshed for this order.'),
         order: freshOrder,
         provider: SHIPPING_PROVIDERS.SHIPMOZO,
-        tracking: reconcileResult.tracking || null,
-        warehouseDelivered: Boolean(reconcileResult.warehouseDelivered),
+        tracking: syncResult.tracking || null,
+        warehouseDelivered: Boolean(syncResult.warehouseDelivered),
+        panelHydrated: Boolean(syncResult.hydrated),
         oosShippingSettlement
       });
     }

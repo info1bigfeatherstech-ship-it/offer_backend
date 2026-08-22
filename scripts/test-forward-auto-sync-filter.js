@@ -18,7 +18,7 @@ function testFilterShape() {
   assert.ok(json.includes('shipmozo'), 'filter includes Shipmozo branch');
   assert.ok(json.includes('shiprocket'), 'filter includes Shiprocket branch');
   assert.ok(json.includes('lastSyncAt'), 'filter includes stale lastSyncAt clause');
-  assert.ok(json.includes('processing'), 'filter includes forward statuses');
+  assert.ok(json.includes('shipmozoOrderId'), 'filter includes Shipmozo order id for panel hydrate');
   console.log('ok filter shape has shipmozo + shiprocket branches');
 }
 
