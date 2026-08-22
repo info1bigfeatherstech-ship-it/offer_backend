@@ -50,7 +50,7 @@ const PIPELINE_ORDER_STATUSES = Object.freeze([
 const GMV_EXCLUDED_ORDER_STATUSES = Object.freeze(['cancelled', 'payment_failed']);
 
 /**
- * Panel tab buckets whose orders may still have an in-flight Shiprocket forward shipment.
+ * Panel tab buckets whose orders may still have an in-flight forward shipment (Shiprocket or Shipmozo).
  * Derived from {@link BUCKET_TO_ORDER_STATUSES} — excludes terminal tabs (Delivered, Cancelled/others).
  * Single source of truth for admin auto-sync eligibility (do not duplicate status lists elsewhere).
  *

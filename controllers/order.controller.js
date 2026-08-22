@@ -3461,6 +3461,7 @@ function enrichPreTransitTrackingTimeline(timeline, orderDoc) {
         isStaleCancelTimelineStatus,
         isForwardProgressStatus
     } = require('../services/shipmentOps/shiprocketStatusMap');
+    const { isShipmozoOrder } = require('../constants/shippingProviders');
     const opsState = computeOpsState(orderDoc);
     const preInTransit = ![
         OPS_STATES.IN_TRANSIT,
@@ -3506,7 +3507,11 @@ function enrichPreTransitTrackingTimeline(timeline, orderDoc) {
         timestamp: si.lastSyncAt || new Date(),
         location: null,
         description:
-            opsState === OPS_STATES.AWB_ASSIGNED ? 'Schedule pickup on Shiprocket to continue.' : null
+            opsState === OPS_STATES.AWB_ASSIGNED
+                ? isShipmozoOrder(orderDoc)
+                    ? 'Schedule pickup on Shipmozo to continue.'
+                    : 'Schedule pickup on Shiprocket to continue.'
+                : null
     };
     return [...filtered, currentEvent].sort(
         (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()

@@ -15,6 +15,17 @@
  */
 
 const { roundMoney2 } = require('../services/checkoutComputation.service');
+const {
+  resolveOrderShippingProvider,
+  SHIPPING_PROVIDERS
+} = require('../constants/shippingProviders');
+
+/** Human label for carrier fulfilment messages (Shipmozo vs Shiprocket). */
+function fulfillmentProviderLabel(order) {
+  return resolveOrderShippingProvider(order) === SHIPPING_PROVIDERS.SHIPMOZO
+    ? 'Shipmozo'
+    : 'Shiprocket';
+}
 
 /**
  * Mirrors order.controller advance first-charge calculation for splitMode "advance".
@@ -121,13 +132,14 @@ function evaluateOrderPaymentForShiprocketFulfillment(order) {
       return { ok: true, reason: 'advance_captured_legacy' };
     }
 
+    const providerLabel = fulfillmentProviderLabel(order);
     return {
       ok: false,
       code: 'ADVANCE_OR_FULL_PAYMENT_REQUIRED',
       message:
         minFirst != null
-          ? `Waiting for the customer to pay the agreed online instalment (at least ₹${minFirst}) before Shiprocket actions.`
-          : 'Waiting for the customer to complete the required online payment before Shiprocket actions.',
+          ? `Waiting for the customer to pay the agreed online instalment (at least ₹${minFirst}) before ${providerLabel} actions.`
+          : `Waiting for the customer to complete the required online payment before ${providerLabel} actions.`,
       details: {
         paymentStatus: status,
         amountPaidInr: paid,
@@ -136,11 +148,11 @@ function evaluateOrderPaymentForShiprocketFulfillment(order) {
     };
   }
 
+  const providerLabel = fulfillmentProviderLabel(order);
   return {
     ok: false,
     code: 'PAYMENT_REQUIRED',
-    message:
-      'Waiting for the customer to complete online payment before Shiprocket actions.',
+    message: `Waiting for the customer to complete online payment before ${providerLabel} actions.`,
     details: {
       paymentStatus: status,
       splitMode,
