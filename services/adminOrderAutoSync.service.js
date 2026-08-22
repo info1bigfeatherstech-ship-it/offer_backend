@@ -1,6 +1,6 @@
 /**
  * Background status sync for admin Orders tab — reconciles stale forward shipments into Mongo.
- * Shiprocket: reconcileOrderFromShiprocket. Shipmozo: reconcileOrderFromShipmozo (AWB track).
+ * Shiprocket: reconcileOrderFromShiprocket. Shipmozo: syncShipmentFromShipmozo (panel hydrate + AWB track).
  */
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
@@ -9,7 +9,7 @@ const {
   isActiveForwardSyncOrderStatus,
 } = require('../constants/adminOrderFulfillmentBuckets');
 const { reconcileOrderFromShiprocket } = require('./shiprocketReconcile.service');
-const { reconcileOrderFromShipmozo } = require('./shipmozoReconcile.service');
+const { syncShipmentFromShipmozo, hasShipmozoSyncReference } = require('./shipmozoPanelSync.service');
 const {
   isShipmozoOrder,
   SHIPPING_PROVIDERS,
@@ -37,6 +37,14 @@ function hasShiprocketReference(shipmentInfo) {
 function hasShipmozoAwb(shipmentInfo) {
   const si = shipmentInfo || {};
   return Boolean(String(si.awbCode || si.trackingNumber || '').trim());
+}
+
+/**
+ * Shipmozo auto-sync: AWB track OR panel hydrate via marketplace order id.
+ * @param {object | null | undefined} shipmentInfo
+ */
+function hasShipmozoAutoSyncReference(shipmentInfo) {
+  return hasShipmozoSyncReference(shipmentInfo);
 }
 
 /**
@@ -113,6 +121,8 @@ function buildAutoSyncCandidateFilter(opts) {
                 $or: [
                   { 'shipmentInfo.awbCode': { $exists: true, $nin: [null, ''] } },
                   { 'shipmentInfo.trackingNumber': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.shipmozoOrderId': { $exists: true, $nin: [null, ''] } },
+                  { 'shipmentInfo.shipmentId': { $exists: true, $nin: [null, ''] } },
                 ],
               },
               staleClause,
@@ -161,15 +171,15 @@ async function runShipmozoAutoSyncSingle(order, id) {
   const previousStatus = String(order.orderStatus || '').toLowerCase();
   const previousProviderStatus = String(order.shipmentInfo?.providerStatus || '');
 
-  if (!hasShipmozoAwb(order.shipmentInfo)) {
+  if (!hasShipmozoAutoSyncReference(order.shipmentInfo)) {
     return {
       orderId: id,
       success: false,
       updated: false,
       skipped: true,
       provider: SHIPPING_PROVIDERS.SHIPMOZO,
-      code: 'SHIPMOZO_AWB_MISSING',
-      message: 'No AWB on this Shipmozo order yet',
+      code: 'SHIPMOZO_REFERENCE_MISSING',
+      message: 'No Shipmozo order id or AWB on this order yet',
     };
   }
 
@@ -185,41 +195,51 @@ async function runShipmozoAutoSyncSingle(order, id) {
     };
   }
 
-  const reconcileResult = await reconcileOrderFromShipmozo(order, {
+  const previousLabelDownloaded = Boolean(order.shipmentInfo?.labelDownloaded);
+  const previousAwb = String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim();
+
+  const syncResult = await syncShipmentFromShipmozo(order, {
     source: 'admin_auto_sync_shipmozo',
     allowOrderStatusUpdate: true,
     notify: true,
   });
 
-  if (!reconcileResult.success) {
+  if (!syncResult.success && syncResult.code !== 'SHIPMOZO_AWB_MISSING') {
     return {
       orderId: id,
       success: false,
       updated: false,
       skipped: false,
       provider: SHIPPING_PROVIDERS.SHIPMOZO,
-      code: reconcileResult.code || 'SYNC_FAILED',
-      message: reconcileResult.message || 'Shipmozo sync failed',
+      code: syncResult.code || 'SYNC_FAILED',
+      message: syncResult.message || 'Shipmozo sync failed',
     };
   }
 
   const fresh = await Order.findOne({ orderId: id })
-    .select('orderStatus shipmentInfo.providerStatus')
+    .select('orderStatus shipmentInfo.providerStatus shipmentInfo.labelDownloaded shipmentInfo.awbCode shipmentInfo.trackingNumber')
     .lean();
   const currentStatus = String(fresh?.orderStatus || '').toLowerCase();
   const currentProviderStatus = String(fresh?.shipmentInfo?.providerStatus || '');
+  const currentLabelDownloaded = Boolean(fresh?.shipmentInfo?.labelDownloaded);
+  const currentAwb = String(fresh?.shipmentInfo?.awbCode || fresh?.shipmentInfo?.trackingNumber || '').trim();
 
   return {
     orderId: id,
     success: true,
     updated:
-      currentStatus !== previousStatus || currentProviderStatus !== previousProviderStatus,
+      currentStatus !== previousStatus ||
+      currentProviderStatus !== previousProviderStatus ||
+      currentLabelDownloaded !== previousLabelDownloaded ||
+      currentAwb !== previousAwb ||
+      Boolean(syncResult.hydrated),
     skipped: false,
     provider: SHIPPING_PROVIDERS.SHIPMOZO,
     previousStatus,
     currentStatus,
     previousProviderStatus,
     currentProviderStatus,
+    panelHydrated: Boolean(syncResult.hydrated),
   };
 }
 
