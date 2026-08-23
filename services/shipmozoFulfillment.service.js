@@ -59,6 +59,34 @@ function isCodOrder(order) {
     .trim() === 'cod';
 }
 
+function round2(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Math.round(x * 100) / 100;
+}
+
+function normalizeCourierId(id) {
+  const n = Number(id);
+  return Number.isFinite(n) ? n : null;
+}
+
+function courierIdsEqual(a, b) {
+  const na = normalizeCourierId(a);
+  const nb = normalizeCourierId(b);
+  return na != null && nb != null && na === nb;
+}
+
+function isExcludedCourier(courierId, excludeCourierIds) {
+  const id = normalizeCourierId(courierId);
+  if (id == null) return false;
+  const set = new Set(
+    (Array.isArray(excludeCourierIds) ? excludeCourierIds : [])
+      .map(normalizeCourierId)
+      .filter((x) => x != null)
+  );
+  return set.has(id);
+}
+
 function mapCourierPublic(c) {
   return {
     courierId: c.courierId,
@@ -69,28 +97,121 @@ function mapCourierPublic(c) {
 }
 
 /**
- * Prefer cheapest courier with totalCharges <= maxCharge; else overall cheapest.
+ * Ranked substitute candidates — never includes excluded ids (e.g. failed checkout courier).
+ * @param {Array<object>} available
+ * @param {{ codRequired?: boolean, maxCharge?: number|null, excludeCourierIds?: number[], allowAboveMaxCharge?: boolean }} [opts]
  */
-function pickSubstituteCourier(available, { codRequired = false, maxCharge = null } = {}) {
-  const list = Array.isArray(available) ? available : [];
-  let pool = list.filter((c) => c.courierId != null && Number.isFinite(c.totalCharges));
+function listSubstituteCandidates(available, opts = {}) {
+  const { codRequired = false, maxCharge = null, excludeCourierIds = [], allowAboveMaxCharge = false } =
+    opts;
+  let pool = (Array.isArray(available) ? available : []).filter(
+    (c) =>
+      c.courierId != null &&
+      Number.isFinite(c.totalCharges) &&
+      !isExcludedCourier(c.courierId, excludeCourierIds)
+  );
   if (codRequired) {
     const codPool = pool.filter((c) => c.codAvailable !== false);
     if (codPool.length) pool = codPool;
   }
-  if (!pool.length) return null;
+  if (!pool.length) return [];
+
+  pool.sort((a, b) => {
+    if (a.totalCharges !== b.totalCharges) return a.totalCharges - b.totalCharges;
+    return String(a.courierName || '').localeCompare(String(b.courierName || ''));
+  });
 
   if (maxCharge != null && Number.isFinite(Number(maxCharge))) {
     const cap = Number(maxCharge) + 0.05;
     const under = pool.filter((c) => Number(c.totalCharges) <= cap);
-    if (under.length) {
-      under.sort((a, b) => a.totalCharges - b.totalCharges);
-      return under[0];
-    }
+    if (under.length) return under;
+    if (!allowAboveMaxCharge) return [];
   }
 
-  pool.sort((a, b) => a.totalCharges - b.totalCharges);
-  return pool[0];
+  return pool;
+}
+
+/**
+ * Prefer cheapest courier with totalCharges <= maxCharge; else overall cheapest (when allowed).
+ * Always excludes failed/quoted courier ids when provided.
+ */
+function pickSubstituteCourier(available, opts = {}) {
+  const list = listSubstituteCandidates(available, opts);
+  return list[0] || null;
+}
+
+function enrichSuggestedSm(picked, freightCap) {
+  if (!picked) return null;
+  const totalCharges =
+    picked.totalCharges != null && Number.isFinite(Number(picked.totalCharges))
+      ? round2(picked.totalCharges)
+      : null;
+  const gap =
+    freightCap != null && totalCharges != null ? round2(Number(totalCharges) - Number(freightCap)) : null;
+  return {
+    courierId: picked.courierId,
+    courierName: picked.courierName,
+    totalCharges,
+    estimatedDays: picked.estimatedDays ?? null,
+    exceedsQuotedFreight: gap != null ? gap > 0.05 : false,
+    freightGapInr: gap != null && gap > 0.05 ? gap : gap != null && gap < -0.05 ? gap : 0
+  };
+}
+
+function buildUnavailablePayload({
+  message,
+  quoted,
+  suggested,
+  available,
+  freightCap,
+  details,
+  assignCode
+}) {
+  return {
+    success: false,
+    code: suggested ? 'QUOTED_COURIER_UNAVAILABLE' : 'NO_ALTERNATE_COURIER',
+    message:
+      message ||
+      (suggested
+        ? 'Checkout courier could not be assigned on Shipmozo. Confirm a substitute courier, or assign from the Shipmozo panel.'
+        : 'Checkout courier could not be assigned and no alternate Shipmozo courier is available for this route. Assign from the Shipmozo panel.'),
+    quotedCourier: quoted?.courierId
+      ? { courierId: quoted.courierId, courierName: quoted.courierName }
+      : null,
+    suggestedCourier: suggested,
+    availableCouriers: (available || []).slice(0, 15).map(mapCourierPublic),
+    quotedFreightInr: freightCap ?? null,
+    customerBillUnchanged: true,
+    details: details || null,
+    assignCode: assignCode || null
+  };
+}
+
+/**
+ * Pincode / route service errors — try another courier, do NOT treat as panel-booked.
+ * @param {string|null|undefined} message
+ */
+function isShipmozoServiceabilityAssignError(message) {
+  const m = String(message || '').toLowerCase();
+  if (!m) return false;
+  return (
+    /not provide service|does not provide|do not provide|non[\s-]*serviceable|\bnsz\b|not serviceable|serviceability|pincode|pin code|cannot deliver|can't deliver|does not deliver|delivery not available|route not available|unserviceable/.test(
+      m
+    ) && !/already\s*(assigned|booked|scheduled)/.test(m)
+  );
+}
+
+/**
+ * @param {string|null|undefined} message
+ */
+function isShipmozoAlreadyBookedAssignError(message) {
+  const m = String(message || '').toLowerCase();
+  if (!m) return false;
+  if (isShipmozoServiceabilityAssignError(message)) return false;
+  return (
+    /already\s*(assigned|booked|scheduled)|courier\s*already|pickup\s*already|order\s*already/.test(m) ||
+    /invalid\s*order\s*id|wrong\s*order\s*id|order\s*id\s*(is\s*)?(wrong|invalid|not\s*found)/.test(m)
+  );
 }
 
 function resolveShipmozoAssignOrderId(order) {
@@ -131,17 +252,117 @@ async function loadLiveRatesSafe(order) {
 }
 
 /**
- * Shipmozo assign-courier often fails when courier was already booked on their panel.
- * @param {string|null|undefined} message
+ * Build ordered assign attempts: preferred id first (if valid), then ranked substitutes.
  */
-function isShipmozoAlreadyBookedAssignError(message) {
-  const m = String(message || '').toLowerCase();
-  if (!m) return false;
-  return (
-    /already\s*(assigned|booked|scheduled)|courier\s*already|pickup\s*already|order\s*already/.test(m) ||
-    /invalid\s*order|wrong\s*order|order\s*id\s*(is\s*)?(wrong|invalid|not\s*found)/.test(m) ||
-    /\bscheduled\b/.test(m)
-  );
+function buildAssignAttemptList(available, opts = {}) {
+  const {
+    codRequired = false,
+    freightCap = null,
+    excludeCourierIds = [],
+    preferredCourierId = null,
+    allowAboveMaxCharge = false
+  } = opts;
+
+  const underCap = listSubstituteCandidates(available, {
+    codRequired,
+    maxCharge: freightCap,
+    excludeCourierIds,
+    allowAboveMaxCharge: false
+  });
+  let aboveCap = [];
+  if (allowAboveMaxCharge && underCap.length === 0) {
+    aboveCap = listSubstituteCandidates(available, {
+      codRequired,
+      maxCharge: freightCap,
+      excludeCourierIds,
+      allowAboveMaxCharge: true
+    });
+  }
+  const ranked = [...underCap, ...aboveCap.filter((c) => !underCap.some((u) => courierIdsEqual(u.courierId, c.courierId)))];
+
+  const pref = normalizeCourierId(preferredCourierId);
+  if (pref == null || isExcludedCourier(pref, excludeCourierIds)) {
+    return ranked;
+  }
+  const prefRow = ranked.find((c) => courierIdsEqual(c.courierId, pref));
+  if (!prefRow) {
+    return ranked;
+  }
+  return [prefRow, ...ranked.filter((c) => !courierIdsEqual(c.courierId, pref))];
+}
+
+/**
+ * Try assign-courier for each candidate until one succeeds.
+ */
+async function tryAssignSubstituteCouriers({
+  smOrderId,
+  order,
+  candidates,
+  quoted,
+  available,
+  applyUpsertShipmentInfo,
+  evaluateAndPersistShipmentOps
+}) {
+  const failedAttempts = [];
+
+  for (const candidate of candidates) {
+    const targetCourierId = Number(candidate.courierId);
+    if (!Number.isFinite(targetCourierId)) continue;
+
+    const assign = await ShipmozoService.assignCourier({
+      orderId: smOrderId,
+      courierId: targetCourierId
+    });
+
+    if (assign.success) {
+      const substituted = quoted.courierId != null && !courierIdsEqual(targetCourierId, quoted.courierId);
+      const substituteMeta = substituted
+        ? {
+            courierAssignNote: quoted.courierId
+              ? `Quoted courier ${quoted.courierName || quoted.courierId} could not be assigned; assigned ${candidate.courierName || targetCourierId} after admin confirm.`
+              : `Assigned ${candidate.courierName || targetCourierId} after admin confirm.`,
+            courierSubstitutedFromId: quoted.courierId,
+            courierSubstitutedFromName: quoted.courierName
+          }
+        : null;
+
+      return finalizeShipmozoAssign({
+        order,
+        smOrderId,
+        targetCourierId,
+        quoted,
+        available,
+        assign,
+        substituted,
+        substituteMeta,
+        applyUpsertShipmentInfo,
+        evaluateAndPersistShipmentOps
+      });
+    }
+
+    failedAttempts.push({
+      courierId: targetCourierId,
+      courierName: candidate.courierName || null,
+      message: assign.message || 'Assign failed',
+      code: assign.code || null
+    });
+
+    if (isShipmozoAlreadyBookedAssignError(assign.message)) {
+      return {
+        success: false,
+        panelBooked: true,
+        message: assign.message,
+        failedAttempts,
+        assign
+      };
+    }
+  }
+
+  return {
+    success: false,
+    panelBooked: false,
+    failedAttempts
+  };
 }
 
 /**
@@ -252,6 +473,8 @@ async function runShipmozoAssignShip(order, opts = {}) {
     let available = [];
     let ratesLoaded = false;
 
+    const failedCourierIds = [];
+
     const ensureRates = async () => {
       if (ratesLoaded) return available;
       const rates = await loadLiveRatesSafe(order);
@@ -260,19 +483,32 @@ async function runShipmozoAssignShip(order, opts = {}) {
       return available;
     };
 
-    const suggestedFromRates = () => {
+    const buildExcludeIds = () => {
+      const ids = [];
+      if (quoted.courierId != null) ids.push(quoted.courierId);
+      for (const id of failedCourierIds) ids.push(id);
+      return ids;
+    };
+
+    const suggestedFromRates = (opts = {}) => {
       const picked = pickSubstituteCourier(available, {
         codRequired,
-        maxCharge: freightCap
+        maxCharge: freightCap,
+        excludeCourierIds: buildExcludeIds(),
+        allowAboveMaxCharge: Boolean(opts.allowAboveMaxCharge)
       });
-      if (!picked) return null;
-      return {
-        courierId: picked.courierId,
-        courierName: picked.courierName,
-        totalCharges: picked.totalCharges,
-        estimatedDays: picked.estimatedDays
-      };
+      return enrichSuggestedSm(picked, freightCap);
     };
+
+    const listPublicAlternates = () =>
+      listSubstituteCandidates(available, {
+        codRequired,
+        maxCharge: freightCap,
+        excludeCourierIds: buildExcludeIds(),
+        allowAboveMaxCharge: true
+      })
+        .slice(0, 15)
+        .map(mapCourierPublic);
 
     let targetCourierId = hasOverride ? Number(courierIdOverride) : null;
     let substituted = false;
@@ -316,43 +552,51 @@ async function runShipmozoAssignShip(order, opts = {}) {
         return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
       }
 
+      failedCourierIds.push(Number(quoted.courierId));
+
       // Assign failed — load rates only to suggest alternatives (never claim "unavailable"
       // solely because our rate list was empty before trying assign).
       await ensureRates();
-      const suggested = suggestedFromRates();
+      let suggested = suggestedFromRates();
+      if (!suggested) {
+        suggested = suggestedFromRates({ allowAboveMaxCharge: true });
+      }
 
       logger.warn('[Shipmozo] Quoted assign failed; offering substitute', {
         orderId: order.orderId,
         quotedCourierId: quoted.courierId,
         assignMessage: direct.message,
         rateCount: available.length,
-        suggestedCourierId: suggested?.courierId || null
+        suggestedCourierId: suggested?.courierId || null,
+        serviceabilityError: isShipmozoServiceabilityAssignError(direct.message)
       });
 
-      return {
-        success: false,
-        code: 'QUOTED_COURIER_UNAVAILABLE',
-        message:
-          direct.message ||
-          `Could not assign checkout courier "${quoted.courierName || quoted.courierId}". Confirm a substitute courier, or assign from the Shipmozo panel.`,
-        quotedCourier: {
-          courierId: quoted.courierId,
-          courierName: quoted.courierName
-        },
-        suggestedCourier: suggested,
-        availableCouriers: available.slice(0, 15).map(mapCourierPublic),
-        details: direct.raw || null
-      };
+      const gapNote =
+        suggested?.exceedsQuotedFreight && suggested?.freightGapInr != null
+          ? ` Suggested courier is ₹${suggested.freightGapInr} above customer-paid shipping — gap is merchant-side only (customer bill unchanged).`
+          : ' Customer order total is not changed.';
+
+      return buildUnavailablePayload({
+        message: `${direct.message || `Could not assign checkout courier "${quoted.courierName || quoted.courierId}".`}${gapNote}`,
+        quoted,
+        suggested,
+        available,
+        freightCap,
+        details: direct.raw || null,
+        assignCode: direct.code
+      });
     }
 
     // ── Path: admin confirmed substitute / no quoted / override ─────────────
     if (!hasOverride) {
       await ensureRates();
-      const suggested = suggestedFromRates();
+      let suggested = suggestedFromRates();
+      if (!suggested) {
+        suggested = suggestedFromRates({ allowAboveMaxCharge: true });
+      }
 
       if (quoted.courierId == null && !confirmSubstitute) {
         if (!suggested) {
-          // Last resort: nothing to suggest — ask admin to confirm retry / panel
           return {
             success: false,
             code: 'NO_QUOTED_COURIER',
@@ -360,18 +604,18 @@ async function runShipmozoAssignShip(order, opts = {}) {
               'No checkout courier on this order and no Shipmozo rates returned. Retry shortly or assign from the Shipmozo panel.',
             quotedCourier: null,
             suggestedCourier: null,
-            availableCouriers: []
+            availableCouriers: [],
+            customerBillUnchanged: true
           };
         }
-        return {
-          success: false,
-          code: 'QUOTED_COURIER_UNAVAILABLE',
+        return buildUnavailablePayload({
           message:
             'No checkout courier was stored on this order. Confirm to assign the cheapest available Shipmozo courier, or pass courierId.',
-          quotedCourier: null,
-          suggestedCourier: suggested,
-          availableCouriers: available.slice(0, 15).map(mapCourierPublic)
-        };
+          quoted: null,
+          suggested,
+          available,
+          freightCap
+        });
       }
 
       if (confirmSubstitute) {
@@ -386,12 +630,14 @@ async function runShipmozoAssignShip(order, opts = {}) {
             courierSubstitutedFromName: quoted.courierName
           };
         } else if (quoted.courierId != null) {
-          // Rates empty but admin confirmed — retry quoted assign (panel may still accept)
-          logger.info('[Shipmozo] confirmSubstitute with empty rates — retry quoted assign', {
-            orderId: order.orderId,
-            quotedCourierId: quoted.courierId
+          return buildUnavailablePayload({
+            message:
+              'No alternate Shipmozo courier is available for this route after excluding the checkout courier. Assign from the Shipmozo panel.',
+            quoted,
+            suggested: null,
+            available,
+            freightCap
           });
-          targetCourierId = Number(quoted.courierId);
         } else {
           return {
             success: false,
@@ -402,101 +648,107 @@ async function runShipmozoAssignShip(order, opts = {}) {
               ? { courierId: quoted.courierId, courierName: quoted.courierName }
               : null,
             suggestedCourier: null,
-            availableCouriers: []
+            availableCouriers: listPublicAlternates(),
+            customerBillUnchanged: true
           };
         }
       }
     }
 
-    if (targetCourierId == null || !Number.isFinite(Number(targetCourierId))) {
-      return {
-        success: false,
-        code: 'COURIER_ID_REQUIRED',
-        message: 'courierId is required to assign on Shipmozo.'
-      };
-    }
-
-    if (hasOverride && quoted.courierId != null && Number(targetCourierId) !== Number(quoted.courierId)) {
-      substituted = true;
-      substituteMeta = {
-        courierAssignNote: `Assigned courier ${targetCourierId} (override); checkout quote was ${quoted.courierName || quoted.courierId}.`,
-        courierSubstitutedFromId: quoted.courierId,
-        courierSubstitutedFromName: quoted.courierName
-      };
-    }
-
-    logger.info('[Shipmozo] Ship now: assign target courier', {
-      orderId: order.orderId,
-      smOrderId,
-      targetCourierId,
-      substituted,
-      hasOverride,
-      confirmSubstitute
-    });
-
-    const assign = await ShipmozoService.assignCourier({
-      orderId: smOrderId,
-      courierId: Number(targetCourierId)
-    });
-
-    if (!assign.success) {
-      if (isShipmozoAlreadyBookedAssignError(assign.message)) {
-        logger.info('[Shipmozo] Assign failed — panel likely booked; syncing', {
-          orderId: order.orderId,
-          smOrderId,
-          assignMessage: assign.message
-        });
-        return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
-      }
+    // When admin confirmed substitute (or picked override), try ranked couriers — never re-assign
+    // the failed checkout courier unless it is the only explicit override and rates are empty.
+    if (confirmSubstitute || hasOverride) {
       if (!ratesLoaded) await ensureRates();
-      // If override/substitute failed, surface clearly (do not infinite-loop confirm)
-      if (!hasOverride && !confirmSubstitute && quoted.courierId != null) {
-        return {
-          success: false,
-          code: 'QUOTED_COURIER_UNAVAILABLE',
+
+      const preferredId =
+        hasOverride && !courierIdsEqual(courierIdOverride, quoted.courierId)
+          ? Number(courierIdOverride)
+          : targetCourierId;
+
+      const excludeIds = buildExcludeIds();
+      if (quoted.courierId != null && !excludeIds.some((id) => courierIdsEqual(id, quoted.courierId))) {
+        excludeIds.push(quoted.courierId);
+      }
+
+      let candidates = buildAssignAttemptList(available, {
+        codRequired,
+        freightCap,
+        excludeCourierIds: excludeIds,
+        preferredCourierId: preferredId,
+        allowAboveMaxCharge: true
+      });
+
+      if (!candidates.length && hasOverride && !courierIdsEqual(courierIdOverride, quoted.courierId)) {
+        const overrideRow = available.find((c) => courierIdsEqual(c.courierId, courierIdOverride));
+        if (overrideRow) candidates = [overrideRow];
+      }
+
+      if (!candidates.length) {
+        return buildUnavailablePayload({
           message:
-            assign.message ||
-            'Could not assign checkout courier. Confirm a substitute or assign from the Shipmozo panel.',
-          quotedCourier: {
-            courierId: quoted.courierId,
-            courierName: quoted.courierName
-          },
-          suggestedCourier: suggestedFromRates(),
-          availableCouriers: available.slice(0, 15).map(mapCourierPublic),
-          details: assign.raw || null
+            'No alternate Shipmozo courier could be assigned for this route. Assign from the Shipmozo panel.',
+          quoted,
+          suggested: suggestedFromRates({ allowAboveMaxCharge: true }),
+          available,
+          freightCap
+        });
+      }
+
+      logger.info('[Shipmozo] Ship now: trying substitute courier(s)', {
+        orderId: order.orderId,
+        smOrderId,
+        attemptIds: candidates.map((c) => c.courierId),
+        confirmSubstitute,
+        hasOverride
+      });
+
+      const attempt = await tryAssignSubstituteCouriers({
+        smOrderId,
+        order,
+        candidates,
+        quoted,
+        available,
+        applyUpsertShipmentInfo,
+        evaluateAndPersistShipmentOps
+      });
+
+      if (attempt.success) {
+        return {
+          ...attempt,
+          customerBillUnchanged: true,
+          quotedFreightInr: freightCap
         };
       }
-      return {
-        success: false,
-        code: assign.code || 'ASSIGN_COURIER_FAILED',
-        message: assign.message || 'Shipmozo assign-courier failed',
-        details: assign.raw || null,
-        suggestedCourier: suggestedFromRates(),
-        availableCouriers: available.slice(0, 15).map(mapCourierPublic)
-      };
-    }
 
-    if (!ratesLoaded) {
-      // Best-effort rates for courier name / pickup flags (non-blocking)
-      try {
-        await ensureRates();
-      } catch (_) {
-        /* ignore */
+      if (attempt.panelBooked) {
+        return syncFromPanelInsteadOfAssign(order, { evaluateAndPersistShipmentOps });
       }
+
+      for (const f of attempt.failedAttempts || []) {
+        if (f.courierId != null) failedCourierIds.push(f.courierId);
+      }
+
+      const nextSuggested = suggestedFromRates({ allowAboveMaxCharge: true });
+      const lastMsg =
+        attempt.failedAttempts?.[attempt.failedAttempts.length - 1]?.message ||
+        'Shipmozo assign-courier failed for all substitute couriers.';
+
+      return buildUnavailablePayload({
+        message: `${lastMsg} Assign from the Shipmozo panel if needed.`,
+        quoted,
+        suggested: nextSuggested,
+        available,
+        freightCap,
+        details: attempt.failedAttempts || null
+      });
     }
 
-    return finalizeShipmozoAssign({
-      order,
-      smOrderId,
-      targetCourierId: Number(targetCourierId),
-      quoted,
-      available,
-      assign,
-      substituted,
-      substituteMeta,
-      applyUpsertShipmentInfo,
-      evaluateAndPersistShipmentOps
-    });
+    return {
+      success: false,
+      code: 'ASSIGN_PATH_UNREACHABLE',
+      message: 'Could not determine Shipmozo assign path for this order. Retry Ship now or assign from the Shipmozo panel.',
+      customerBillUnchanged: true
+    };
   } catch (err) {
     logger.error('[Shipmozo] runShipmozoAssignShip unexpected error', {
       orderId: order?.orderId,
@@ -653,5 +905,10 @@ async function finalizeShipmozoAssign({
 module.exports = {
   runShipmozoAssignShip,
   quotedCourierFromOrder,
-  pickSubstituteCourier
+  pickSubstituteCourier,
+  listSubstituteCandidates,
+  enrichSuggestedSm,
+  isShipmozoServiceabilityAssignError,
+  isShipmozoAlreadyBookedAssignError,
+  courierIdsEqual
 };

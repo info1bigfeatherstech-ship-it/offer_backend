@@ -1785,7 +1785,7 @@ exports.adminFulfillmentAssignShip = async (req, res) => {
         status = 500;
       } else if (c === 'SHIPROCKET_WALLET_OR_BALANCE') {
         status = 402;
-      } else if (c === 'QUOTED_COURIER_UNAVAILABLE') {
+      } else if (c === 'QUOTED_COURIER_UNAVAILABLE' || c === 'NO_ALTERNATE_COURIER') {
         status = 409;
       }
       return jsonError(res, status, c, assignRes.message, {
