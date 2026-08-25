@@ -447,6 +447,13 @@ app.post(
   orderController.shiprocketWebhook
 );
 
+// Shipmozo push webhooks (separate from Shiprocket). Panel URL may include ?token=
+app.post(
+  '/api/orders/shipping/shipmozo/webhook',
+  express.json({ limit: '1mb' }),
+  orderController.shipmozoWebhook
+);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan(IS_PRODUCTION ? 'combined' : 'dev'));

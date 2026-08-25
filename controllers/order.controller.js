@@ -2408,6 +2408,59 @@ exports.shiprocketWebhook = async (req, res) => {
     }
 };
 
+// ========== SHIPMOZO WEBHOOK (Shipmozo orders only — does not touch Shiprocket) ==========
+exports.shipmozoWebhook = async (req, res) => {
+    try {
+        const {
+            verifyShipmozoWebhookAuth,
+            processShipmozoWebhook
+        } = require('../services/shipmozoWebhook.service');
+
+        const auth = verifyShipmozoWebhookAuth(req);
+        if (!auth.ok) {
+            return respondOrderError(
+                res,
+                401,
+                auth.code || 'SHIPMOZO_WEBHOOK_UNAUTHORIZED',
+                auth.message || 'Invalid Shipmozo webhook token'
+            );
+        }
+
+        const result = await processShipmozoWebhook(req.body || {}, { source: 'shipmozo_webhook' });
+
+        if (!result.success) {
+            const status = Number(result.httpStatus) || 400;
+            return respondOrderError(
+                res,
+                status,
+                result.code || 'SHIPMOZO_WEBHOOK_FAILED',
+                result.message || 'Shipmozo webhook failed',
+                {
+                    orderId: result.orderId || null,
+                    provider: result.provider || null
+                }
+            );
+        }
+
+        return res.json({
+            success: true,
+            message: result.message || 'Shipmozo webhook processed',
+            orderId: result.orderId || null,
+            cancelled: Boolean(result.cancelled),
+            previousProviderStatus: result.previousProviderStatus || null,
+            currentProviderStatus: result.currentProviderStatus || null,
+            previousOrderStatus: result.previousOrderStatus || null,
+            currentOrderStatus: result.currentOrderStatus || null
+        });
+    } catch (error) {
+        logger.error('Shipmozo webhook error', {
+            message: error.message,
+            stack: error.stack
+        });
+        return respondOrderError(res, 500, 'SHIPMOZO_WEBHOOK_FAILED', 'Failed to process Shipmozo webhook');
+    }
+};
+
 // ========== PAY REMAINING BALANCE (after advance) ==========
 exports.payOrderBalance = async (req, res) => {
     try {
