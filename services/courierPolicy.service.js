@@ -115,8 +115,14 @@ function pickCheapestActiveCourier(couriers, opts = {}) {
   const active = filterActiveCouriers(couriers);
   if (!active.length) return null;
 
+  const excludeIds = new Set(
+    (Array.isArray(opts.excludeCourierIds) ? opts.excludeCourierIds : [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0)
+  );
+
   const needCod = Boolean(opts.codRequired);
-  const filtered = needCod
+  let filtered = needCod
     ? active.filter(
         (c) =>
           c.cod === 1 ||
@@ -125,7 +131,15 @@ function pickCheapestActiveCourier(couriers, opts = {}) {
           c.is_cod_available === true
       )
     : active;
-  const pool = filtered.length ? filtered : active;
+  let pool = filtered.length ? filtered : active;
+
+  if (excludeIds.size) {
+    pool = pool.filter((c) => {
+      const id = getCourierCompanyIdFromRow(c);
+      return id == null || !excludeIds.has(Number(id));
+    });
+  }
+  if (!pool.length) return null;
 
   const scored = pool.map((c) => {
     const rate = Number(c.rate ?? c.freight_charge ?? Infinity);

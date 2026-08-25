@@ -237,10 +237,11 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
     const codRequired = () => Boolean(parts?.useCodAtDoor);
 
-    const suggestedFromRates = () => {
+    const suggestedFromRates = (excludeCourierIds = []) => {
       const picked = pickCheapestActiveCourier(available, {
         codRequired: codRequired(),
-        maxCharge: freightCap
+        maxCharge: freightCap,
+        excludeCourierIds
       });
       return enrichSuggested(picked, freightCap);
     };
@@ -330,7 +331,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
             res.assign.message ||
             'Could not assign selected courier. Confirm another substitute or use the Shiprocket panel.',
           quoted,
-          suggested: suggestedFromRates(),
+          suggested: suggestedFromRates([quoted.courierId, courierIdOverride].filter(Boolean)),
           available,
           freightCap,
           details: res.assign.details || res.assign.raw || null,
@@ -374,7 +375,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
           customerBillUnchanged: true
         };
       }
-      const suggested = suggestedFromRates();
+      const suggested = suggestedFromRates(quoted.courierId != null ? [quoted.courierId] : []);
       let targetId = suggested?.courierId ?? null;
       let courierName = suggested?.courierName || null;
       let reason = 'admin_confirm';
@@ -454,7 +455,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
     if (quoted.courierId != null) {
       if (isCourierInactive({ id: quoted.courierId, name: quoted.courierName })) {
         await ensureRates();
-        const suggested = suggestedFromRates();
+        const suggested = suggestedFromRates(quoted.courierId != null ? [quoted.courierId] : []);
         return unavailablePayload({
           message: `Checkout courier "${quoted.courierName || quoted.courierId}" is inactive in our shipping policy. Confirm a substitute (customer bill unchanged), or assign from the Shiprocket panel.`,
           quoted,
@@ -495,7 +496,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
       }
 
       await ensureRates();
-      const suggested = suggestedFromRates();
+      const suggested = suggestedFromRates(quoted.courierId != null ? [quoted.courierId] : []);
       logger.warn('[Shiprocket] Quoted assign failed; offering substitute', {
         orderId: order.orderId,
         quotedCourierId: quoted.courierId,
