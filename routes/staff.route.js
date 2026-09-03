@@ -139,7 +139,7 @@ router.post(
       .isLength({ min: 6 })
       .withMessage('Password must be at least 6 characters'),
     body('role')
-      .isIn(['product_manager', 'order_manager', 'marketing_manager'])
+      .isIn(['product_manager', 'order_manager', 'marketing_manager', 'inventory_manager'])
       .withMessage('Invalid role')
   ],
   staffController.createStaff

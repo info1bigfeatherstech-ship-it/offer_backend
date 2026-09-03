@@ -6,6 +6,11 @@ const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
 const { uploadProductImages, uploadCSVFile, uploadBulkNewProductFiles } = require('../middlewares/upload.middleware');
 const productController = require('../controllers/product.controller');
 const updateProductTagController = require('../controllers/updateProductTag.controller');
+
+const readRoles = authorizeRoles('admin', 'product_manager', 'inventory_manager');
+const writeRoles = authorizeRoles('admin', 'product_manager');
+const inventoryWriteRoles = authorizeRoles('admin', 'product_manager', 'inventory_manager');
+
 // Validation middleware to check for rejected fields
 const rejectSlugSku = (req, res, next) => {
   if ('slug' in req.body || 'sku' in req.body) {
@@ -15,13 +20,13 @@ const rejectSlugSku = (req, res, next) => {
 };
 
 router.use(verifyToken);
-router.use(authorizeRoles('admin', 'product_manager'));
 
 // =============================================
-// PRODUCT CRUD - Main routes
+// PRODUCT CRUD - Write routes (catalog managers only)
 // =============================================
 router.post(
   '/',
+  writeRoles,
   uploadProductImages,
   rejectSlugSku,
   [
@@ -47,41 +52,46 @@ router.post(
 );
 
 // =============================================
-// BULK UPLOAD & PREVIEW ROUTES (Specific paths)
+// BULK UPLOAD & PREVIEW ROUTES (catalog managers only)
 // =============================================
-router.post('/preview-csv', uploadCSVFile, productController.previewBulkUpload);
-router.post('/preview-import-csv', uploadCSVFile, productController.previewImportProductsFromCSV);
-router.post('/import-csv', uploadCSVFile, productController.importProductsFromCSV);
-router.get('/download-error-report/:fileName', productController.downloadErrorReport);
-router.post('/bulk-new-products', uploadBulkNewProductFiles, productController.bulkUploadNewProductsWithImages);
-router.patch('/bulk-status', productController.bulkUpdateProductStatus);
-router.get('/bulk-upload-template', productController.downloadBulkUploadTemplate);
+router.post('/preview-csv', writeRoles, uploadCSVFile, productController.previewBulkUpload);
+router.post('/preview-import-csv', writeRoles, uploadCSVFile, productController.previewImportProductsFromCSV);
+router.post('/import-csv', writeRoles, uploadCSVFile, productController.importProductsFromCSV);
+router.get('/download-error-report/:fileName', writeRoles, productController.downloadErrorReport);
+router.post('/bulk-new-products', writeRoles, uploadBulkNewProductFiles, productController.bulkUploadNewProductsWithImages);
+router.patch('/bulk-status', writeRoles, productController.bulkUpdateProductStatus);
+router.get('/bulk-upload-template', writeRoles, productController.downloadBulkUploadTemplate);
 
 // =============================================
-// LIST & FILTER ROUTES (Specific paths)
+// LIST & FILTER ROUTES (read + inventory_manager)
 // =============================================
-router.get('/archived', productController.getArchivedProducts);
-router.post('/bulk-delete', productController.bulkDelete);
-router.patch('/bulk-restore', productController.bulkRestore);
-router.get('/low-stock', productController.getLowStockProducts);
-router.get('/drafts', productController.getDraftProducts);
-router.get('/all', productController.getAllProductsAdmin);
-router.get('/export-csv', productController.exportProductsCSV);
-router.delete('/bulk-hard-delete', productController.bulkHardDelete);
-router.get('/active', productController.getAllActiveProducts);
-            
-router.put("/updateFlags", updateProductTagController);
+router.get('/archived', writeRoles, productController.getArchivedProducts);
+router.post('/bulk-delete', writeRoles, productController.bulkDelete);
+router.patch('/bulk-restore', writeRoles, productController.bulkRestore);
+router.get('/low-stock', readRoles, productController.getLowStockProducts);
+router.get('/drafts', readRoles, productController.getDraftProducts);
+router.get('/all', readRoles, productController.getAllProductsAdmin);
+router.get('/export-csv', writeRoles, productController.exportProductsCSV);
+router.delete('/bulk-hard-delete', writeRoles, productController.bulkHardDelete);
+router.get('/active', readRoles, productController.getAllActiveProducts);
+
+router.put('/updateFlags', writeRoles, updateProductTagController);
+
 // =============================================
 // SINGLE PRODUCT ACTIONS (with :slug, :productCode)
 // =============================================
-router.patch('/restore/:slug', productController.restoreProduct);
-router.delete('/hard/:slug', productController.hardDeleteProduct);
-router.post('/:slug/variants', uploadProductImages, productController.addVariant);
-router.patch('/:slug/variants/:productCode/channel-visibility', productController.updateVariantChannelVisibility);
-router.delete('/:slug/variants', productController.deleteVariant);
-router.get('/variant/:productCode', productController.getVariantByproductCode);
-router.put('/:slug', uploadProductImages, rejectSlugSku, productController.updateProduct);
-router.delete('/:slug', productController.deleteProduct);
-router.get('/:slug', productController.getProductBySlug);
-// router.get('/', productController.getAllActiveProducts); // Get products with filters, pagination, search, etc.
+router.patch('/restore/:slug', writeRoles, productController.restoreProduct);
+router.delete('/hard/:slug', writeRoles, productController.hardDeleteProduct);
+router.post('/:slug/variants', writeRoles, uploadProductImages, productController.addVariant);
+router.patch('/:slug/variants/:productCode/channel-visibility', writeRoles, productController.updateVariantChannelVisibility);
+router.delete('/:slug/variants', writeRoles, productController.deleteVariant);
+router.get('/variant/:productCode', readRoles, productController.getVariantByproductCode);
+
+// Inventory-only patch — must be registered before PUT /:slug
+router.patch('/:slug/inventory', inventoryWriteRoles, productController.patchProductInventory);
+
+router.put('/:slug', writeRoles, uploadProductImages, rejectSlugSku, productController.updateProduct);
+router.delete('/:slug', writeRoles, productController.deleteProduct);
+router.get('/:slug', readRoles, productController.getProductBySlug);
+
 module.exports = router;

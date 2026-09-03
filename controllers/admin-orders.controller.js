@@ -81,8 +81,8 @@ exports.getDashboardSummary = async (req, res) => {
  * Query: from, to, rangePreset, presetDays, bucket, search, page, limit, sortBy, sortOrder
  *
  * When `search` is non-empty: date window is ignored (all-time) and status bucket is skipped
- * so order ID / AWB / name / phone can match any age or status. Browse without search keeps
- * the requested date range (default last 30 days).
+ * so order ID / AWB / name / phone can match any age or status. Browse without search uses
+ * the requested date range (`rangePreset=all` = lifetime / paginated; today|last7|last30|from+to = window).
  */
 exports.getOrdersList = async (req, res) => {
   try {

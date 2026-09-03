@@ -68,7 +68,7 @@ function _enforceAdminStorefrontScope(req, res, next, options = {}) {
                 ]
               },
               { userType: { $nin: ['wholesaler', 'admin'] } },
-              { role: { $nin: ['wholesaler', 'admin', 'product_manager', 'order_manager', 'marketing_manager'] } }
+              { role: { $nin: ['wholesaler', 'admin', 'product_manager', 'order_manager', 'marketing_manager', 'inventory_manager'] } }
             ]
           }
   };

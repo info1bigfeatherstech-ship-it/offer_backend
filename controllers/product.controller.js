@@ -4723,22 +4723,6 @@ const updateProduct = async (req, res) => {
         doc.markModified('variants');
       }
 
-      if (updates.channelVisibility !== undefined) {
-        const parsed = parseIfString(updates.channelVisibility, {});
-        if (
-          parsed?.wholesale === "active" &&
-          !hasWholesalePricingConfig(variant)
-        ) {
-          return res.status(400).json({
-            success: false,
-            message:
-              "Cannot set wholesale visibility active for this variant. Set wholesale=true and wholesaleBase (>0) first."
-          });
-        }
-        variant.channelVisibility = mergeVariantChannelVisibility(variant, parsed);
-        doc.markModified("variants");
-      }
-
       if (updates.attributes !== undefined) {
         const parsed = parseIfString(updates.attributes, []);
         variant.attributes = Array.isArray(parsed)
@@ -4862,6 +4846,23 @@ const updateProduct = async (req, res) => {
         }
       }
 
+      // Apply channelVisibility AFTER wholesale flag + price (same-request safe).
+      if (updates.channelVisibility !== undefined) {
+        const parsed = parseIfString(updates.channelVisibility, {});
+        if (
+          parsed?.wholesale === "active" &&
+          !hasWholesalePricingConfig(variant)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Cannot set wholesale visibility active for this variant. Set wholesale=true and wholesaleBase (>0) first."
+          });
+        }
+        variant.channelVisibility = mergeVariantChannelVisibility(variant, parsed);
+        doc.markModified("variants");
+      }
+
       const keptRes = parseVariantKeptArrayFromBody(updates);
       if (!keptRes.ok) {
         return res.status(400).json({
@@ -4969,6 +4970,177 @@ const updateProduct = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error updating product",
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Inventory-only update for inventory_manager role.
+ * Accepts { variants: [{ productCode, quantity?, lowStockThreshold? }] } — no other fields.
+ */
+const patchProductInventory = async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    const topKeys = Object.keys(body);
+    if (topKeys.length !== 1 || topKeys[0] !== "variants") {
+      return res.status(400).json({
+        success: false,
+        message: "Only a variants array is allowed in the inventory update request"
+      });
+    }
+
+    const variantsInput = body.variants;
+    if (!Array.isArray(variantsInput) || variantsInput.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "variants must be a non-empty array"
+      });
+    }
+
+    const seenCodes = new Set();
+    for (const item of variantsInput) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return res.status(400).json({
+          success: false,
+          message: "Each variant entry must be an object"
+        });
+      }
+      const itemKeys = Object.keys(item);
+      const allowedVariantKeys = ["productCode", "quantity", "lowStockThreshold"];
+      const invalidKeys = itemKeys.filter((k) => !allowedVariantKeys.includes(k));
+      if (invalidKeys.length) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid fields in variant update: ${invalidKeys.join(", ")}`
+        });
+      }
+      const productCode = String(item.productCode || "").trim();
+      if (!productCode) {
+        return res.status(400).json({
+          success: false,
+          message: "productCode is required for each variant"
+        });
+      }
+      if (seenCodes.has(productCode)) {
+        return res.status(400).json({
+          success: false,
+          message: `Duplicate productCode in request: ${productCode}`
+        });
+      }
+      seenCodes.add(productCode);
+      if (item.quantity === undefined && item.lowStockThreshold === undefined) {
+        return res.status(400).json({
+          success: false,
+          message: "At least quantity or lowStockThreshold must be provided per variant"
+        });
+      }
+      if (item.quantity !== undefined) {
+        const nextQty = Number(item.quantity);
+        if (!Number.isFinite(nextQty) || nextQty < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "quantity must be a non-negative number"
+          });
+        }
+      }
+      if (item.lowStockThreshold !== undefined) {
+        const lst = Number(item.lowStockThreshold);
+        if (!Number.isFinite(lst) || lst < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "lowStockThreshold must be a non-negative number"
+          });
+        }
+      }
+    }
+
+    const doc = await Product.findOne({ slug });
+    if (!doc) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found"
+      });
+    }
+
+    const restockNotifyEvents = [];
+
+    for (const item of variantsInput) {
+      const productCode = String(item.productCode).trim();
+      const variant = doc.variants.find(
+        (v) => String(v.productCode || "") === productCode
+      );
+      if (!variant) {
+        return res.status(404).json({
+          success: false,
+          message: `Variant not found: ${productCode}`
+        });
+      }
+
+      if (!variant.inventory) {
+        variant.inventory = {
+          quantity: 0,
+          trackInventory: true,
+          lowStockThreshold: 5
+        };
+      }
+
+      if (item.quantity !== undefined) {
+        const prevQty = Number(variant.inventory.quantity || 0);
+        const nextQty = Number(item.quantity);
+        const trackInventory = variant.inventory.trackInventory !== false;
+        try {
+          const { isRestockTransition } = require("../services/oosRestockNotify.service");
+          if (
+            isRestockTransition(prevQty, nextQty, trackInventory !== false, {
+              minimumOrderQuantity: variant.minimumOrderQuantity
+            })
+          ) {
+            restockNotifyEvents.push({
+              productId: doc._id,
+              variantId: variant._id,
+              productSlug: doc.slug,
+              productName: doc.name,
+              variantSku: variant.sku || null
+            });
+          }
+        } catch (_) {
+          /* optional at boot */
+        }
+        variant.inventory.quantity = nextQty;
+      }
+
+      if (item.lowStockThreshold !== undefined) {
+        variant.inventory.lowStockThreshold = Number(item.lowStockThreshold);
+      }
+    }
+
+    doc.markModified("variants");
+    recomputeProductAggregates(doc);
+    await doc.save({ validateBeforeSave: true });
+    await invalidateProductCaches(doc.slug);
+
+    if (restockNotifyEvents.length) {
+      try {
+        const { scheduleRestockNotifications } = require("../services/oosRestockNotify.service");
+        scheduleRestockNotifications(restockNotifyEvents);
+      } catch (notifyErr) {
+        console.warn("[patchProductInventory] restock notify schedule failed", notifyErr?.message);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Inventory updated successfully",
+      product: doc
+    });
+  } catch (error) {
+    console.error("Patch product inventory error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error updating inventory",
       error: error.message
     });
   }
@@ -7165,6 +7337,7 @@ const downloadBulkUploadTemplate = async (req, res) => {
 module.exports = {
   createProduct,
   updateProduct,
+  patchProductInventory,
   deleteProduct,
   bulkDelete,
   bulkUpdateProductStatus,

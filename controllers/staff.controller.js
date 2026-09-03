@@ -27,7 +27,7 @@ const redisManager = require('../config/redis.config');
 // ==============================
 
 /** Allowed roles for staff members (admin only) */
-const ALLOWED_STAFF_ROLES = ['product_manager', 'order_manager', 'marketing_manager'];
+const ALLOWED_STAFF_ROLES = ['product_manager', 'order_manager', 'marketing_manager', 'inventory_manager'];
 
 /** OTP expiration time in seconds (10 minutes) */
 const OTP_EXPIRY_SECONDS = 600;
