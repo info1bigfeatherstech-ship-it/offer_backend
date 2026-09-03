@@ -799,10 +799,16 @@ app.use((err, req, res, next) => {
     requestId: req.id
   });
 
-  const statusCode = err.statusCode || 500;
-  const message = IS_PRODUCTION && statusCode === 500
+  const statusCode = err.statusCode || (err.name === 'MulterError' ? 400 : 500);
+  let message = IS_PRODUCTION && statusCode === 500
     ? 'Internal Server Error'
     : err.message;
+
+  if (err.name === 'MulterError' && err.code === 'LIMIT_FILE_SIZE') {
+    message = String(req.path || '').includes('/categories')
+      ? 'Image file is too large. Maximum size is 20 MB for category images.'
+      : (err.message || 'Uploaded file is too large.');
+  }
 
   res.status(statusCode).json({
     success: false,

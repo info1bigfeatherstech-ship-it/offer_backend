@@ -22,7 +22,14 @@ const categorySchema = new mongoose.Schema(
       default: ''
     },
 
+    // Banner / hero background on category listing page
     image: {
+      url: { type: String, default: '' },
+      publicId: { type: String, default: '' }
+    },
+
+    // Square/card art for Top Categories (and similar UI tiles)
+    cardImage: {
       url: { type: String, default: '' },
       publicId: { type: String, default: '' }
     },

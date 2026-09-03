@@ -17,9 +17,16 @@ const CATEGORY_IMAGE_MAX_WIDTH = Math.min(
   2048,
   Math.max(400, Number(process.env.CATEGORY_IMAGE_MAX_WIDTH) || 1200)
 );
+/** Top Categories card art — square-friendly, slightly smaller than banner. */
+const CATEGORY_CARD_IMAGE_MAX_WIDTH = Math.min(
+  1600,
+  Math.max(400, Number(process.env.CATEGORY_CARD_IMAGE_MAX_WIDTH) || 800)
+);
 
-function getCategoryImageOptimizeOptions() {
-  const opts = { maxWidth: CATEGORY_IMAGE_MAX_WIDTH };
+function getCategoryImageOptimizeOptions(kind = 'banner') {
+  const opts = {
+    maxWidth: kind === 'card' ? CATEGORY_CARD_IMAGE_MAX_WIDTH : CATEGORY_IMAGE_MAX_WIDTH
+  };
   const q = process.env.CATEGORY_IMAGE_WEBP_QUALITY;
   if (q !== undefined && q !== '' && !Number.isNaN(Number(q))) {
     opts.quality = Math.min(100, Math.max(50, Number(q)));
@@ -28,19 +35,71 @@ function getCategoryImageOptimizeOptions() {
 }
 
 /**
- * EXIF-safe resize, WebP encode, upload to Cloudinary `categories` folder with a stable public_id.
+ * EXIF-safe resize, WebP encode, upload to Cloudinary with a stable public_id.
  * @param {Buffer} buffer — multer memory buffer
- * @param {{ nameHint: string, uniqueSuffix: string }} meta
+ * @param {{ nameHint: string, uniqueSuffix: string, kind?: 'banner'|'card', folder?: string }} meta
  */
-async function processAndUploadCategoryImage(buffer, { nameHint, uniqueSuffix }) {
+async function processAndUploadCategoryImage(buffer, { nameHint, uniqueSuffix, kind = 'banner', folder }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new Error('Invalid or empty image buffer');
   }
-  const optimized = await optimizeProductImageBuffer(buffer, getCategoryImageOptimizeOptions());
+  const optimized = await optimizeProductImageBuffer(
+    buffer,
+    getCategoryImageOptimizeOptions(kind)
+  );
   const base = slugify(String(nameHint || 'category'), { lower: true, strict: true }).slice(0, 72);
   const suffix = String(uniqueSuffix || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '');
-  const publicId = `${base}-${suffix}`.slice(0, 120);
-  return uploadToCloudinary(optimized, 'categories', publicId);
+  const kindTag = kind === 'card' ? 'card' : 'banner';
+  const publicId = `${base}-${kindTag}-${suffix}`.slice(0, 120);
+  const folderPath = folder || (kind === 'card' ? 'categories/cards' : 'categories');
+  return uploadToCloudinary(optimized, folderPath, publicId);
+}
+
+function getMultipartFile(req, fieldName) {
+  if (req.files && Array.isArray(req.files[fieldName]) && req.files[fieldName][0]) {
+    return req.files[fieldName][0];
+  }
+  // Backward compat if a route still uses .single('image')
+  if (fieldName === 'image' && req.file && req.file.buffer) {
+    return req.file;
+  }
+  return null;
+}
+
+function isTruthyFlag(value) {
+  return value === true || value === 'true' || value === '1' || value === 'yes';
+}
+
+/**
+ * Upload new media, swap onto category field, then delete previous Cloudinary asset.
+ * Upload-first so a failed upload never clears the existing image.
+ */
+async function replaceCategoryMediaField(category, fieldKey, file, { nameHint, uniqueSuffix, kind }) {
+  const { url, publicId } = await processAndUploadCategoryImage(file.buffer, {
+    nameHint,
+    uniqueSuffix,
+    kind
+  });
+  const previousPublicId = category[fieldKey]?.publicId;
+  category[fieldKey] = { url, publicId };
+  if (previousPublicId && previousPublicId !== publicId) {
+    try {
+      await deleteFromCloudinary(previousPublicId);
+    } catch (mediaErr) {
+      console.error(`Category ${fieldKey} old media cleanup failed:`, mediaErr.message);
+    }
+  }
+}
+
+async function clearCategoryMediaField(category, fieldKey) {
+  const previousPublicId = category[fieldKey]?.publicId;
+  category[fieldKey] = { url: '', publicId: '' };
+  if (!previousPublicId) return;
+  try {
+    await deleteFromCloudinary(previousPublicId);
+  } catch (mediaErr) {
+    console.error(`Category ${fieldKey} media clear failed:`, mediaErr.message);
+  }
 }
 
 
@@ -251,21 +310,42 @@ const createCategory = async (req, res) => {
       category.level = 0;
     }
 
-    if (req.file && req.file.buffer) {
-      try {
-        const { url, publicId } = await processAndUploadCategoryImage(req.file.buffer, {
+    const bannerFile = getMultipartFile(req, 'image');
+    const cardFile = getMultipartFile(req, 'cardImage');
+    const uploadedPublicIds = [];
+
+    try {
+      if (bannerFile?.buffer) {
+        await replaceCategoryMediaField(category, 'image', bannerFile, {
           nameHint: name,
-          uniqueSuffix: `${Date.now()}`
+          uniqueSuffix: `${Date.now()}`,
+          kind: 'banner'
         });
-        category.image = { url, publicId };
-      } catch (err) {
-        console.error('Category image upload failed:', err.message);
-        return res.status(400).json({
-          success: false,
-          message: 'Category image could not be processed or uploaded',
-          error: err.message
-        });
+        if (category.image?.publicId) uploadedPublicIds.push(category.image.publicId);
       }
+
+      if (cardFile?.buffer) {
+        await replaceCategoryMediaField(category, 'cardImage', cardFile, {
+          nameHint: name,
+          uniqueSuffix: `${Date.now()}`,
+          kind: 'card'
+        });
+        if (category.cardImage?.publicId) uploadedPublicIds.push(category.cardImage.publicId);
+      }
+    } catch (err) {
+      console.error('Category media upload failed on create:', err.message);
+      for (const pid of uploadedPublicIds) {
+        try {
+          await deleteFromCloudinary(pid);
+        } catch (cleanupErr) {
+          console.error('Create rollback media cleanup failed:', cleanupErr.message);
+        }
+      }
+      return res.status(400).json({
+        success: false,
+        message: 'Category image could not be processed or uploaded',
+        error: err.message
+      });
     }
 
     await category.save();
@@ -292,7 +372,15 @@ const createCategory = async (req, res) => {
 const updateCategory = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, parent, order, status } = req.body;
+    const {
+      name,
+      description,
+      parent,
+      order,
+      status,
+      removeImage,
+      removeCardImage
+    } = req.body;
 
     const category = await Category.findById(id);
     if (!category) return res.status(404).json({ success: false, message: 'Category not found' });
@@ -311,26 +399,46 @@ const updateCategory = async (req, res) => {
       category.level = 0;
     }
 
-    if (req.file && req.file.buffer) {
+    const displayName = name || category.name;
+    const bannerFile = getMultipartFile(req, 'image');
+    const cardFile = getMultipartFile(req, 'cardImage');
+
+    if (bannerFile?.buffer) {
       try {
-        const displayName = name || category.name;
-        const { url, publicId } = await processAndUploadCategoryImage(req.file.buffer, {
+        await replaceCategoryMediaField(category, 'image', bannerFile, {
           nameHint: displayName,
-          uniqueSuffix: `${String(id)}-${Date.now()}`
+          uniqueSuffix: `${String(id)}-${Date.now()}`,
+          kind: 'banner'
         });
-        const previousPublicId = category.image?.publicId;
-        category.image = { url, publicId };
-        if (previousPublicId && previousPublicId !== publicId) {
-          await deleteFromCloudinary(previousPublicId);
-        }
       } catch (err) {
-        console.error('Category image upload failed:', err.message);
+        console.error('Category banner image upload failed:', err.message);
         return res.status(400).json({
           success: false,
-          message: 'Category image could not be processed or uploaded',
+          message: 'Category banner image could not be processed or uploaded',
           error: err.message
         });
       }
+    } else if (isTruthyFlag(removeImage)) {
+      await clearCategoryMediaField(category, 'image');
+    }
+
+    if (cardFile?.buffer) {
+      try {
+        await replaceCategoryMediaField(category, 'cardImage', cardFile, {
+          nameHint: displayName,
+          uniqueSuffix: `${String(id)}-${Date.now()}`,
+          kind: 'card'
+        });
+      } catch (err) {
+        console.error('Category card image upload failed:', err.message);
+        return res.status(400).json({
+          success: false,
+          message: 'Category card image could not be processed or uploaded',
+          error: err.message
+        });
+      }
+    } else if (isTruthyFlag(removeCardImage)) {
+      await clearCategoryMediaField(category, 'cardImage');
     }
 
     await category.save();
@@ -387,13 +495,16 @@ const deleteCategory = async (req, res) => {
       });
     }
 
-    const previousPublicId = category.image?.publicId;
+    const previousBannerPublicId = category.image?.publicId;
+    const previousCardPublicId = category.cardImage?.publicId;
     category.status = 'inactive';
     category.showInMenu = false;
     category.image = { url: '', publicId: '' };
+    category.cardImage = { url: '', publicId: '' };
     await category.save();
 
-    if (previousPublicId) {
+    for (const previousPublicId of [previousBannerPublicId, previousCardPublicId]) {
+      if (!previousPublicId) continue;
       try {
         await deleteFromCloudinary(previousPublicId);
       } catch (mediaErr) {
