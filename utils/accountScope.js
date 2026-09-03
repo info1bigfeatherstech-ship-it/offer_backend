@@ -18,7 +18,8 @@ const PRIVILEGED_OPERATIONAL_ROLES = new Set([
   'admin',
   'product_manager',
   'order_manager',
-  'marketing_manager'
+  'marketing_manager',
+  'inventory_manager'
 ]);
 
 function normalizeAccountScope(value) {
