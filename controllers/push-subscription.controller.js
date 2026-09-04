@@ -7,6 +7,10 @@ const {
   removePushSubscription,
   getPushStatusForUser,
 } = require('../services/pushSubscription.service');
+const {
+  getPushSoftPromptEligibility,
+  recordPushSoftPromptImpression,
+} = require('../services/pushSoftPrompt.service');
 
 const getVapidPublicKeyHandler = async (req, res) => {
   try {
@@ -125,9 +129,67 @@ const getPushStatus = async (req, res) => {
   }
 };
 
+const getPushPromptEligibilityHandler = async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id || req.userId;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const eligibility = await getPushSoftPromptEligibility(userId);
+
+    return res.status(200).json({
+      success: true,
+      ...eligibility,
+    });
+  } catch (error) {
+    const code = error.code || 'PROMPT_ELIGIBILITY_FAILED';
+    const status = code === 'USER_NOT_FOUND' ? 404 : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not check push prompt eligibility',
+      allowed: false,
+    });
+  }
+};
+
+const recordPushPromptImpressionHandler = async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id || req.userId;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const result = await recordPushSoftPromptImpression(userId);
+
+    return res.status(200).json({
+      success: true,
+      ...result,
+    });
+  } catch (error) {
+    const code = error.code || 'PROMPT_IMPRESSION_FAILED';
+    const status = code === 'USER_NOT_FOUND' ? 404 : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not record push prompt impression',
+      recorded: false,
+    });
+  }
+};
+
 module.exports = {
   getVapidPublicKeyHandler,
   subscribePush,
   unsubscribePush,
   getPushStatus,
+  getPushPromptEligibilityHandler,
+  recordPushPromptImpressionHandler,
 };

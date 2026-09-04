@@ -33,6 +33,11 @@ const pushSubscriptionSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    lastWishlistReminderPushAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
     lastPushAt: {
       type: Date,
       default: null,

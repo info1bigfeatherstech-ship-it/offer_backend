@@ -29,6 +29,8 @@ const gracefulShutdown = require('./services/shutdown.service');
 const cleanupService = require('./services/cleanup.service');
 const paymentHoldExpiryService = require('./services/paymentHoldExpiry.service');
 const cartReminderPushScheduler = require('./services/cartReminderPushScheduler.service');
+const newProductsPushScheduler = require('./services/newProductsPushScheduler.service');
+const wishlistReminderPushScheduler = require('./services/wishlistReminderPushScheduler.service');
 const rtoStatusSyncScheduler = require('./services/rtoStatusSyncScheduler.service');
 const logger = require('./utils/logger');
 const { CORS_STOREFRONT_ALLOWED_HEADERS } = require('./constants/storefrontHeaders');
@@ -761,7 +763,9 @@ app.use('/api/shipping-provider', shippingProviderRoutes);
 app.use('/api/delivery', deliveryRoutes);
 app.use('/api/admin/coupons', adminCouponRoutes);
 app.use('/api/coupons', userCouponRoutes);
-app.use('/api/push', limiters.pushWrite, pushRoutes);
+// Push rate limits are applied per-route (after verifyToken) inside push.route.js
+// so authenticated buckets are per userId; do not wrap the whole mount here.
+app.use('/api/push', pushRoutes);
 app.use('/api/notifications', limiters.write, userNotificationRoutes);
 app.use('/api/product-reviews/public', limiters.products, productReviewPublicRoutes);
 app.use('/api/product-reviews', limiters.write, productReviewUserRoutes);
@@ -857,9 +861,11 @@ async function startApplication() {
       cleanupService.start();
       paymentHoldExpiryService.start();
       cartReminderPushScheduler.start();
+      newProductsPushScheduler.start();
+      wishlistReminderPushScheduler.start();
       rtoStatusSyncScheduler.start();
       logger.info(
-        '[Schedulers] cleanup + paymentHold + cartReminderPush + rtoStatusSync started on primary instance'
+        '[Schedulers] cleanup + paymentHold + cartReminderPush + newProductsPush + wishlistReminderPush + rtoStatusSync started on primary instance'
       );
     } else {
       logger.info('[Schedulers] Skipping cleanup/paymentHold/rtoStatusSync on secondary worker', {
@@ -902,6 +908,14 @@ async function startApplication() {
 
       gracefulShutdown.registerConnection('CartReminderPushScheduler', async () => {
         cartReminderPushScheduler.stop();
+      });
+
+      gracefulShutdown.registerConnection('NewProductsPushScheduler', async () => {
+        newProductsPushScheduler.stop();
+      });
+
+      gracefulShutdown.registerConnection('WishlistReminderPushScheduler', async () => {
+        wishlistReminderPushScheduler.stop();
       });
 
       gracefulShutdown.registerConnection('RtoStatusSyncScheduler', async () => {
