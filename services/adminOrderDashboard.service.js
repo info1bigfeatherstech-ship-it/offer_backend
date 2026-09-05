@@ -68,7 +68,8 @@ function escapeRegex(s) {
  * (4) default last 30 days rolling
  *
  * `all` = no createdAt window (dashboard cards / lifetime totals).
- * `today` = start→end of **server local** calendar day (set TZ=Asia/Kolkata in production if needed).
+ * `today` = start→end of **server local** calendar day (legacy).
+ * Prefer client-sent `from`+`to` (browser local midnight→midnight) so the list matches UI date labels.
  */
 function resolveDateRange(q) {
   const now = new Date();

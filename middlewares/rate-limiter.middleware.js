@@ -101,10 +101,26 @@ const rateLimits = {
     message: 'Admin rate limit exceeded'
   },
 
+  /**
+   * Push writes (subscribe / unsubscribe / prompt-impression).
+   * Applied after verifyToken so the bucket is per authenticated user.
+   * Env-tunable for live traffic without a code change.
+   */
   pushWrite: {
-    windowMs: 15 * 60 * 1000,
-    max: 30,
+    windowMs: envWindowMs('RATE_LIMIT_PUSH_WRITE_WINDOW_SEC', 15 * 60 * 1000),
+    max: envInt('RATE_LIMIT_PUSH_WRITE_MAX', 120),
     message: 'Too many push subscription updates. Please try again later'
+  },
+
+  /**
+   * Push reads (status / prompt-eligibility / vapid public key).
+   * Higher ceiling: status sync + soft-prompt eligibility can run on focus/visibility.
+   * Auth routes: per user. Public vapid: per IP.
+   */
+  pushRead: {
+    windowMs: envWindowMs('RATE_LIMIT_PUSH_READ_WINDOW_SEC', 15 * 60 * 1000),
+    max: envInt('RATE_LIMIT_PUSH_READ_MAX', 240),
+    message: 'Too many push status checks. Please try again later'
   }
 };
 
@@ -154,7 +170,8 @@ const limiters = {
   sensitive: createRateLimiter('sensitive', ['/health', '/api/health']),
   orders: createRateLimiter('orders', ['/health', '/api/health']),
   admin: createRateLimiter('admin', ['/health', '/api/health']),
-  pushWrite: createRateLimiter('pushWrite', ['/health', '/api/health'])
+  pushWrite: createRateLimiter('pushWrite', ['/health', '/api/health']),
+  pushRead: createRateLimiter('pushRead', ['/health', '/api/health'])
 };
 
 module.exports = { limiters, createRateLimiter, rateLimits };

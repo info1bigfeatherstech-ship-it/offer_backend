@@ -7,6 +7,7 @@ const {
   getUserById,
   bulkCartReminderEmail,
   bulkCartReminderPush,
+  bulkWishlistReminderPush,
   getLeadsPushSettings,
   updateLeadsPushSettings,
   getAllCarts,
@@ -39,6 +40,7 @@ router.get('/push-settings', getLeadsPushSettings);
 router.put('/push-settings', updateLeadsPushSettings);
 router.post('/users/bulk-cart-reminder-email', bulkCartReminderEmail);
 router.post('/users/bulk-cart-reminder-push', bulkCartReminderPush);
+router.post('/users/bulk-wishlist-reminder-push', bulkWishlistReminderPush);
 router.get('/users/:userId', getUserById);
 
 // Cart analytics

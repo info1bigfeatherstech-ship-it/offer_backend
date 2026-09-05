@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 /**
- * Per-storefront leads push policy (admin-controlled auto cart reminder).
+ * Per-storefront leads push policy (admin-controlled auto reminders + digests).
  */
 const leadsPushSettingsSchema = new mongoose.Schema(
   {
@@ -16,6 +16,30 @@ const leadsPushSettingsSchema = new mongoose.Schema(
     autoPushEnabled: {
       type: Boolean,
       default: false,
+    },
+    /** New products digest in IST windows 11–13 and 18–20. */
+    newProductsAutoPushEnabled: {
+      type: Boolean,
+      default: false,
+    },
+    /** Daily auto wishlist-reminder push (same hour policy as cart). */
+    wishlistAutoPushEnabled: {
+      type: Boolean,
+      default: false,
+    },
+    /** Watermark: products created after this are eligible for the next digest. */
+    lastNewProductsDigestAt: {
+      type: Date,
+      default: null,
+    },
+    /** IST YYYY-MM-DD keys so each slot runs at most once per day. */
+    lastNewProductsMorningDateKey: {
+      type: String,
+      default: null,
+    },
+    lastNewProductsEveningDateKey: {
+      type: String,
+      default: null,
     },
     updatedBy: {
       type: mongoose.Schema.Types.ObjectId,

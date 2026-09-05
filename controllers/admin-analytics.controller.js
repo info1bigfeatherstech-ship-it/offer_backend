@@ -12,6 +12,10 @@ const {
   sendBulkCartReminderPushes,
   MAX_BULK_RECIPIENTS: MAX_BULK_PUSH_RECIPIENTS
 } = require('../services/cartReminderPush.service');
+const {
+  sendBulkWishlistReminderPushes,
+  MAX_BULK_RECIPIENTS: MAX_BULK_WISHLIST_PUSH_RECIPIENTS
+} = require('../services/wishlistReminderPush.service');
 const leadsPushSettingsService = require('../services/leadsPushSettings.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
@@ -943,34 +947,46 @@ const getLeadsPushSettings = async (req, res) => {
 
 const updateLeadsPushSettings = async (req, res) => {
   try {
-    if (req.body?.autoPushEnabled === undefined) {
+    const body = req.body || {};
+    const hasAnyFlag =
+      body.autoPushEnabled !== undefined ||
+      body.newProductsAutoPushEnabled !== undefined ||
+      body.wishlistAutoPushEnabled !== undefined;
+
+    if (!hasAnyFlag) {
       return res.status(400).json({
         success: false,
-        code: 'AUTO_PUSH_ENABLED_REQUIRED',
-        message: 'autoPushEnabled is required',
+        code: 'PUSH_SETTINGS_PATCH_REQUIRED',
+        message:
+          'Provide at least one of: autoPushEnabled, newProductsAutoPushEnabled, wishlistAutoPushEnabled',
       });
     }
 
     const storefront = scopeLabelFromReq(req);
-    const data = await leadsPushSettingsService.updateAutoPushEnabled(
+    const data = await leadsPushSettingsService.updatePushSettings(
       storefront,
-      req.body.autoPushEnabled,
+      {
+        autoPushEnabled: body.autoPushEnabled,
+        newProductsAutoPushEnabled: body.newProductsAutoPushEnabled,
+        wishlistAutoPushEnabled: body.wishlistAutoPushEnabled,
+      },
       req.user?._id || req.userId || null
     );
 
     return res.status(200).json({
       success: true,
       scope: storefront,
-      message: data.autoPushEnabled
-        ? 'Auto cart reminder push enabled'
-        : 'Auto cart reminder push disabled',
+      message: 'Push notification settings updated',
       data,
     });
   } catch (error) {
     console.error('Update leads push settings error:', error);
-    return res.status(500).json({
+    const code = error.code || 'PUSH_SETTINGS_UPDATE_FAILED';
+    const status = code === 'PUSH_SETTINGS_PATCH_REQUIRED' ? 400 : 500;
+    return res.status(status).json({
       success: false,
-      message: 'Could not update push notification settings',
+      code,
+      message: error.message || 'Could not update push notification settings',
     });
   }
 };
@@ -1020,6 +1036,55 @@ const bulkCartReminderPush = async (req, res) => {
       success: false,
       code,
       message: error.message || 'Could not send cart reminder push notifications'
+    });
+  }
+};
+
+// =============================================
+// BULK WISHLIST REMINDER PUSH
+// =============================================
+const bulkWishlistReminderPush = async (req, res) => {
+  try {
+    const userIds = req.body?.userIds;
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'USER_IDS_REQUIRED',
+        message: 'userIds array is required'
+      });
+    }
+    if (userIds.length > MAX_BULK_WISHLIST_PUSH_RECIPIENTS) {
+      return res.status(400).json({
+        success: false,
+        code: 'BULK_LIMIT_EXCEEDED',
+        message: `Maximum ${MAX_BULK_WISHLIST_PUSH_RECIPIENTS} users per bulk send`
+      });
+    }
+
+    const results = await sendBulkWishlistReminderPushes({
+      userIds,
+      scopeQuery: scopedUserQueryFromReq(req),
+      storefront: resolveCustomerStorefrontFromReq(req)
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Wishlist reminder push processed: ${results.sent} sent, ${results.skipped} skipped, ${results.failed} failed`,
+      ...results
+    });
+  } catch (error) {
+    console.error('Bulk wishlist reminder push error:', error);
+    const code = error.code || 'WISHLIST_REMINDER_PUSH_FAILED';
+    const status =
+      code === 'PUSH_NOT_CONFIGURED'
+        ? 503
+        : ['USER_IDS_REQUIRED', 'BULK_LIMIT_EXCEEDED', 'INVALID_USER_IDS'].includes(code)
+          ? 400
+          : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not send wishlist reminder push notifications'
     });
   }
 };
@@ -1080,6 +1145,7 @@ module.exports = {
   getLeadsPushSettings,
   updateLeadsPushSettings,
   bulkCartReminderPush,
+  bulkWishlistReminderPush,
   bulkCartReminderEmail,
   getAllCarts: getAllcarts,
   getAbandonedCarts: getAbandonedcarts,

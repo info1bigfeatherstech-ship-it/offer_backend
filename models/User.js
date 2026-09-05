@@ -205,7 +205,23 @@ const userSchema = new mongoose.Schema(
       type: [String],
       enum: ["ecomm", "wholesale"],
       default: ["ecomm"]
-    }
+    },
+
+    /**
+     * Soft "Allow notifications" UI cadence (logged-in only).
+     * Guests use localStorage on the client. Per-user doc is already
+     * partitioned by accountScope (ecomm vs wholesale).
+     */
+    pushSoftPrompt: {
+      impressions: {
+        type: [Date],
+        default: [],
+      },
+      lastShownAt: {
+        type: Date,
+        default: null,
+      },
+    },
   },
   { timestamps: true }
 );
