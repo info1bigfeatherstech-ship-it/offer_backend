@@ -31,7 +31,8 @@ function sendError(res, err, fallbackMessage) {
 /**
  * GET /api/admin/orders/summary
  * Query: from, to (ISO), rangePreset (all|today|last7|last30), presetDays, preset=30d alias
- * Admin Orders cards use rangePreset=all so totals stay filter-independent.
+ * Admin Orders UI passes the active date filter so cards match the table window.
+ * Always scoped by req.adminScope.orderMatch (ecomm vs wholesale — no cross-mix).
  */
 exports.getDashboardSummary = async (req, res) => {
   try {
