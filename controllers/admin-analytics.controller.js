@@ -17,6 +17,7 @@ const {
   MAX_BULK_RECIPIENTS: MAX_BULK_WISHLIST_PUSH_RECIPIENTS
 } = require('../services/wishlistReminderPush.service');
 const leadsPushSettingsService = require('../services/leadsPushSettings.service');
+const engagementAnalyticsService = require('../services/engagementAnalytics.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
 const scopeLabelFromReq = (req) => req.adminScope?.storefront || 'ecomm';
@@ -1138,6 +1139,63 @@ const bulkCartReminderEmail = async (req, res) => {
   }
 };
 
+
+const getEngagementSummary = async (req, res) => {
+  try {
+    const summary = await engagementAnalyticsService.getEngagementSummary(
+      scopedUserQueryFromReq(req)
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      data: summary,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load engagement summary',
+    });
+  }
+};
+
+const getPushSubscribers = async (req, res) => {
+  try {
+    const result = await engagementAnalyticsService.listPushSubscribers(
+      scopedUserQueryFromReq(req),
+      req.query
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      ...result,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load push subscribers',
+    });
+  }
+};
+
+const getPwaInstalls = async (req, res) => {
+  try {
+    const result = await engagementAnalyticsService.listPwaInstalls(
+      scopedUserQueryFromReq(req),
+      req.query
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      ...result,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load PWA installs',
+    });
+  }
+};
+
 module.exports = {
   getAllUsers,
   exportUsersExcel,
@@ -1154,5 +1212,8 @@ module.exports = {
   getAllWishlists,
   getStaleWishlists,
   getPopularWishlistProducts,
-  getDashboardSummary
+  getDashboardSummary,
+  getEngagementSummary,
+  getPushSubscribers,
+  getPwaInstalls
 };

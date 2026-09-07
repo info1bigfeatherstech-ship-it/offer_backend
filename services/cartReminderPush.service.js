@@ -14,6 +14,7 @@ const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
 const { findCartForStorefront } = require('./cartStorefront.service');
 const { mergeCustomerStorefrontFilter, normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
+const { resolvePushAssetUrl, buildStorefrontUrl } = require('../utils/storefrontFrontendUrl');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -44,12 +45,8 @@ function ensureVapidConfigured() {
   vapidConfigured = true;
 }
 
-function getStorefrontCartUrl() {
-  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
-  return `${base}/account/usercart`;
+function getStorefrontCartUrl(storefront = 'ecomm') {
+  return buildStorefrontUrl(storefront, '/account/usercart');
 }
 
 function formatInr(amount) {
@@ -106,8 +103,8 @@ function buildPushPayload({ customerName, cartSummary }) {
   return {
     title: cartReminderPushTemplate.title,
     body: applyPlaceholders(cartReminderPushTemplate.body, vars),
-    icon: cartReminderPushTemplate.icon,
-    badge: cartReminderPushTemplate.badge,
+    icon: resolvePushAssetUrl(cartReminderPushTemplate.icon, 'ecomm'),
+    badge: resolvePushAssetUrl(cartReminderPushTemplate.badge || cartReminderPushTemplate.icon, 'ecomm'),
     tag: cartReminderPushTemplate.tag,
     url: cartUrl,
     data: {

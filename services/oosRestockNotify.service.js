@@ -18,6 +18,7 @@ const OutOfStockInquiry = require('../models/OutOfStockInquiry');
 const Product = require('../models/Product');
 const logger = require('../utils/logger');
 const template = require('../templates/oosRestockEmail.template');
+const { buildStorefrontUrl } = require('../utils/storefrontFrontendUrl');
 
 const SEND_DELAY_MS = Math.min(
   2000,
@@ -85,25 +86,14 @@ function escapeHtml(value) {
 }
 
 function storefrontBaseUrl(storefront) {
-  if (storefront === 'wholesale') {
-    return String(
-      process.env.WHOLESALE_FRONTEND_URL ||
-        process.env.FRONTEND_URL ||
-        process.env.STORE_URL ||
-        'https://offerwalebaba.com'
-    ).replace(/\/$/, '');
-  }
-  return String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
+  return buildStorefrontUrl(storefront === 'wholesale' ? 'wholesale' : 'ecomm', '/').replace(/\/$/, '');
 }
 
 function buildProductUrl(inquiry) {
-  const base = storefrontBaseUrl(inquiry.storefront);
   const slug = String(inquiry.productSlug || '').trim();
-  if (!slug) return base;
-  return `${base}/products/${encodeURIComponent(slug)}`;
+  const sf = inquiry.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+  if (!slug) return buildStorefrontUrl(sf, '/');
+  return buildStorefrontUrl(sf, `/products/${encodeURIComponent(slug)}`);
 }
 
 function fillTemplate(str, map) {

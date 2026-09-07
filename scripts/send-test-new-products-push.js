@@ -11,14 +11,13 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const mongoose = require('mongoose');
 const PushSubscription = require('../models/PushSubscription');
 const User = require('../models/User');
-const newProductsPushTemplate = require('../templates/newProductsPush.template');
 const {
   ensureVapidConfigured,
   isPushConfigured,
   dispatchWebPush,
   delay,
 } = require('../utils/webPushDispatch');
-const { getStorefrontFrontendBase } = require('../utils/storefrontFrontendUrl');
+const { buildPayload } = require('../services/newProductsPush.service');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
 function parseArgs(argv) {
@@ -42,21 +41,12 @@ async function main() {
   await mongoose.connect(process.env.MONGO_DB_URI);
   ensureVapidConfigured();
 
-  const base = getStorefrontFrontendBase(storefront);
-  const path = newProductsPushTemplate.ctaPath || '/#best-sellers';
+  const basePayload = buildPayload(storefront);
   const payload = {
-    title: newProductsPushTemplate.title,
-    body: newProductsPushTemplate.body,
-    icon: newProductsPushTemplate.icon,
-    badge: newProductsPushTemplate.badge,
-    tag: `${newProductsPushTemplate.tag || 'new-products-digest'}-${Date.now()}`,
-    actions: Array.isArray(newProductsPushTemplate.actions)
-      ? newProductsPushTemplate.actions
-      : undefined,
+    ...basePayload,
+    tag: `${basePayload.tag || 'new-products-digest'}-${Date.now()}`,
     data: {
-      type: 'new-products-digest',
-      url: `${base}${path.startsWith('/') ? path : `/${path}`}`,
-      storefront,
+      ...(basePayload.data || {}),
       test: true,
     },
   };
@@ -75,10 +65,17 @@ async function main() {
 
   const subs = await PushSubscription.find(query);
   console.log(`Active subscriptions matched: ${subs.length} (payload storefront: ${storefront})`);
-  console.log('Payload:', { title: payload.title, body: payload.body, url: payload.data.url });
+  console.log('Payload:', {
+    title: payload.title,
+    body: payload.body,
+    url: payload.data.url,
+    icon: payload.icon,
+  });
 
   if (!subs.length) {
-    console.error('No active subscriptions. On that browser: login → Allow notifications → re-run browser console self-test.');
+    console.error(
+      'No active subscriptions. On that browser: login → Allow notifications → re-run browser console self-test.'
+    );
     await mongoose.disconnect();
     process.exit(1);
   }
@@ -92,7 +89,9 @@ async function main() {
       console.log(`OK  user=${sub.userId} id=${sub._id}`);
     } else {
       fail += 1;
-      console.log(`FAIL user=${sub.userId} id=${sub._id} reason=${outcome.reason || outcome.error || 'unknown'}`);
+      console.log(
+        `FAIL user=${sub.userId} id=${sub._id} reason=${outcome.reason || outcome.error || 'unknown'}`
+      );
     }
     await delay(120);
   }
