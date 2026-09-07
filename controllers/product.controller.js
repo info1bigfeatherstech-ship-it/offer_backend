@@ -1309,11 +1309,20 @@ const createProduct = async (req, res) => {
     const resolvedStatus =
       status && ["draft", "active", "archived"].includes(String(status).toLowerCase())
         ? String(status).toLowerCase()
-        : "draft";
+        : "active";
     const channelStatus = deriveProductChannelStatusFromLegacy(
       resolvedStatus,
       req.body.channelStatus
     );
+    // Legacy status maps both channels; keep wholesale draft unless a variant is
+    // wholesale-eligible (wholesale=true + wholesaleBase > 0). Prevents create
+    // failure / accidental wholesale catalog publish on single ecomm listing.
+    if (
+      channelStatus.wholesale === "active" &&
+      !hasWholesalePricingEligibleVariant(variants)
+    ) {
+      channelStatus.wholesale = "draft";
+    }
 
     // =============================
     //  CREATE PRODUCT
@@ -4976,8 +4985,9 @@ const updateProduct = async (req, res) => {
 };
 
 /**
- * Inventory-only update for inventory_manager role.
- * Accepts { variants: [{ productCode, quantity?, lowStockThreshold? }] } — no other fields.
+ * Inventory + price update for inventory_manager (also admin / product_manager).
+ * Accepts { variants: [{ productCode, quantity?, lowStockThreshold?, price? }] }.
+ * price may include base, sale, wholesaleBase, wholesaleSale — no other product fields.
  */
 const patchProductInventory = async (req, res) => {
   try {
@@ -5000,7 +5010,37 @@ const patchProductInventory = async (req, res) => {
       });
     }
 
+    const allowedVariantKeys = new Set([
+      "productCode",
+      "quantity",
+      "lowStockThreshold",
+      "price"
+    ]);
+    const allowedPriceKeys = new Set([
+      "base",
+      "sale",
+      "wholesaleBase",
+      "wholesaleSale"
+    ]);
+
+    const parseMoneyField = (raw, fieldName, { allowNull = false } = {}) => {
+      if (raw === undefined) {
+        return { omitted: true };
+      }
+      if (raw === null || raw === "") {
+        if (allowNull) return { value: null };
+        return { error: `${fieldName} cannot be empty` };
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) {
+        return { error: `${fieldName} must be a non-negative number` };
+      }
+      return { value: n };
+    };
+
+    const normalized = [];
     const seenCodes = new Set();
+
     for (const item of variantsInput) {
       if (!item || typeof item !== "object" || Array.isArray(item)) {
         return res.status(400).json({
@@ -5008,15 +5048,16 @@ const patchProductInventory = async (req, res) => {
           message: "Each variant entry must be an object"
         });
       }
+
       const itemKeys = Object.keys(item);
-      const allowedVariantKeys = ["productCode", "quantity", "lowStockThreshold"];
-      const invalidKeys = itemKeys.filter((k) => !allowedVariantKeys.includes(k));
+      const invalidKeys = itemKeys.filter((k) => !allowedVariantKeys.has(k));
       if (invalidKeys.length) {
         return res.status(400).json({
           success: false,
           message: `Invalid fields in variant update: ${invalidKeys.join(", ")}`
         });
       }
+
       const productCode = String(item.productCode || "").trim();
       if (!productCode) {
         return res.status(400).json({
@@ -5031,12 +5072,11 @@ const patchProductInventory = async (req, res) => {
         });
       }
       seenCodes.add(productCode);
-      if (item.quantity === undefined && item.lowStockThreshold === undefined) {
-        return res.status(400).json({
-          success: false,
-          message: "At least quantity or lowStockThreshold must be provided per variant"
-        });
-      }
+
+      let quantity;
+      let lowStockThreshold;
+      const pricePatch = {};
+
       if (item.quantity !== undefined) {
         const nextQty = Number(item.quantity);
         if (!Number.isFinite(nextQty) || nextQty < 0) {
@@ -5045,7 +5085,9 @@ const patchProductInventory = async (req, res) => {
             message: "quantity must be a non-negative number"
           });
         }
+        quantity = nextQty;
       }
+
       if (item.lowStockThreshold !== undefined) {
         const lst = Number(item.lowStockThreshold);
         if (!Number.isFinite(lst) || lst < 0) {
@@ -5054,7 +5096,75 @@ const patchProductInventory = async (req, res) => {
             message: "lowStockThreshold must be a non-negative number"
           });
         }
+        lowStockThreshold = lst;
       }
+
+      if (item.price !== undefined) {
+        if (!item.price || typeof item.price !== "object" || Array.isArray(item.price)) {
+          return res.status(400).json({
+            success: false,
+            message: "price must be an object when provided"
+          });
+        }
+        const priceKeys = Object.keys(item.price);
+        const invalidPriceKeys = priceKeys.filter((k) => !allowedPriceKeys.has(k));
+        if (invalidPriceKeys.length) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid price fields: ${invalidPriceKeys.join(", ")}`
+          });
+        }
+        if (!priceKeys.length) {
+          return res.status(400).json({
+            success: false,
+            message: "price object must include at least one field"
+          });
+        }
+
+        const baseParsed = parseMoneyField(item.price.base, "price.base");
+        if (baseParsed.error) {
+          return res.status(400).json({ success: false, message: baseParsed.error });
+        }
+        if (!baseParsed.omitted) pricePatch.base = baseParsed.value;
+
+        const saleParsed = parseMoneyField(item.price.sale, "price.sale", { allowNull: true });
+        if (saleParsed.error) {
+          return res.status(400).json({ success: false, message: saleParsed.error });
+        }
+        if (!saleParsed.omitted) pricePatch.sale = saleParsed.value;
+
+        const wbParsed = parseMoneyField(item.price.wholesaleBase, "price.wholesaleBase", {
+          allowNull: true
+        });
+        if (wbParsed.error) {
+          return res.status(400).json({ success: false, message: wbParsed.error });
+        }
+        if (!wbParsed.omitted) pricePatch.wholesaleBase = wbParsed.value;
+
+        const wsParsed = parseMoneyField(item.price.wholesaleSale, "price.wholesaleSale", {
+          allowNull: true
+        });
+        if (wsParsed.error) {
+          return res.status(400).json({ success: false, message: wsParsed.error });
+        }
+        if (!wsParsed.omitted) pricePatch.wholesaleSale = wsParsed.value;
+      }
+
+      const hasPricePatch = Object.keys(pricePatch).length > 0;
+      if (quantity === undefined && lowStockThreshold === undefined && !hasPricePatch) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "At least quantity, lowStockThreshold, or price fields must be provided per variant"
+        });
+      }
+
+      normalized.push({
+        productCode,
+        quantity,
+        lowStockThreshold,
+        pricePatch: hasPricePatch ? pricePatch : null
+      });
     }
 
     const doc = await Product.findOne({ slug });
@@ -5067,15 +5177,14 @@ const patchProductInventory = async (req, res) => {
 
     const restockNotifyEvents = [];
 
-    for (const item of variantsInput) {
-      const productCode = String(item.productCode).trim();
+    for (const item of normalized) {
       const variant = doc.variants.find(
-        (v) => String(v.productCode || "") === productCode
+        (v) => String(v.productCode || "") === item.productCode
       );
       if (!variant) {
         return res.status(404).json({
           success: false,
-          message: `Variant not found: ${productCode}`
+          message: `Variant not found: ${item.productCode}`
         });
       }
 
@@ -5085,6 +5194,9 @@ const patchProductInventory = async (req, res) => {
           trackInventory: true,
           lowStockThreshold: 5
         };
+      }
+      if (!variant.price) {
+        variant.price = { base: 0, sale: null };
       }
 
       if (item.quantity !== undefined) {
@@ -5115,6 +5227,59 @@ const patchProductInventory = async (req, res) => {
       if (item.lowStockThreshold !== undefined) {
         variant.inventory.lowStockThreshold = Number(item.lowStockThreshold);
       }
+
+      if (item.pricePatch) {
+        if (item.pricePatch.base !== undefined) {
+          variant.price.base = item.pricePatch.base;
+        }
+        if (item.pricePatch.sale !== undefined) {
+          variant.price.sale = item.pricePatch.sale;
+        }
+        if (item.pricePatch.wholesaleBase !== undefined) {
+          variant.price.wholesaleBase = item.pricePatch.wholesaleBase;
+        }
+        if (item.pricePatch.wholesaleSale !== undefined) {
+          variant.price.wholesaleSale = item.pricePatch.wholesaleSale;
+        }
+
+        const nextBase = Number(variant.price.base);
+        if (!Number.isFinite(nextBase) || nextBase < 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid base price for variant ${item.productCode}`
+          });
+        }
+
+        const nextSale = variant.price.sale;
+        if (nextSale != null && Number(nextSale) >= nextBase) {
+          return res.status(400).json({
+            success: false,
+            message: `Sale price must be less than base price for variant ${item.productCode}`
+          });
+        }
+
+        const nextWb = variant.price.wholesaleBase;
+        const nextWs = variant.price.wholesaleSale;
+        if (variant.wholesale === true) {
+          if (nextWb == null || !Number.isFinite(Number(nextWb)) || Number(nextWb) <= 0) {
+            return res.status(400).json({
+              success: false,
+              message: `wholesaleBase is required and must be > 0 when wholesale is enabled (${item.productCode})`
+            });
+          }
+        }
+        if (
+          nextWs != null &&
+          nextWb != null &&
+          Number.isFinite(Number(nextWb)) &&
+          Number(nextWs) >= Number(nextWb)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: `Wholesale sale price must be less than wholesale base for variant ${item.productCode}`
+          });
+        }
+      }
     }
 
     doc.markModified("variants");
@@ -5133,7 +5298,7 @@ const patchProductInventory = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Inventory updated successfully",
+      message: "Inventory and prices updated successfully",
       product: doc
     });
   } catch (error) {
