@@ -52,6 +52,9 @@ function buildPayload(storefront) {
     icon: newProductsPushTemplate.icon,
     badge: newProductsPushTemplate.badge,
     tag: newProductsPushTemplate.tag,
+    actions: Array.isArray(newProductsPushTemplate.actions)
+      ? newProductsPushTemplate.actions
+      : [{ action: 'shop-new-arrivals', title: newProductsPushTemplate.ctaLabel || 'Shop New Arrivals' }],
     data: {
       type: 'new-products-digest',
       url,

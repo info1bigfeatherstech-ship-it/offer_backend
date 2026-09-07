@@ -3,10 +3,11 @@
  */
 module.exports = {
   title: '🆕 New Products Added!',
-  body:
-    'New products have arrived! Explore yesterday’s latest additions and find something you’ll love.',
+  body: 'Explore our latest arrivals today!',
   icon: '/pwa-192x192.png',
   badge: '/pwa-192x192.png',
   tag: 'new-products-digest',
   ctaPath: '/#best-sellers',
+  ctaLabel: 'Shop New Arrivals',
+  actions: [{ action: 'shop-new-arrivals', title: 'Shop New Arrivals' }],
 };

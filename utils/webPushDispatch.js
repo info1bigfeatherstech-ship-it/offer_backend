@@ -70,6 +70,7 @@ async function dispatchWebPush(subscriptionDoc, payload, options = {}) {
     icon: payload.icon,
     badge: payload.badge,
     tag: payload.tag,
+    actions: Array.isArray(payload.actions) ? payload.actions : undefined,
     data: payload.data || {},
   });
 
