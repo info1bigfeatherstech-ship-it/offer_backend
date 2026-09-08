@@ -97,11 +97,46 @@ function buildStorefrontUrl(storefront, pathOrUrl = '/') {
   return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
-/** Absolute URL for push icons/badges (OS often ignores relative paths). */
+/**
+ * Absolute URL for push icons/badges (OS often ignores relative paths).
+ *
+ * Brand assets (relative paths like /pwa-192x192.png):
+ * - Prefer same-origin relative URLs so the service worker resolves against
+ *   the tab that registered (localhost in dev, live host in prod).
+ * - Avoid prefixing broken public CDN/hosts that 404/500 and cause Chrome
+ *   to fall back to the large `image` (product photo) for the small icon too.
+ *
+ * Absolute https URLs (product photos, CDN logos) are returned unchanged.
+ * Optional: PUSH_BRAND_ICON_URL=https://... forces brand icon/badge globally.
+ */
 function resolvePushAssetUrl(assetPath, storefront = 'ecomm') {
-  const path = String(assetPath || '/pwa-192x192.png').trim() || '/pwa-192x192.png';
-  if (/^https?:\/\//i.test(path)) return path;
-  return buildStorefrontUrl(storefront, path);
+  const fallbackPath = '/pwa-192x192.png';
+  const path = String(assetPath || fallbackPath).trim() || fallbackPath;
+
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+
+  const brandOverride = String(process.env.PUSH_BRAND_ICON_URL || '').trim();
+  const isBrandAsset =
+    /^\/pwa-\d+x\d+\.(png|webp|jpg|jpeg)$/i.test(path) ||
+    path === '/favicon.ico' ||
+    path === fallbackPath;
+
+  if (isBrandAsset && /^https:\/\//i.test(brandOverride)) {
+    try {
+      return new URL(brandOverride).href;
+    } catch {
+      // fall through
+    }
+  }
+
+  // Same-origin relative — SW converts via self.location.origin
+  if (path.startsWith('/')) {
+    return path;
+  }
+
+  return buildStorefrontUrl(storefront, path.startsWith('/') ? path : `/${path}`);
 }
 
 module.exports = {

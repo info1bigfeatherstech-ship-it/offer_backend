@@ -554,8 +554,10 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   const tagPrefix = template.pushTagPrefix || 'oos-restock';
   const inquiryId = String(inquiry._id);
 
-  // Restock-only: large `image` = product photo; small `icon` + `badge` = brand logo.
+  // Restock-only: large `image` = product photo; small `icon` + `badge` = brand logo
+  // (same-origin /pwa-192x192.png via resolvePushAssetUrl — SW loads from this site).
   // Click uses same-origin path so SW opens this storefront's PDP (local or prod).
+  const brandIcon = brandAssetUrl || '/pwa-192x192.png';
   const payload = {
     title: title || `"${productNameForTitle}" · Offer Wale Baba`.slice(0, 80),
     body:
@@ -563,9 +565,11 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
       (moqCopy
         ? 'Now available for wholesale on Offer Wale Baba. Tap to order.'
         : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
-    icon: brandAssetUrl,
-    badge: brandAssetUrl,
-    image: productImageUrl || undefined,
+    icon: brandIcon,
+    badge: brandIcon,
+    // Never set icon to product photo — only the large `image` slot.
+    image:
+      productImageUrl && productImageUrl !== brandIcon ? productImageUrl : undefined,
     tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
     data: {
       type: 'back_in_stock',
