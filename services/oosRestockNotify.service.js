@@ -534,10 +534,26 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   const tagPrefix = template.pushTagPrefix || 'oos-restock';
   const inquiryId = String(inquiry._id);
 
-  // Restock web push: brand logo only (no large `image`).
-  // OS notification "image" slots crop portrait product photos; logo + quoted title is clearer.
-  // Click uses same-origin PDP path so SW opens this storefront's product page.
+  // Restock web push:
+  // - icon/badge = brand logo (same-origin /pwa-192x192.png)
+  // - image = landscape letterboxed product preview (option 3) so OS does not crop
+  // Soft-fail: if preview cannot be built, omit image (logo + text still send).
   const brandIcon = brandAssetUrl || '/pwa-192x192.png';
+  let landscapeImageUrl = null;
+  try {
+    const { resolveLandscapePushImageUrl } = require('../utils/pushLandscapePreview');
+    landscapeImageUrl = await resolveLandscapePushImageUrl(
+      ctx.productImage || inquiry.productImage || null,
+      { logTag: 'oosRestockPush' }
+    );
+  } catch (err) {
+    logger.warn('[oosRestockNotify] landscape preview threw', {
+      inquiryId,
+      message: err?.message || String(err),
+    });
+    landscapeImageUrl = null;
+  }
+
   const payload = {
     title: title || `"${productNameForTitle}" · Offer Wale Baba`.slice(0, 80),
     body:
@@ -547,6 +563,10 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
         : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
     icon: brandIcon,
     badge: brandIcon,
+    image:
+      landscapeImageUrl && landscapeImageUrl !== brandIcon
+        ? landscapeImageUrl
+        : undefined,
     tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
     data: {
       type: 'back_in_stock',
