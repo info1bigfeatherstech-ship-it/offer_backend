@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const logger = require('./logger');
 const pickupCalendarUtil = require('./shiprocketPickupCalendar');
+const { sanitizeCourierConsigneeName } = require('./addressValidation');
 
 const DEFAULT_BASE = 'https://apiv2.shiprocket.in/v1';
 const PICKUP_PREFS_CACHE_MS = 60 * 60 * 1000;
@@ -735,7 +736,7 @@ class ShiprocketService {
       order_id: order.orderId,
       order_date: (order.createdAt || new Date()).toISOString().slice(0, 19).replace('T', ' '),
       pickup_location: pickupLocation,
-      billing_customer_name: addr.fullName || 'Customer',
+      billing_customer_name: sanitizeCourierConsigneeName(addr.fullName),
       billing_last_name: '.',
       billing_address: [addr.houseNumber, addr.building, addr.floor, addr.addressLine1].filter(Boolean).join(', ') || 'Address',
       billing_address_2: [addr.addressLine2, addr.area, addr.landmark].filter(Boolean).join(', ') || '',
@@ -834,7 +835,7 @@ class ShiprocketService {
       awb_code: order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || null,
       reason: returnInfo.reasonType || 'damaged',
       remarks: returnInfo.reasonMessage || 'Return approved by admin',
-      pickup_name: order.addressSnapshot?.fullName || 'Customer',
+      pickup_name: sanitizeCourierConsigneeName(order.addressSnapshot?.fullName),
       pickup_phone: String(order.addressSnapshot?.phone || '').replace(/\D/g, '').slice(-10) || undefined,
       pickup_address: [order.addressSnapshot?.houseNumber, order.addressSnapshot?.building, order.addressSnapshot?.floor, order.addressSnapshot?.addressLine1].filter(Boolean).join(', ') || undefined,
       pickup_address_2: [order.addressSnapshot?.addressLine2, order.addressSnapshot?.area, order.addressSnapshot?.landmark].filter(Boolean).join(', ') || undefined,

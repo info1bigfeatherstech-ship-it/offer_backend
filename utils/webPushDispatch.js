@@ -69,7 +69,10 @@ async function dispatchWebPush(subscriptionDoc, payload, options = {}) {
     body: payload.body,
     icon: payload.icon,
     badge: payload.badge,
+    // Optional large image (restock product photo). Other push types omit this.
+    image: typeof payload.image === 'string' && payload.image ? payload.image : undefined,
     tag: payload.tag,
+    actions: Array.isArray(payload.actions) ? payload.actions : undefined,
     data: payload.data || {},
   });
 

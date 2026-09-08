@@ -6,6 +6,7 @@ const cartReminderTemplate = require('../templates/cartReminderEmail.template');
 const logger = require('../utils/logger');
 const { findCartForStorefront } = require('./cartStorefront.service');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
+const { buildStorefrontUrl } = require('../utils/storefrontFrontendUrl');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -53,12 +54,8 @@ function getTransporter() {
   return cachedTransporter;
 }
 
-function getStorefrontCartUrl() {
-  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
-  return `${base}/account/usercart`;
+function getStorefrontCartUrl(storefront = 'ecomm') {
+  return buildStorefrontUrl(storefront, '/account/usercart');
 }
 
 function escapeHtml(value) {

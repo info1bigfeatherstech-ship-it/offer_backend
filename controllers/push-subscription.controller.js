@@ -11,6 +11,8 @@ const {
   getPushSoftPromptEligibility,
   recordPushSoftPromptImpression,
 } = require('../services/pushSoftPrompt.service');
+const { recordPwaInstall } = require('../services/engagementAnalytics.service');
+const logger = require('../utils/logger');
 
 const getVapidPublicKeyHandler = async (req, res) => {
   try {
@@ -185,6 +187,43 @@ const recordPushPromptImpressionHandler = async (req, res) => {
   }
 };
 
+/**
+ * Logged-in PWA install attribution (appinstalled or standalone confirm).
+ * Idempotent — safe to call on every standalone session open.
+ */
+const recordPwaInstallHandler = async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const result = await recordPwaInstall(userId, {
+      userAgent: req.headers['user-agent'] || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      ...result,
+    });
+  } catch (error) {
+    const code = error.code || 'PWA_INSTALL_FAILED';
+    const status = code === 'USER_NOT_FOUND' ? 404 : 500;
+    logger.warn('[pwaInstall] record failed', {
+      code,
+      message: error?.message,
+    });
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not record PWA install',
+    });
+  }
+};
+
 module.exports = {
   getVapidPublicKeyHandler,
   subscribePush,
@@ -192,4 +231,5 @@ module.exports = {
   getPushStatus,
   getPushPromptEligibilityHandler,
   recordPushPromptImpressionHandler,
+  recordPwaInstallHandler,
 };

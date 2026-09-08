@@ -222,6 +222,28 @@ const userSchema = new mongoose.Schema(
         default: null,
       },
     },
+
+    /**
+     * Attributed PWA install (logged-in only).
+     * Guests who install without login are not counted until they log in
+     * while running as installed PWA (confirm endpoint).
+     */
+    pwaInstall: {
+      installedAt: {
+        type: Date,
+        default: null,
+        index: true,
+      },
+      lastConfirmedAt: {
+        type: Date,
+        default: null,
+      },
+      userAgent: {
+        type: String,
+        default: null,
+        maxlength: 512,
+      },
+    },
   },
   { timestamps: true }
 );

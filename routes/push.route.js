@@ -9,6 +9,7 @@ const {
   getPushStatus,
   getPushPromptEligibilityHandler,
   recordPushPromptImpressionHandler,
+  recordPwaInstallHandler,
 } = require('../controllers/push-subscription.controller');
 
 /**
@@ -36,5 +37,6 @@ router.post(
 );
 router.post('/subscribe', verifyToken, limiters.pushWrite, subscribePush);
 router.delete('/unsubscribe', verifyToken, limiters.pushWrite, unsubscribePush);
+router.post('/pwa-install', verifyToken, limiters.pushWrite, recordPwaInstallHandler);
 
 module.exports = router;

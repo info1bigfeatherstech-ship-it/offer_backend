@@ -1,5 +1,5 @@
 /**
- * Back-in-stock email copy for OOS inquiry waitlist.
+ * Back-in-stock email + web-push copy for OOS inquiry waitlist.
  * Placeholders: {{productName}}, {{productUrl}}, {{ctaLabel}}, {{greeting}}, {{intro}}, {{stockLine}}, {{footer}}
  */
 module.exports = {
@@ -15,6 +15,16 @@ module.exports = {
   footer:
     'You received this because you asked to be notified when this product was back in stock. If you already bought it, you can ignore this email.',
 
+  // Web push (browser / PWA)
+  // Title: product name only. Brand stays in body + logo icon/badge.
+  // Large `image` = landscape letterboxed product preview (generated at send-time).
+  pushBrandName: 'Offer Wale Baba',
+  pushTitle: '{{productName}}',
+  pushBody: 'Back in stock on Offer Wale Baba. Tap to view and order.',
+  pushBadgePath: '/pwa-192x192.png',
+  pushIconPath: '/pwa-192x192.png',
+  pushTagPrefix: 'oos-restock',
+
   // Wholesale MOQ waitlist (reason = moq_unmet)
   moqSubject: '{{productName}} is now available for wholesale order',
   moqGreeting: 'Good news!',
@@ -26,6 +36,8 @@ module.exports = {
     'You received this because you asked to be notified when this product had enough wholesale stock. If you already ordered, you can ignore this email.',
   moqTextBody:
     '{{productName}} is now available for wholesale order.\nEnough stock is now available to meet the wholesale minimum order quantity.',
+  moqPushTitle: '{{productName}}',
+  moqPushBody: 'Now available for wholesale on Offer Wale Baba. Tap to order.',
 
   htmlLayout: `
 <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:24px;border:1px solid #eee;border-radius:10px;">
@@ -42,3 +54,4 @@ module.exports = {
 </div>
 `.trim(),
 };
+

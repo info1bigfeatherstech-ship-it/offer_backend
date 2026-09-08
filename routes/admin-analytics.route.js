@@ -17,7 +17,10 @@ const {
   getAllWishlists,
   getStaleWishlists,
   getPopularWishlistProducts,
-  getDashboardSummary
+  getDashboardSummary,
+  getEngagementSummary,
+  getPushSubscribers,
+  getPwaInstalls,
 } = require('../controllers/admin-analytics.controller');
 
 // Import your auth middleware (adjust path as needed)
@@ -38,6 +41,9 @@ router.get('/users', getAllUsers);
 router.get('/users/export', exportUsersExcel);
 router.get('/push-settings', getLeadsPushSettings);
 router.put('/push-settings', updateLeadsPushSettings);
+router.get('/engagement/summary', getEngagementSummary);
+router.get('/engagement/push-subscribers', getPushSubscribers);
+router.get('/engagement/pwa-installs', getPwaInstalls);
 router.post('/users/bulk-cart-reminder-email', bulkCartReminderEmail);
 router.post('/users/bulk-cart-reminder-push', bulkCartReminderPush);
 router.post('/users/bulk-wishlist-reminder-push', bulkWishlistReminderPush);

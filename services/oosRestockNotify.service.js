@@ -10,7 +10,8 @@
  * - wholesale moq_unmet: notify when qty >= MOQ
  *
  * Safety: atomic claim pending → notifying, then notified / reclaim on failure.
- * Channels: email (marketing) + in-app website notifications (UserNotification).
+ * Channels: email (marketing) + in-app website notifications + web push (opt-in devices).
+ * Web push is storefront-aware via inquiry.storefront (PDP URL) and scoped user lookup.
  * Never blocks the inventory write path — callers should fire-and-forget.
  */
 const nodemailer = require('nodemailer');
@@ -18,10 +19,24 @@ const OutOfStockInquiry = require('../models/OutOfStockInquiry');
 const Product = require('../models/Product');
 const logger = require('../utils/logger');
 const template = require('../templates/oosRestockEmail.template');
+const { buildStorefrontUrl, resolvePushAssetUrl } = require('../utils/storefrontFrontendUrl');
+const {
+  isPushConfigured,
+  dispatchWebPush,
+  delay: pushDelay,
+} = require('../utils/webPushDispatch');
 
 const SEND_DELAY_MS = Math.min(
   2000,
   Math.max(150, Number(process.env.OOS_RESTOCK_NOTIFY_DELAY_MS || 350))
+);
+const PUSH_DEVICE_DELAY_MS = Math.min(
+  500,
+  Math.max(50, Number(process.env.OOS_RESTOCK_PUSH_DEVICE_DELAY_MS || 100))
+);
+const MAX_PUSH_DEVICES_PER_USER = Math.min(
+  10,
+  Math.max(1, Number(process.env.OOS_RESTOCK_PUSH_MAX_DEVICES || 5))
 );
 const MAX_PER_VARIANT = Math.min(
   500,
@@ -84,26 +99,28 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function storefrontBaseUrl(storefront) {
-  if (storefront === 'wholesale') {
-    return String(
-      process.env.WHOLESALE_FRONTEND_URL ||
-        process.env.FRONTEND_URL ||
-        process.env.STORE_URL ||
-        'https://offerwalebaba.com'
-    ).replace(/\/$/, '');
-  }
-  return String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
+function resolveInquiryStorefront(inquiry) {
+  return inquiry?.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
 }
 
 function buildProductUrl(inquiry) {
-  const base = storefrontBaseUrl(inquiry.storefront);
   const slug = String(inquiry.productSlug || '').trim();
-  if (!slug) return base;
-  return `${base}/products/${encodeURIComponent(slug)}`;
+  const sf = resolveInquiryStorefront(inquiry);
+  if (!slug) return buildStorefrontUrl(sf, '/');
+  return buildStorefrontUrl(sf, buildProductClickPath(slug, sf));
+}
+
+/**
+ * Same-origin PDP path for web-push click (SW resolves against its registration origin).
+ * ecomm → /products/:slug | wholesale → /product/:slug
+ */
+function buildProductClickPath(productSlug, storefront = 'ecomm') {
+  const slug = String(productSlug || '').trim();
+  if (!slug) return '/';
+  // Reject path traversal / absolute URLs masquerading as slugs
+  if (slug.includes('/') || slug.includes('\\') || slug.includes('..')) return '/';
+  const prefix = storefront === 'wholesale' ? '/product' : '/products';
+  return `${prefix}/${encodeURIComponent(slug)}`;
 }
 
 function fillTemplate(str, map) {
@@ -160,7 +177,7 @@ function shouldNotifyInquiryForStock(inquiry, stock) {
   if (!Number.isFinite(qty) || qty <= 0) return false;
 
   const reason = inquiry?.reason === 'moq_unmet' ? 'moq_unmet' : 'out_of_stock';
-  const storefront = inquiry?.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+  const storefront = resolveInquiryStorefront(inquiry);
 
   if (storefront === 'wholesale' && reason === 'moq_unmet') {
     return qty >= resolveMinimumOrderQuantity(stock.minimumOrderQuantity);
@@ -218,6 +235,7 @@ async function claimInquiry(inquiryId) {
         status: 'notifying',
         lastNotifyAttemptAt: new Date(),
         lastNotifyError: null,
+        notifyChannelErrors: [],
       },
       $inc: { notifyAttempts: 1 },
     },
@@ -225,18 +243,55 @@ async function claimInquiry(inquiryId) {
   );
 }
 
-async function markNotified(inquiryId, channels) {
+async function markNotified(inquiryId, channels, channelErrors = []) {
+  const errSummary = Array.isArray(channelErrors) && channelErrors.length
+    ? channelErrors.join('; ').slice(0, 500)
+    : null;
   await OutOfStockInquiry.updateOne(
     { _id: inquiryId, status: 'notifying' },
     {
       $set: {
         status: 'notified',
         notifiedAt: new Date(),
-        lastNotifyError: null,
+        // Keep soft channel failures visible even when another channel succeeded
+        lastNotifyError: errSummary,
         notifyChannelsSent: channels,
+        notifyChannelErrors: Array.isArray(channelErrors) ? channelErrors.slice(0, 20) : [],
       },
     }
   );
+}
+
+function classifyEmailError(err) {
+  const msg = String(err?.message || err || '');
+  const code = String(err?.code || '');
+  const response = String(err?.response || '');
+  const blob = `${code} ${msg} ${response}`.toLowerCase();
+  if (
+    blob.includes('daily user sending limit') ||
+    blob.includes('5.4.5') ||
+    blob.includes('sending limit')
+  ) {
+    const wrapped = new Error(
+      'Marketing Gmail daily sending limit exceeded. Email skipped until quota resets.'
+    );
+    wrapped.code = 'EMAIL_QUOTA_EXCEEDED';
+    return wrapped;
+  }
+  if (blob.includes('invalid login') || blob.includes('authentication') || code === 'EAUTH') {
+    const wrapped = new Error(msg || 'Marketing email authentication failed');
+    wrapped.code = 'EMAIL_AUTH_FAILED';
+    return wrapped;
+  }
+  if (code === 'EENVELOPE' || code === 'EMESSAGE') {
+    const wrapped = new Error(msg || 'Marketing email envelope rejected');
+    wrapped.code = code;
+    return wrapped;
+  }
+  if (err && typeof err === 'object') return err;
+  const wrapped = new Error(msg || 'email_failed');
+  wrapped.code = code || 'EMAIL_FAILED';
+  return wrapped;
 }
 
 async function releaseClaim(inquiryId, errorMessage) {
@@ -313,14 +368,14 @@ async function sendRestockEmail(inquiry, ctx) {
 }
 
 /**
- * Resolve account for in-app bell notifications.
- * Prefers inquiry.userId, else match User by email/phone.
+ * Resolve account for in-app + web push.
+ * Prefers inquiry.userId, else match User by email/phone within inquiry storefront scope.
  */
 async function resolveUserIdForInquiry(inquiry) {
   if (inquiry.userId) return inquiry.userId;
   const User = require('../models/User');
   const { buildCustomerContactLookup, customerScopeFromStorefront } = require('../utils/accountScope');
-  const scope = customerScopeFromStorefront(inquiry.storefront);
+  const scope = customerScopeFromStorefront(resolveInquiryStorefront(inquiry));
   if (inquiry.email) {
     const byEmail = await User.findOne(
       buildCustomerContactLookup({ email: String(inquiry.email).toLowerCase() }, scope)
@@ -343,9 +398,13 @@ async function resolveUserIdForInquiry(inquiry) {
 /**
  * In-app notification in the website Notifications centre.
  * Uses synthetic orderId `oos:{inquiryId}` for idempotency with existing unique index.
+ * @param {object} inquiry
+ * @param {object} ctx
+ * @param {unknown} [resolvedUserId]
  */
-async function sendInAppRestockNotification(inquiry, ctx) {
-  const userId = await resolveUserIdForInquiry(inquiry);
+async function sendInAppRestockNotification(inquiry, ctx, resolvedUserId = null) {
+  const userId =
+    resolvedUserId != null ? resolvedUserId : await resolveUserIdForInquiry(inquiry);
   if (!userId) {
     const err = new Error('No logged-in user account to attach in-app notification');
     err.code = 'IN_APP_USER_MISSING';
@@ -383,6 +442,7 @@ async function sendInAppRestockNotification(inquiry, ctx) {
             productSlug: productSlug || null,
             productId: inquiry.productId ? String(inquiry.productId) : null,
             inquiryId,
+            storefront: resolveInquiryStorefront(inquiry),
           },
         },
       },
@@ -398,45 +458,240 @@ async function sendInAppRestockNotification(inquiry, ctx) {
 }
 
 /**
- * Deliver via email and/or in-app. At least one channel must succeed.
+ * Browser / PWA web push for waitlist users who opted into notifications.
+ * Soft channel: missing user / subscription / VAPID is a skip, not a hard outage.
+ * @param {object} inquiry
+ * @param {object} ctx
+ * @param {unknown} [resolvedUserId]
+ */
+async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
+  if (!envFlagEnabled('OOS_RESTOCK_WEB_PUSH_ENABLED', true)) {
+    const err = new Error('OOS restock web push disabled');
+    err.code = 'PUSH_DISABLED';
+    throw err;
+  }
+  if (!isPushConfigured()) {
+    const err = new Error('Web push is not configured (VAPID keys)');
+    err.code = 'PUSH_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const userId =
+    resolvedUserId != null ? resolvedUserId : await resolveUserIdForInquiry(inquiry);
+  if (!userId) {
+    const err = new Error('No user account linked for web push');
+    err.code = 'PUSH_USER_MISSING';
+    throw err;
+  }
+
+  const PushSubscription = require('../models/PushSubscription');
+  let subscriptions = [];
+  try {
+    subscriptions = await PushSubscription.find({
+      userId,
+      isActive: true,
+    }).limit(MAX_PUSH_DEVICES_PER_USER);
+  } catch (err) {
+    const wrapped = new Error(err?.message || 'Push subscription lookup failed');
+    wrapped.code = 'PUSH_LOOKUP_FAILED';
+    throw wrapped;
+  }
+
+  if (!subscriptions.length) {
+    const err = new Error('No active push subscription for user');
+    err.code = 'PUSH_NO_SUBSCRIPTION';
+    throw err;
+  }
+
+  const sf = resolveInquiryStorefront(inquiry);
+  const productNameRaw = String(ctx.productName || inquiry.productName || 'Your item')
+    .trim()
+    .replace(/["«»“”]/g, '')
+    .replace(/\s+/g, ' ');
+  // Title is product name only (no quotes / brand suffix).
+  const productNameForTitle = productNameRaw.slice(0, 80) || 'Your item';
+  const productName = productNameRaw.slice(0, 120) || 'Your item';
+  const productSlug = ctx.productSlug || inquiry.productSlug || null;
+  const productUrl = buildProductUrl({
+    ...(inquiry.toObject?.() || inquiry),
+    productSlug,
+    storefront: sf,
+  });
+  const clickPath = buildProductClickPath(productSlug, sf);
+  const moqCopy = isMoqUnmetInquiry(inquiry);
+  const titleTemplate = moqCopy
+    ? template.moqPushTitle || '{{productName}}'
+    : template.pushTitle || '{{productName}}';
+  const bodyTemplate = moqCopy
+    ? template.moqPushBody ||
+      'Now available for wholesale on Offer Wale Baba. Tap to order.'
+    : template.pushBody || 'Back in stock on Offer Wale Baba. Tap to view and order.';
+  const title = fillTemplate(titleTemplate, { productName: productNameForTitle }).slice(0, 80);
+  const body = fillTemplate(bodyTemplate, { productName }).slice(0, 180);
+  const brandAssetPath =
+    template.pushBadgePath || template.pushIconPath || '/pwa-192x192.png';
+  const brandAssetUrl = resolvePushAssetUrl(brandAssetPath, sf);
+  const tagPrefix = template.pushTagPrefix || 'oos-restock';
+  const inquiryId = String(inquiry._id);
+
+  // Restock web push:
+  // - icon/badge = brand logo (same-origin /pwa-192x192.png)
+  // - image = landscape letterboxed product preview (option 3) so OS does not crop
+  // Soft-fail: if preview cannot be built, omit image (logo + text still send).
+  const brandIcon = brandAssetUrl || '/pwa-192x192.png';
+  let landscapeImageUrl = null;
+  try {
+    const { resolveLandscapePushImageUrl } = require('../utils/pushLandscapePreview');
+    landscapeImageUrl = await resolveLandscapePushImageUrl(
+      ctx.productImage || inquiry.productImage || null,
+      { logTag: 'oosRestockPush' }
+    );
+  } catch (err) {
+    logger.warn('[oosRestockNotify] landscape preview threw', {
+      inquiryId,
+      message: err?.message || String(err),
+    });
+    landscapeImageUrl = null;
+  }
+
+  const payload = {
+    title: title || productNameForTitle.slice(0, 80),
+    body:
+      body ||
+      (moqCopy
+        ? 'Now available for wholesale on Offer Wale Baba. Tap to order.'
+        : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
+    icon: brandIcon,
+    badge: brandIcon,
+    image:
+      landscapeImageUrl && landscapeImageUrl !== brandIcon
+        ? landscapeImageUrl
+        : undefined,
+    tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
+    data: {
+      type: 'back_in_stock',
+      url: clickPath,
+      absoluteUrl: productUrl,
+      storefront: sf,
+      inquiryId,
+      productSlug: productSlug || null,
+      productId: inquiry.productId ? String(inquiry.productId) : null,
+    },
+  };
+
+  let devicesSent = 0;
+  for (const sub of subscriptions) {
+    try {
+      const outcome = await dispatchWebPush(sub, payload, { logTag: 'oosRestockPush' });
+      if (outcome?.ok) devicesSent += 1;
+    } catch (err) {
+      logger.warn('[oosRestockNotify] web push device send threw', {
+        inquiryId,
+        userId: String(userId),
+        subscriptionId: String(sub?._id || ''),
+        storefront: sf,
+        message: err?.message || String(err),
+      });
+    }
+    if (PUSH_DEVICE_DELAY_MS > 0) {
+      await pushDelay(PUSH_DEVICE_DELAY_MS);
+    }
+  }
+
+  if (!devicesSent) {
+    const err = new Error('All web push devices failed or expired');
+    err.code = 'PUSH_SEND_FAILED';
+    throw err;
+  }
+
+  return { devicesSent };
+}
+
+/**
+ * Deliver via email and/or in-app and/or web push. At least one channel must succeed.
  */
 async function deliverInquiry(inquiry, ctx) {
   const channels = [];
   const errors = [];
 
+  let resolvedUserId = null;
+  try {
+    resolvedUserId = await resolveUserIdForInquiry(inquiry);
+  } catch (err) {
+    logger.warn('[oosRestockNotify] user resolve failed', {
+      inquiryId: String(inquiry._id),
+      message: err?.message || String(err),
+    });
+  }
+
   if (inquiry.email) {
     try {
       await sendRestockEmail(inquiry, ctx);
       channels.push('email');
-    } catch (err) {
+    } catch (rawErr) {
+      const err = classifyEmailError(rawErr);
       errors.push(`email:${err.code || err.message}`);
       logger.warn('[oosRestockNotify] email failed', {
         inquiryId: String(inquiry._id),
+        storefront: resolveInquiryStorefront(inquiry),
+        to: String(inquiry.email || '').slice(0, 80),
+        message: err.message,
+        code: err.code,
+      });
+    }
+  } else {
+    errors.push('email:EMAIL_MISSING');
+  }
+
+  try {
+    await sendInAppRestockNotification(inquiry, ctx, resolvedUserId);
+    channels.push('in_app');
+  } catch (err) {
+    errors.push(`in_app:${err.code || err.message}`);
+    logger.warn('[oosRestockNotify] in-app failed', {
+      inquiryId: String(inquiry._id),
+      storefront: resolveInquiryStorefront(inquiry),
+      message: err.message,
+      code: err.code,
+    });
+  }
+
+  try {
+    await sendRestockWebPush(inquiry, ctx, resolvedUserId);
+    channels.push('web_push');
+  } catch (err) {
+    errors.push(`web_push:${err.code || err.message}`);
+    const soft = [
+      'PUSH_DISABLED',
+      'PUSH_NOT_CONFIGURED',
+      'PUSH_USER_MISSING',
+      'PUSH_NO_SUBSCRIPTION',
+    ].includes(err.code);
+    if (soft) {
+      logger.info('[oosRestockNotify] web push skipped', {
+        inquiryId: String(inquiry._id),
+        storefront: resolveInquiryStorefront(inquiry),
+        code: err.code,
+        message: err.message,
+      });
+    } else {
+      logger.warn('[oosRestockNotify] web push failed', {
+        inquiryId: String(inquiry._id),
+        storefront: resolveInquiryStorefront(inquiry),
         message: err.message,
         code: err.code,
       });
     }
   }
 
-  try {
-    await sendInAppRestockNotification(inquiry, ctx);
-    channels.push('in_app');
-  } catch (err) {
-    errors.push(`in_app:${err.code || err.message}`);
-    logger.warn('[oosRestockNotify] in-app failed', {
-      inquiryId: String(inquiry._id),
-      message: err.message,
-      code: err.code,
-    });
-  }
-
   if (!channels.length) {
     const err = new Error(errors.join('; ') || 'No channel succeeded');
     err.code = 'ALL_CHANNELS_FAILED';
+    err.channelErrors = errors;
     throw err;
   }
 
-  return channels;
+  return { channels, channelErrors: errors };
 }
 
 /**
@@ -497,12 +752,17 @@ async function notifyPendingInquiriesForRestock(event) {
     if (!claimed) continue;
 
     try {
-      const channels = await deliverInquiry(claimed, enriched);
-      await markNotified(claimed._id, channels);
+      const result = await deliverInquiry(claimed, enriched);
+      const channels = Array.isArray(result) ? result : result?.channels || [];
+      const channelErrors = Array.isArray(result?.channelErrors) ? result.channelErrors : [];
+      await markNotified(claimed._id, channels, channelErrors);
       notified += 1;
     } catch (err) {
       failed += 1;
-      await releaseClaim(claimed._id, err.message);
+      const detail = Array.isArray(err?.channelErrors) && err.channelErrors.length
+        ? err.channelErrors.join('; ')
+        : err.message;
+      await releaseClaim(claimed._id, detail);
     }
 
     if (SEND_DELAY_MS > 0) await sleep(SEND_DELAY_MS);

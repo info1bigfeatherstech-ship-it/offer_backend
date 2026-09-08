@@ -9,7 +9,7 @@ const {
   dispatchWebPush,
   delay,
 } = require('../utils/webPushDispatch');
-const { getStorefrontFrontendBase } = require('../utils/storefrontFrontendUrl');
+const { buildStorefrontUrl, resolvePushAssetUrl } = require('../utils/storefrontFrontendUrl');
 const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
@@ -43,9 +43,8 @@ function wasReminderSentToday(lastSentAt) {
 }
 
 function buildWishlistUrl(storefront) {
-  const base = getStorefrontFrontendBase(storefront);
   const path = wishlistReminderPushTemplate.ctaPath || '/account/userwishlist';
-  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  return buildStorefrontUrl(storefront, path);
 }
 
 function buildPushPayload({ customerName, itemCount, storefront }) {
@@ -61,8 +60,11 @@ function buildPushPayload({ customerName, itemCount, storefront }) {
   return {
     title: wishlistReminderPushTemplate.title,
     body: applyPlaceholders(wishlistReminderPushTemplate.body, vars),
-    icon: wishlistReminderPushTemplate.icon,
-    badge: wishlistReminderPushTemplate.badge,
+    icon: resolvePushAssetUrl(wishlistReminderPushTemplate.icon, storefront),
+    badge: resolvePushAssetUrl(
+      wishlistReminderPushTemplate.badge || wishlistReminderPushTemplate.icon,
+      storefront
+    ),
     tag: wishlistReminderPushTemplate.tag,
     data: {
       type: 'wishlist-reminder',

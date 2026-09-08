@@ -17,6 +17,7 @@ const {
   MAX_BULK_RECIPIENTS: MAX_BULK_WISHLIST_PUSH_RECIPIENTS
 } = require('../services/wishlistReminderPush.service');
 const leadsPushSettingsService = require('../services/leadsPushSettings.service');
+const engagementAnalyticsService = require('../services/engagementAnalytics.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
 const scopeLabelFromReq = (req) => req.adminScope?.storefront || 'ecomm';
@@ -105,26 +106,53 @@ function formatAdminCart(cart, extra = {}) {
 // =============================================
 const getAllUsers = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = '', role = '' } = req.query;
+    let { page = 1, limit = 20, search = '', role = '', engagement = 'all' } = req.query;
 
     page = Math.max(1, Number(page));
     limit = Math.min(100, Math.max(1, Number(limit)));
     const skip = (page - 1) * limit;
 
+    const engagementFilter =
+      engagementAnalyticsService.normalizeEngagementFilter(engagement);
+
     // Build query (always scoped by admin storefront)
     let query = scopedUserQueryFromReq(req);
-    
+
     if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } }
-      ];
+      const searchRx = { $regex: String(search).slice(0, 120), $options: 'i' };
+      query = mergeAnd(query, {
+        $or: [{ name: searchRx }, { email: searchRx }, { phone: searchRx }],
+      });
     }
-    
+
     if (role && ['user', 'wholesaler', 'admin'].includes(role)) {
       query = mergeAnd(query, { role });
     }
+
+    let pushUserIds = [];
+    if (
+      engagementFilter === 'push_on' ||
+      engagementFilter === 'push_off' ||
+      engagementFilter === 'push_and_pwa'
+    ) {
+      try {
+        pushUserIds = await engagementAnalyticsService.getActivePushUserIds(
+          scopedUserQueryFromReq(req)
+        );
+      } catch (pushErr) {
+        console.error('getAllUsers push filter lookup failed', pushErr?.message);
+        return res.status(500).json({
+          success: false,
+          message: 'Could not apply notification filter',
+        });
+      }
+    }
+
+    query = engagementAnalyticsService.applyEngagementFilterToUserQuery(
+      query,
+      engagementFilter,
+      pushUserIds
+    );
 
     const [users, total] = await Promise.all([
       User.find(query)
@@ -133,45 +161,70 @@ const getAllUsers = async (req, res) => {
         .skip(skip)
         .limit(limit)
         .lean(),
-      User.countDocuments(query)
+      User.countDocuments(query),
     ]);
 
+    let pushMetaByUserId = new Map();
+    try {
+      pushMetaByUserId = await engagementAnalyticsService.getPushMetaForUserIds(
+        users.map((u) => u._id)
+      );
+    } catch (metaErr) {
+      console.warn('getAllUsers push meta enrich failed', metaErr?.message);
+      pushMetaByUserId = new Map();
+    }
+
     // Get additional stats for each user
-    const usersWithStats = await Promise.all(users.map(async (user) => {
-      // Get cart count
-      const cartt = await findCartForStorefront(user._id, resolveCustomerStorefrontFromReq(req));
-      const cartItemsCount = cartt?.items?.length || 0;
-      
-      // Get wishlist count
-      const wishlist = await Wishlist.findOne({ userId: user._id });
-      const wishlistCount = wishlist?.products?.length || 0;
-      
-      return {
-        ...user,
-        cartItemsCount,
-        wishlistCount,
-        lastActive: user.updatedAt || user.createdAt
-      };
-    }));
+    const usersWithStats = await Promise.all(
+      users.map(async (user) => {
+        let cartItemsCount = 0;
+        let wishlistCount = 0;
+        try {
+          const cartt = await findCartForStorefront(
+            user._id,
+            resolveCustomerStorefrontFromReq(req)
+          );
+          cartItemsCount = cartt?.items?.length || 0;
+        } catch {
+          cartItemsCount = 0;
+        }
+        try {
+          const wishlist = await Wishlist.findOne({ userId: user._id });
+          wishlistCount = wishlist?.products?.length || 0;
+        } catch {
+          wishlistCount = 0;
+        }
+
+        return engagementAnalyticsService.attachEngagementFields(
+          {
+            ...user,
+            cartItemsCount,
+            wishlistCount,
+            lastActive: user.updatedAt || user.createdAt,
+          },
+          pushMetaByUserId
+        );
+      })
+    );
 
     return res.status(200).json({
       success: true,
       scope: scopeLabelFromReq(req),
+      engagementFilter,
       data: usersWithStats,
       pagination: {
         total,
         page,
         limit,
-        totalPages: Math.ceil(total / limit)
-      }
+        totalPages: Math.max(1, Math.ceil(total / limit) || 1),
+      },
     });
-
   } catch (error) {
     console.error('Get all users error:', error);
     return res.status(500).json({
       success: false,
       message: 'Error fetching users',
-      error: error.message
+      error: error.message,
     });
   }
 };
@@ -1138,6 +1191,63 @@ const bulkCartReminderEmail = async (req, res) => {
   }
 };
 
+
+const getEngagementSummary = async (req, res) => {
+  try {
+    const summary = await engagementAnalyticsService.getEngagementSummary(
+      scopedUserQueryFromReq(req)
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      data: summary,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load engagement summary',
+    });
+  }
+};
+
+const getPushSubscribers = async (req, res) => {
+  try {
+    const result = await engagementAnalyticsService.listPushSubscribers(
+      scopedUserQueryFromReq(req),
+      req.query
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      ...result,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load push subscribers',
+    });
+  }
+};
+
+const getPwaInstalls = async (req, res) => {
+  try {
+    const result = await engagementAnalyticsService.listPwaInstalls(
+      scopedUserQueryFromReq(req),
+      req.query
+    );
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      ...result,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Could not load PWA installs',
+    });
+  }
+};
+
 module.exports = {
   getAllUsers,
   exportUsersExcel,
@@ -1154,5 +1264,8 @@ module.exports = {
   getAllWishlists,
   getStaleWishlists,
   getPopularWishlistProducts,
-  getDashboardSummary
+  getDashboardSummary,
+  getEngagementSummary,
+  getPushSubscribers,
+  getPwaInstalls
 };

@@ -931,7 +931,130 @@ async function findExistingProductByProductCode(rawCode) {
   );
 }
 
+/**
+ * Product identity for listing/bulk is productCode BASE series, not display name.
+ * Different products may share the same name; variants of one product share one base
+ * (e.g. 1001, 1001-1, 1001-2).
+ */
+async function findExistingProductByCodeBase(base, options = {}) {
+  const baseNorm = String(base || "")
+    .trim()
+    .toUpperCase();
+  if (!baseNorm) return null;
+  const pattern = new RegExp(`^${escapeRegex(baseNorm)}(-\\d+)?$`, "i");
+  let query = Product.findOne({ "variants.productCode": { $regex: pattern } });
+  if (options.select) {
+    query = query.select(options.select);
+  }
+  return query;
+}
 
+function tryParseProductCodeBase(rawCode) {
+  try {
+    const normalized = normalizeProductCode(rawCode);
+    if (!normalized) return null;
+    return parseProductCodeParts(normalized, "productCode").base;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Group bulk/CSV rows by productCode BASE (not name).
+ * Same display name + different bases => separate products.
+ * Same base + different names => nameConflict on the group (validated later).
+ */
+function groupBulkImportRowsByCodeBase(rows) {
+  const productMap = new Map();
+  const skipped = [];
+
+  for (const row of rows || []) {
+    const productName = String(row?.name || "").trim();
+    if (!productName) {
+      skipped.push({
+        row,
+        reason: "Product name is missing",
+      });
+      continue;
+    }
+
+    const normalizedCode = normalizeProductCode(row?.productCode);
+    let base = tryParseProductCodeBase(normalizedCode);
+    if (!base) {
+      // Keep row processable: isolated group so row-level validation still runs.
+      const rowKey = row?.rowNumber != null ? String(row.rowNumber) : `i${productMap.size}`;
+      base = normalizedCode
+        ? `__invalid_code_${rowKey}`
+        : `__missing_code_${rowKey}`;
+    }
+
+    if (!productMap.has(base)) {
+      productMap.set(base, {
+        name: productName,
+        base,
+        rows: [],
+        nameConflict: false,
+        conflictNames: [productName],
+      });
+    } else {
+      const group = productMap.get(base);
+      if (
+        !String(base).startsWith("__") &&
+        String(group.name).trim().toLowerCase() !== productName.toLowerCase()
+      ) {
+        group.nameConflict = true;
+        if (
+          !group.conflictNames.some(
+            (n) => String(n).toLowerCase() === productName.toLowerCase()
+          )
+        ) {
+          group.conflictNames.push(productName);
+        }
+      }
+    }
+    productMap.get(base).rows.push(row);
+  }
+
+  return { productMap, skipped };
+}
+
+function assertBulkGroupSharedProductName(group, contextLabel) {
+  if (!group) return "";
+  if (group.nameConflict) {
+    const listed = (group.conflictNames || [])
+      .map((n) => `"${n}"`)
+      .join(", ");
+    throw new Error(
+      `${contextLabel}: all variants of productCode base ${group.base} must share the same product name. Found: ${listed}.`
+    );
+  }
+  const name = String(group.name || "").trim();
+  if (!name) {
+    throw new Error(`${contextLabel}: product name is required`);
+  }
+  return name;
+}
+
+function assertCsvNameMatchesExistingProduct(existingProduct, productName, contextLabel) {
+  if (!existingProduct) return;
+  const existingName = String(existingProduct.name || "")
+    .trim()
+    .toLowerCase();
+  const incomingName = String(productName || "")
+    .trim()
+    .toLowerCase();
+  if (existingName && incomingName && existingName !== incomingName) {
+    throw new Error(
+      `${contextLabel}: productCode series belongs to existing product "${existingProduct.name}". ` +
+        `Use that same product name to add variants, or use a different productCode base for a new product named "${productName}".`
+    );
+  }
+}
+
+function productsAreSameDocument(a, b) {
+  if (!a || !b || a._id == null || b._id == null) return false;
+  return String(a._id) === String(b._id);
+}
 
 // Create new product
 const createProduct = async (req, res) => {
@@ -976,23 +1099,8 @@ const createProduct = async (req, res) => {
       });
     }
 
-    // If product already exists (same name), do not create duplicate; return existing variant codes.
-    const existingProductByName = await Product.findOne({
-      name: { $regex: new RegExp(`^${escapeRegex(String(name).trim())}$`, 'i') }
-    }).select('name slug variants.productCode');
-    if (existingProductByName) {
-      return res.status(409).json({
-        success: false,
-        message: "Product already exists with these variants",
-        product: {
-          name: existingProductByName.name,
-          slug: existingProductByName.slug
-        },
-        existingVariantProductCodes: (existingProductByName.variants || [])
-          .map((v) => normalizeProductCode(v.productCode))
-          .filter(Boolean)
-      });
-    }
+    // Product display name may be shared across products. Identity / uniqueness is
+    // enforced on variants.productCode (and slug is generated uniquely from name).
 
     let variantsInput = variantsRaw;
     if (typeof variantsRaw === "string") {
@@ -1309,11 +1417,20 @@ const createProduct = async (req, res) => {
     const resolvedStatus =
       status && ["draft", "active", "archived"].includes(String(status).toLowerCase())
         ? String(status).toLowerCase()
-        : "draft";
+        : "active";
     const channelStatus = deriveProductChannelStatusFromLegacy(
       resolvedStatus,
       req.body.channelStatus
     );
+    // Legacy status maps both channels; keep wholesale draft unless a variant is
+    // wholesale-eligible (wholesale=true + wholesaleBase > 0). Prevents create
+    // failure / accidental wholesale catalog publish on single ecomm listing.
+    if (
+      channelStatus.wholesale === "active" &&
+      !hasWholesalePricingEligibleVariant(variants)
+    ) {
+      channelStatus.wholesale = "draft";
+    }
 
     // =============================
     //  CREATE PRODUCT
@@ -1480,46 +1597,59 @@ const importProductsFromCSV = async (req, res) => {
     }
     
     // =============================================
-    // STEP 3: Group rows by product name
+    // STEP 3: Group rows by productCode BASE (name may be shared across products)
     // =============================================
-    const productMap = new Map();
-    
-    for (const row of rows) {
-      const productName = String(row.name || '').trim();
-      if (!productName) {
-        stats.failed.push({
-          product: "Unknown",
-          reason: "Product name is missing",
-          rowNumber: row.rowNumber
-        });
-        continue;
-      }
-      
-      const key = productName.toLowerCase();
-      
-      if (!productMap.has(key)) {
-        productMap.set(key, {
-          name: productName,
-          rows: [],
-          originalIndex: row.rowNumber
-        });
-      }
-      productMap.get(key).rows.push(row);
+    const { productMap, skipped: skippedNameRows } = groupBulkImportRowsByCodeBase(rows);
+    for (const item of skippedNameRows) {
+      stats.failed.push({
+        product: "Unknown",
+        reason: item.reason || "Product name is missing",
+        rowNumber: item.row?.rowNumber
+      });
     }
     
     stats.uniqueProducts = productMap.size;
-    console.log(`📦 Unique products: ${stats.uniqueProducts}`);
+    console.log(`📦 Unique products (by productCode base): ${stats.uniqueProducts}`);
 
     // =============================================
     // STEP 3.5: Pre-validate productCode series (same behavior as ZIP bulk flow)
     // =============================================
     for (const [, productData] of productMap) {
       const productRows = productData.rows || [];
+      const contextLabel = `CSV import product "${productData.name}" (base ${productData.base})`;
+      try {
+        assertBulkGroupSharedProductName(productData, contextLabel);
+      } catch (nameErr) {
+        for (const row of productRows) {
+          row._preValidationError = nameErr.message;
+        }
+        continue;
+      }
+
       normalizeBareProductCodesForBulkGroup(productRows);
 
-      const existingProduct = await Product.findOne({
-        name: { $regex: new RegExp(`^${escapeRegex(String(productData.name || '').trim())}$`, 'i') }
-      }).select('variants.productCode');
+      const codeBase =
+        String(productData.base || "").startsWith("__")
+          ? tryParseProductCodeBase(productRows[0]?.productCode)
+          : productData.base;
+      const existingProduct = codeBase
+        ? await findExistingProductByCodeBase(codeBase, {
+            select: "name variants.productCode",
+          })
+        : null;
+
+      try {
+        assertCsvNameMatchesExistingProduct(
+          existingProduct,
+          productData.name,
+          contextLabel
+        );
+      } catch (matchErr) {
+        for (const row of productRows) {
+          row._preValidationError = matchErr.message;
+        }
+        continue;
+      }
 
       alignIncomingRowsWithExistingSeries(
         productRows,
@@ -1533,7 +1663,7 @@ const importProductsFromCSV = async (req, res) => {
         assertBulkSeriesAgainstExisting({
           incomingCodes: codes,
           existingCodes: (existingProduct?.variants || []).map((v) => v.productCode),
-          contextLabel: `CSV import product "${productData.name}"`
+          contextLabel
         });
       } catch (err) {
         const isNewProduct = !existingProduct;
@@ -1575,7 +1705,8 @@ const importProductsFromCSV = async (req, res) => {
     for (const [, productData] of productMap) {
       const preview = await validateImportCsvProductGroupPreview(
         productData.name,
-        productData.rows || []
+        productData.rows || [],
+        { codeBase: productData.base, groupMeta: productData }
       );
       if (!preview.hasErrors) continue;
       for (const err of preview.productErrors || preview.errors || []) {
@@ -1810,14 +1941,43 @@ function collectImportCsvRowFieldErrors(row, productName) {
   return { errors, warnings };
 }
 
-async function validateImportCsvProductGroupPreview(productName, productRows) {
+async function validateImportCsvProductGroupPreview(productName, productRows, options = {}) {
   const productErrors = [];
   const productWarnings = [];
   const variants = [];
+  const groupMeta = options.groupMeta || {
+    name: productName,
+    base: options.codeBase,
+    rows: productRows,
+    nameConflict: false,
+    conflictNames: [productName],
+  };
+  const contextLabel = `CSV import product "${productName}"${
+    groupMeta.base ? ` (base ${groupMeta.base})` : ""
+  }`;
 
-  const existingProduct = await Product.findOne({
-    name: { $regex: new RegExp(`^${escapeRegex(String(productName).trim())}$`, 'i') }
-  }).select('name slug category variants.productCode');
+  try {
+    assertBulkGroupSharedProductName(groupMeta, contextLabel);
+  } catch (e) {
+    productErrors.push(e.message);
+  }
+
+  const codeBase =
+    options.codeBase && !String(options.codeBase).startsWith("__")
+      ? options.codeBase
+      : tryParseProductCodeBase(productRows?.[0]?.productCode);
+
+  const existingProduct = codeBase
+    ? await findExistingProductByCodeBase(codeBase, {
+        select: "name slug category variants.productCode",
+      })
+    : null;
+
+  try {
+    assertCsvNameMatchesExistingProduct(existingProduct, productName, contextLabel);
+  } catch (e) {
+    productErrors.push(e.message);
+  }
 
   const firstRow = productRows[0];
   const categoryDoc = await Category.findOne({
@@ -1849,7 +2009,7 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
       const seriesInfo = assertBulkSeriesAgainstExisting({
         incomingCodes: seriesCodes,
         existingCodes: (existingProduct?.variants || []).map((v) => v.productCode),
-        contextLabel: `CSV import product "${productName}"`
+        contextLabel
       });
       nextSuggestedProductCode = seriesInfo.nextSuggestedProductCode;
     } catch (e) {
@@ -1896,7 +2056,7 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
         if (existingProductWithCode) {
           if (
             existingProduct &&
-            existingProduct._id.toString() === existingProductWithCode._id.toString()
+            productsAreSameDocument(existingProduct, existingProductWithCode)
           ) {
             const existsInProduct = existingProduct.variants.some(
               (v) => normalizeProductCode(v.productCode) === productCode
@@ -1916,11 +2076,10 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
               );
             }
           } else {
-            const isExistingSameProductByName =
-              existingProduct &&
-              String(existingProduct.name || "").trim().toLowerCase() ===
-                String(existingProductWithCode.name || "").trim().toLowerCase();
-            const sameProductHint = isExistingSameProductByName
+            const sameProductHint = productsAreSameDocument(
+              existingProduct,
+              existingProductWithCode
+            )
               ? ` It looks like this row is for the same product; use next variant code ${suggestNextVariantCodeForProduct(existingProduct, productCode) || "BASE-N"}.`
               : "";
             variantErrors.push(
@@ -1977,6 +2136,7 @@ async function validateImportCsvProductGroupPreview(productName, productRows) {
 
   return {
     name: productName,
+    codeBase: codeBase || null,
     category: firstRow?.category,
     brand: firstRow?.brand || 'Generic',
     productErrors,
@@ -2044,15 +2204,18 @@ const previewImportProductsFromCSV = async (req, res) => {
       });
     }
 
-    const productMap = new Map();
-    for (const row of rows) {
-      const productName = String(row.name || '').trim();
-      if (!productName) continue;
-      const key = productName.toLowerCase();
-      if (!productMap.has(key)) {
-        productMap.set(key, { name: productName, rows: [] });
-      }
-      productMap.get(key).rows.push(row);
+    const { productMap, skipped: skippedPreviewRows } = groupBulkImportRowsByCodeBase(rows);
+    for (const item of skippedPreviewRows) {
+      // Represent missing-name rows as invalid product stubs in summary via a synthetic group
+      const row = item.row || {};
+      productMap.set(`__missing_name_${row.rowNumber ?? productMap.size}`, {
+        name: "Unknown",
+        base: `__missing_name_${row.rowNumber ?? productMap.size}`,
+        rows: [row],
+        nameConflict: false,
+        conflictNames: ["Unknown"],
+        _skipReason: item.reason,
+      });
     }
 
     const products = [];
@@ -2062,8 +2225,16 @@ const previewImportProductsFromCSV = async (req, res) => {
     for (const [, productData] of productMap) {
       const preview = await validateImportCsvProductGroupPreview(
         productData.name,
-        productData.rows
+        productData.rows,
+        { codeBase: productData.base, groupMeta: productData }
       );
+      if (productData._skipReason) {
+        preview.productErrors = [
+          ...(preview.productErrors || []),
+          productData._skipReason,
+        ];
+        preview.hasErrors = true;
+      }
       products.push({
         ...preview,
         variantCount: preview.variants.length,
@@ -2131,13 +2302,17 @@ async function processProductWithRollback(productName, productRows, stats) {
   const firstRow = productRows[0];
   
   try {
-    let existingProduct = await Product.findOne({ 
-      name: { $regex: new RegExp(`^${escapeRegex(String(productName).trim())}$`, 'i') }
-    });
+    const contextLabel = `CSV import product "${productName}"`;
     const firstIncomingCode = normalizeProductCode(productRows?.[0]?.productCode);
     const preferredBase = firstIncomingCode
-      ? parseProductCodeParts(firstIncomingCode, "incoming productCode").base
+      ? tryParseProductCodeBase(firstIncomingCode)
       : null;
+
+    let existingProduct = preferredBase
+      ? await findExistingProductByCodeBase(preferredBase)
+      : null;
+    assertCsvNameMatchesExistingProduct(existingProduct, productName, contextLabel);
+
     await ensureMissingVariantProductCodes(existingProduct, preferredBase);
 
     // Category must exist (same rule as ZIP bulk — fail whole product, not silent create)
@@ -2166,7 +2341,7 @@ async function processProductWithRollback(productName, productRows, stats) {
     assertBulkSeriesAgainstExisting({
       incomingCodes: seriesCodes,
       existingCodes: (existingProduct?.variants || []).map((v) => v.productCode),
-      contextLabel: `CSV import product "${productName}"`
+      contextLabel
     });
     
     const variants = [];
@@ -2854,21 +3029,17 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
       try {
         const existingProductWithCode = await Product.findOne({
           'variants.productCode': productCodeToDbQuery(productCode)
-        }).select('name');
+        }).select('name slug');
         if (existingProductWithCode) {
-          const sameName =
-            String(existingProductWithCode.name || '').trim().toLowerCase() ===
-            String(productName || '').trim().toLowerCase();
-          if (!sameName) {
-            errors.push({
-              rowNumber,
-              productName,
-              productCode,
-              error:
-                `productCode ${productCode} belongs to product "${existingProductWithCode.name}". ` +
-                `Please use a different productCode for "${productName}".`
-            });
-          }
+          // Exact productCode is globally unique — always block (name may be shared).
+          errors.push({
+            rowNumber,
+            productName,
+            productCode,
+            error:
+              `productCode ${productCode} already exists on product "${existingProductWithCode.name}". ` +
+              `Use the next BASE-N code to add a variant on that series, or a different productCode base for a new product.`
+          });
         }
       } catch (_) {
         /* ignore lookup noise in preflight */
@@ -2876,23 +3047,18 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
     }
   }
 
-  // New products that start mid-series without -1 in this CSV
-  const byName = new Map();
+  // New products that start mid-series without -1 in this CSV (grouped by code base)
+  const byBase = new Map();
   for (const row of rows) {
-    const key = String(row.name || '').trim().toLowerCase();
-    if (!key) continue;
-    if (!byName.has(key)) byName.set(key, []);
-    byName.get(key).push(row);
+    const base = tryParseProductCodeBase(row.productCode);
+    if (!base) continue;
+    if (!byBase.has(base)) byBase.set(base, []);
+    byBase.get(base).push(row);
   }
-  for (const [, group] of byName) {
-    const existingProduct = await Product.findOne({
-      name: {
-        $regex: new RegExp(
-          `^${escapeRegex(String(group[0]?.name || '').trim())}$`,
-          'i'
-        )
-      }
-    }).select('_id name variants.productCode');
+  for (const [base, group] of byBase) {
+    const existingProduct = await findExistingProductByCodeBase(base, {
+      select: '_id name variants.productCode',
+    });
     if (existingProduct) continue;
 
     for (const row of group) {
@@ -2919,7 +3085,7 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
               productName: String(row.name || '').trim() || 'Unknown',
               productCode: normalizeProductCode(row.productCode) || '',
               error:
-                `Cannot import variant ${parsed.normalized}: product does not exist yet. ` +
+                `Cannot import variant ${parsed.normalized}: product series ${parsed.base} does not exist yet. ` +
                 `Include ${parsed.base}-1 (or bare ${parsed.base}) in this CSV first.`
             });
           }
@@ -3074,24 +3240,23 @@ async function uploadVariantImages(imageFolder, productName, productCode, concur
 }
 
 /**
- * ZIP bulk: resolve parent product by exact name or by existing variant series base (e.g. 9002-1).
+ * ZIP/CSV bulk: resolve parent product by productCode BASE series only.
+ * Display name may be shared across products — never use name as identity.
  */
 async function findProductForZipBulkRow(row, parsedCode) {
-  const name = String(row.name || '').trim();
-  if (name) {
-    const byName = await Product.findOne({
-      name: { $regex: new RegExp(`^${escapeRegex(name)}$`, 'i') }
-    });
-    if (byName) return byName;
+  if (!parsedCode?.base) return null;
+  const bySeries = await findExistingProductByCodeBase(parsedCode.base);
+  if (!bySeries) return null;
+
+  const rowName = String(row?.name || "").trim();
+  if (rowName) {
+    assertCsvNameMatchesExistingProduct(
+      bySeries,
+      rowName,
+      `bulk productCode series ${parsedCode.base}`
+    );
   }
-  if (parsedCode?.base && parsedCode.sequence != null) {
-    const variantCodePattern = new RegExp(`^${escapeRegex(parsedCode.base)}-\\d+$`, 'i');
-    const bySeries = await Product.findOne({
-      'variants.productCode': { $regex: variantCodePattern }
-    });
-    if (bySeries) return bySeries;
-  }
-  return null;
+  return bySeries;
 }
 
 // =============================================
@@ -3247,21 +3412,44 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       });
     }
 
-    // Normalize and validate productCode series per product upfront.
+    // Normalize and validate productCode series per product upfront (by code base).
     // Example for 3 variants: 4321-1, 4321-2, 4321-3 (01, 02 also accepted on input)
-    const rowsByProductName = new Map();
+    const { productMap: rowsByCodeBase } = groupBulkImportRowsByCodeBase(rows);
     for (const row of rows) {
       row.productCode = normalizeProductCode(row.productCode);
-      const key = String(row.name || '').trim().toLowerCase();
-      if (!key) continue;
-      if (!rowsByProductName.has(key)) rowsByProductName.set(key, []);
-      rowsByProductName.get(key).push(row);
     }
-    for (const [nameKey, productRows] of rowsByProductName.entries()) {
+    for (const [baseKey, productData] of rowsByCodeBase.entries()) {
+      const productRows = productData.rows || [];
+      const contextLabel = `bulk product "${productData.name}" (base ${baseKey})`;
+      try {
+        assertBulkGroupSharedProductName(productData, contextLabel);
+      } catch (nameErr) {
+        for (const row of productRows) {
+          row._preValidationError = nameErr.message;
+        }
+        continue;
+      }
       normalizeBareProductCodesForBulkGroup(productRows);
-      const existingProduct = await Product.findOne({
-        name: { $regex: new RegExp(`^${escapeRegex(String(productRows[0]?.name || '').trim())}$`, 'i') }
-      }).select('variants.productCode');
+      const codeBase = String(baseKey).startsWith("__")
+        ? tryParseProductCodeBase(productRows[0]?.productCode)
+        : baseKey;
+      const existingProduct = codeBase
+        ? await findExistingProductByCodeBase(codeBase, {
+            select: "name variants.productCode",
+          })
+        : null;
+      try {
+        assertCsvNameMatchesExistingProduct(
+          existingProduct,
+          productData.name,
+          contextLabel
+        );
+      } catch (matchErr) {
+        for (const row of productRows) {
+          row._preValidationError = matchErr.message;
+        }
+        continue;
+      }
       alignIncomingRowsWithExistingSeries(
         productRows,
         (existingProduct?.variants || []).map((v) => v.productCode)
@@ -3272,7 +3460,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
         assertBulkSeriesAgainstExisting({
           incomingCodes: codes,
           existingCodes: (existingProduct?.variants || []).map((v) => v.productCode),
-          contextLabel: `bulk product "${nameKey}"`
+          contextLabel
         });
       } catch (err) {
         const isNewProduct = !existingProduct;
@@ -3294,11 +3482,11 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       }
     }
 
-    // Process variant -1 before -2/-3 per product so primary row creates product shipping first.
+    // Process variant -1 before -2/-3 per code base so primary row creates product shipping first.
     rows.sort((a, b) => {
-      const nameA = String(a.name || '').trim().toLowerCase();
-      const nameB = String(b.name || '').trim().toLowerCase();
-      if (nameA !== nameB) return nameA.localeCompare(nameB);
+      const baseA = tryParseProductCodeBase(a.productCode) || "";
+      const baseB = tryParseProductCodeBase(b.productCode) || "";
+      if (baseA !== baseB) return baseA.localeCompare(baseB);
       try {
         const pa = parseProductCodeParts(normalizeProductCode(a.productCode), 'productCode');
         const pb = parseProductCodeParts(normalizeProductCode(b.productCode), 'productCode');
@@ -3439,8 +3627,8 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
 
           if (!product && parsedCode.sequence != null && parsedCode.sequence > 1) {
             throw new Error(
-              `Cannot import variant ${productCode}: product "${String(row.name || '').trim()}" was not found. ` +
-                `Import ${parsedCode.base}-1 first with the exact same product name.`
+              `Cannot import variant ${productCode}: product series ${parsedCode.base} was not found. ` +
+                `Import ${parsedCode.base}-1 (or bare ${parsedCode.base}) first.`
             );
           }
 
@@ -3887,24 +4075,9 @@ const previewBulkUpload = async (req, res) => {
     }
 
     // =============================================
-    // STEP 5: Group rows by product name
+    // STEP 5: Group rows by productCode BASE (name may be shared across products)
     // =============================================
-    const productMap = new Map();
-    
-    for (const row of rows) {
-      const productName = String(row.name || '').trim();
-      if (!productName) continue;
-      
-      const key = productName.toLowerCase();
-      if (!productMap.has(key)) {
-        productMap.set(key, {
-          name: productName,
-          rows: [],
-          originalIndex: row.rowNumber
-        });
-      }
-      productMap.get(key).rows.push(row);
-    }
+    const { productMap } = groupBulkImportRowsByCodeBase(rows);
 
     // =============================================
     // STEP 6: Validate each product and variant
@@ -3918,18 +4091,40 @@ const previewBulkUpload = async (req, res) => {
     
     for (const [_, productData] of productMap) {
       const { name: productName, rows: productRows } = productData;
+      const productErrors = [];
+      try {
+        assertBulkGroupSharedProductName(
+          productData,
+          `product "${productName}" (base ${productData.base})`
+        );
+      } catch (e) {
+        productErrors.push(e.message);
+      }
       for (const row of productRows) {
         if (row.productCode != null) row.productCode = normalizeProductCode(row.productCode);
       }
       normalizeBareProductCodesForBulkGroup(productRows);
-      const existingProduct = await Product.findOne({
-        name: { $regex: new RegExp(`^${escapeRegex(String(productName).trim())}$`, 'i') }
-      }).select('name slug variants.productCode');
+      const codeBase = String(productData.base || "").startsWith("__")
+        ? tryParseProductCodeBase(productRows[0]?.productCode)
+        : productData.base;
+      const existingProduct = codeBase
+        ? await findExistingProductByCodeBase(codeBase, {
+            select: "name slug variants.productCode",
+          })
+        : null;
+      try {
+        assertCsvNameMatchesExistingProduct(
+          existingProduct,
+          productName,
+          `product "${productName}" (base ${codeBase || productData.base})`
+        );
+      } catch (e) {
+        productErrors.push(e.message);
+      }
       alignIncomingRowsWithExistingSeries(
         productRows,
         (existingProduct?.variants || []).map((v) => v.productCode)
       );
-      const productErrors = [];
       const variants = [];
       const productCodes = new Set();
       let nextSuggestedProductCode = null;
@@ -3999,9 +4194,10 @@ const previewBulkUpload = async (req, res) => {
               'variants.productCode': productCodeToDbQuery(productCode)
             }).select('name variants.productCode');
             if (existingProductWithCode) {
-              const isSameProduct =
-                String(existingProductWithCode.name || "").trim().toLowerCase() ===
-                String(productName || "").trim().toLowerCase();
+              const isSameProduct = productsAreSameDocument(
+                existingProduct,
+                existingProductWithCode
+              );
               if (isSameProduct) {
                 const suggested = nextCodeForSameProduct(productCode);
                 const entered = normalizeProductCode(row._productCodeAdjustedFrom);
@@ -4976,8 +5172,9 @@ const updateProduct = async (req, res) => {
 };
 
 /**
- * Inventory-only update for inventory_manager role.
- * Accepts { variants: [{ productCode, quantity?, lowStockThreshold? }] } — no other fields.
+ * Inventory + price update for inventory_manager (also admin / product_manager).
+ * Accepts { variants: [{ productCode, quantity?, lowStockThreshold?, price? }] }.
+ * price may include base, sale, wholesaleBase, wholesaleSale — no other product fields.
  */
 const patchProductInventory = async (req, res) => {
   try {
@@ -5000,7 +5197,37 @@ const patchProductInventory = async (req, res) => {
       });
     }
 
+    const allowedVariantKeys = new Set([
+      "productCode",
+      "quantity",
+      "lowStockThreshold",
+      "price"
+    ]);
+    const allowedPriceKeys = new Set([
+      "base",
+      "sale",
+      "wholesaleBase",
+      "wholesaleSale"
+    ]);
+
+    const parseMoneyField = (raw, fieldName, { allowNull = false } = {}) => {
+      if (raw === undefined) {
+        return { omitted: true };
+      }
+      if (raw === null || raw === "") {
+        if (allowNull) return { value: null };
+        return { error: `${fieldName} cannot be empty` };
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) {
+        return { error: `${fieldName} must be a non-negative number` };
+      }
+      return { value: n };
+    };
+
+    const normalized = [];
     const seenCodes = new Set();
+
     for (const item of variantsInput) {
       if (!item || typeof item !== "object" || Array.isArray(item)) {
         return res.status(400).json({
@@ -5008,15 +5235,16 @@ const patchProductInventory = async (req, res) => {
           message: "Each variant entry must be an object"
         });
       }
+
       const itemKeys = Object.keys(item);
-      const allowedVariantKeys = ["productCode", "quantity", "lowStockThreshold"];
-      const invalidKeys = itemKeys.filter((k) => !allowedVariantKeys.includes(k));
+      const invalidKeys = itemKeys.filter((k) => !allowedVariantKeys.has(k));
       if (invalidKeys.length) {
         return res.status(400).json({
           success: false,
           message: `Invalid fields in variant update: ${invalidKeys.join(", ")}`
         });
       }
+
       const productCode = String(item.productCode || "").trim();
       if (!productCode) {
         return res.status(400).json({
@@ -5031,12 +5259,11 @@ const patchProductInventory = async (req, res) => {
         });
       }
       seenCodes.add(productCode);
-      if (item.quantity === undefined && item.lowStockThreshold === undefined) {
-        return res.status(400).json({
-          success: false,
-          message: "At least quantity or lowStockThreshold must be provided per variant"
-        });
-      }
+
+      let quantity;
+      let lowStockThreshold;
+      const pricePatch = {};
+
       if (item.quantity !== undefined) {
         const nextQty = Number(item.quantity);
         if (!Number.isFinite(nextQty) || nextQty < 0) {
@@ -5045,7 +5272,9 @@ const patchProductInventory = async (req, res) => {
             message: "quantity must be a non-negative number"
           });
         }
+        quantity = nextQty;
       }
+
       if (item.lowStockThreshold !== undefined) {
         const lst = Number(item.lowStockThreshold);
         if (!Number.isFinite(lst) || lst < 0) {
@@ -5054,7 +5283,75 @@ const patchProductInventory = async (req, res) => {
             message: "lowStockThreshold must be a non-negative number"
           });
         }
+        lowStockThreshold = lst;
       }
+
+      if (item.price !== undefined) {
+        if (!item.price || typeof item.price !== "object" || Array.isArray(item.price)) {
+          return res.status(400).json({
+            success: false,
+            message: "price must be an object when provided"
+          });
+        }
+        const priceKeys = Object.keys(item.price);
+        const invalidPriceKeys = priceKeys.filter((k) => !allowedPriceKeys.has(k));
+        if (invalidPriceKeys.length) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid price fields: ${invalidPriceKeys.join(", ")}`
+          });
+        }
+        if (!priceKeys.length) {
+          return res.status(400).json({
+            success: false,
+            message: "price object must include at least one field"
+          });
+        }
+
+        const baseParsed = parseMoneyField(item.price.base, "price.base");
+        if (baseParsed.error) {
+          return res.status(400).json({ success: false, message: baseParsed.error });
+        }
+        if (!baseParsed.omitted) pricePatch.base = baseParsed.value;
+
+        const saleParsed = parseMoneyField(item.price.sale, "price.sale", { allowNull: true });
+        if (saleParsed.error) {
+          return res.status(400).json({ success: false, message: saleParsed.error });
+        }
+        if (!saleParsed.omitted) pricePatch.sale = saleParsed.value;
+
+        const wbParsed = parseMoneyField(item.price.wholesaleBase, "price.wholesaleBase", {
+          allowNull: true
+        });
+        if (wbParsed.error) {
+          return res.status(400).json({ success: false, message: wbParsed.error });
+        }
+        if (!wbParsed.omitted) pricePatch.wholesaleBase = wbParsed.value;
+
+        const wsParsed = parseMoneyField(item.price.wholesaleSale, "price.wholesaleSale", {
+          allowNull: true
+        });
+        if (wsParsed.error) {
+          return res.status(400).json({ success: false, message: wsParsed.error });
+        }
+        if (!wsParsed.omitted) pricePatch.wholesaleSale = wsParsed.value;
+      }
+
+      const hasPricePatch = Object.keys(pricePatch).length > 0;
+      if (quantity === undefined && lowStockThreshold === undefined && !hasPricePatch) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "At least quantity, lowStockThreshold, or price fields must be provided per variant"
+        });
+      }
+
+      normalized.push({
+        productCode,
+        quantity,
+        lowStockThreshold,
+        pricePatch: hasPricePatch ? pricePatch : null
+      });
     }
 
     const doc = await Product.findOne({ slug });
@@ -5067,15 +5364,14 @@ const patchProductInventory = async (req, res) => {
 
     const restockNotifyEvents = [];
 
-    for (const item of variantsInput) {
-      const productCode = String(item.productCode).trim();
+    for (const item of normalized) {
       const variant = doc.variants.find(
-        (v) => String(v.productCode || "") === productCode
+        (v) => String(v.productCode || "") === item.productCode
       );
       if (!variant) {
         return res.status(404).json({
           success: false,
-          message: `Variant not found: ${productCode}`
+          message: `Variant not found: ${item.productCode}`
         });
       }
 
@@ -5085,6 +5381,9 @@ const patchProductInventory = async (req, res) => {
           trackInventory: true,
           lowStockThreshold: 5
         };
+      }
+      if (!variant.price) {
+        variant.price = { base: 0, sale: null };
       }
 
       if (item.quantity !== undefined) {
@@ -5115,6 +5414,59 @@ const patchProductInventory = async (req, res) => {
       if (item.lowStockThreshold !== undefined) {
         variant.inventory.lowStockThreshold = Number(item.lowStockThreshold);
       }
+
+      if (item.pricePatch) {
+        if (item.pricePatch.base !== undefined) {
+          variant.price.base = item.pricePatch.base;
+        }
+        if (item.pricePatch.sale !== undefined) {
+          variant.price.sale = item.pricePatch.sale;
+        }
+        if (item.pricePatch.wholesaleBase !== undefined) {
+          variant.price.wholesaleBase = item.pricePatch.wholesaleBase;
+        }
+        if (item.pricePatch.wholesaleSale !== undefined) {
+          variant.price.wholesaleSale = item.pricePatch.wholesaleSale;
+        }
+
+        const nextBase = Number(variant.price.base);
+        if (!Number.isFinite(nextBase) || nextBase < 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid base price for variant ${item.productCode}`
+          });
+        }
+
+        const nextSale = variant.price.sale;
+        if (nextSale != null && Number(nextSale) >= nextBase) {
+          return res.status(400).json({
+            success: false,
+            message: `Sale price must be less than base price for variant ${item.productCode}`
+          });
+        }
+
+        const nextWb = variant.price.wholesaleBase;
+        const nextWs = variant.price.wholesaleSale;
+        if (variant.wholesale === true) {
+          if (nextWb == null || !Number.isFinite(Number(nextWb)) || Number(nextWb) <= 0) {
+            return res.status(400).json({
+              success: false,
+              message: `wholesaleBase is required and must be > 0 when wholesale is enabled (${item.productCode})`
+            });
+          }
+        }
+        if (
+          nextWs != null &&
+          nextWb != null &&
+          Number.isFinite(Number(nextWb)) &&
+          Number(nextWs) >= Number(nextWb)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: `Wholesale sale price must be less than wholesale base for variant ${item.productCode}`
+          });
+        }
+      }
     }
 
     doc.markModified("variants");
@@ -5133,7 +5485,7 @@ const patchProductInventory = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Inventory updated successfully",
+      message: "Inventory and prices updated successfully",
       product: doc
     });
   } catch (error) {
@@ -7123,212 +7475,194 @@ const exportProductsCSV = async (req, res) => {
 };
 
 // =============================================
-// DOWNLOAD BULK UPLOAD TEMPLATE (with data validation)
+// DOWNLOAD BULK UPLOAD TEMPLATE (code-generated)
+// Instructions + ZIP guide + headers/examples come from
+// templates/bulkUploadTemplate.meta.js — no external XLSX on disk.
+// Categories dropdown refreshed from DB on every download.
 // =============================================
 const downloadBulkUploadTemplate = async (req, res) => {
+  let bufferSent = false;
   try {
     const ExcelJS = require('exceljs');
-    const XLSX = require('xlsx');
-    const path = require('path');
-    const fs = require('fs');
+    const templateMeta = require('../templates/bulkUploadTemplate.meta');
 
-    const templatePath = 'c:/BigFeathers/offerWaaleBaba/OWB-bulkUploadFormat-ForNewProducts-FinalUpdated.xlsx';
+    const {
+      STATUS_OPTIONS,
+      BOOL_OPTIONS,
+      FOMO_TYPE_OPTIONS,
+      GST_OPTIONS,
+      buildInstructionsAoa,
+      buildImageZipGuideAoa,
+      buildExampleProductAoa,
+      getProductSheetHeaders,
+    } = templateMeta;
 
-    // ── Fetch dynamic categories ─────────────────────────────────────────────
-    const categories = await Category.find({ status: 'active' })
-      .sort({ name: 1 })
-      .lean();
-    const categoryNames = categories.map(c => c.name);
+    // ── Fetch dynamic categories (fail soft → empty dropdown, still download) ─
+    let categoryNames = [];
+    try {
+      const categories = await Category.find({ status: 'active' })
+        .sort({ name: 1 })
+        .select('name')
+        .lean();
+      categoryNames = (categories || [])
+        .map((c) => String(c?.name || '').trim())
+        .filter(Boolean);
+    } catch (catErr) {
+      console.error('downloadBulkUploadTemplate: category lookup failed:', catErr?.message || catErr);
+      categoryNames = [];
+    }
 
     const workbook = new ExcelJS.Workbook();
-    
-    // Set active worksheet tab to BulkUpload_NewProducts (index 1) when workbook is opened
+    workbook.creator = 'OfferWaleBaba';
+    workbook.created = new Date();
     workbook.views = [
       {
         firstSheet: 0,
-        activeTab: 1, // 0-indexed: index 1 refers to BulkUpload_NewProducts worksheet
-        visibility: 'visible'
-      }
+        activeTab: 1, // open on BulkUpload_NewProducts
+        visibility: 'visible',
+      },
     ];
-    
-    // Create worksheets
+
     const wsInstructions = workbook.addWorksheet('Instructions');
     const wsProducts = workbook.addWorksheet('BulkUpload_NewProducts');
     const wsImageGuide = workbook.addWorksheet('Image_ZIP_Guide');
     const wsLookups = workbook.addWorksheet('Lookups');
 
-    let productsRows = [];
-
-    if (fs.existsSync(templatePath)) {
-      // ── Use SheetJS (xlsx) to read the template file ───────────────────────
-      const workbookTemplate = XLSX.readFile(templatePath);
-      
-      // 1. Read Instructions
-      const instructionsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Instructions'], { header: 1 });
-      instructionsRows.forEach(row => {
-        const fieldName = String(row[1] || '').trim();
-        if (['weight', 'length', 'width', 'height'].includes(fieldName)) {
-          row[2] = '✅ Yes'; // Update validation column description to show "Required"
-        }
-        wsInstructions.addRow(row);
-      });
-
-      // Style Instructions sheet
+    // ── Instructions ─────────────────────────────────────────────────────────
+    const instructionsRows = buildInstructionsAoa();
+    instructionsRows.forEach((row) => wsInstructions.addRow(row));
+    try {
       wsInstructions.getCell('A1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
-      const instHeader = wsInstructions.getRow(5);
-      instHeader.height = 24;
-      instHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF475569' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'left' };
-      });
+      const instHeader = wsInstructions.getRow(6); // header after intro rows
+      if (String(instHeader.getCell(1).value || '') === 'Column') {
+        instHeader.height = 24;
+        instHeader.eachCell((cell) => {
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF475569' },
+          };
+          cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+        });
+      }
       wsInstructions.columns = [
-        { width: 10 }, // Column
-        { width: 22 }, // Field Name
-        { width: 12 }, // Required?
-        { width: 12 }, // Data Type
-        { width: 45 }, // Allowed Values / Format
-        { width: 30 }, // Example
-        { width: 70 }  // Notes
+        { width: 10 },
+        { width: 22 },
+        { width: 12 },
+        { width: 12 },
+        { width: 45 },
+        { width: 36 },
+        { width: 72 },
       ];
-
-      // 2. Read Products & examples
-      productsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['BulkUpload_NewProducts'], { header: 1 });
-      productsRows.forEach(row => {
-        wsProducts.addRow(row);
-      });
-
-      // Style Products header
-      const prodHeader = wsProducts.getRow(1);
-      prodHeader.height = 26;
-      prodHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF1D4ED8' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      });
-      wsProducts.columns = productsRows[0].map(h => ({
-        header: h,
-        width: Math.max(String(h || '').length + 4, 16)
-      }));
-      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
-
-      // 3. Read Image Guide
-      const imageGuideRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Image_ZIP_Guide'], { header: 1 });
-      imageGuideRows.forEach(row => {
-        wsImageGuide.addRow(row);
-      });
-
-      // Style Image Guide
-      wsImageGuide.getCell('B1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
-      wsImageGuide.columns = [
-        { width: 6 },
-        { width: 80 }
-      ];
-    } else {
-      // Fallback if template is not found
-      productsRows = [[
-        'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
-        'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
-        'weight', 'length', 'width', 'height',
-        'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
-        'productAttributes', 'images (LEAVE BLANK)', 'hsnCode', 'gstRate', 'isFragile',
-        'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
-      ]];
-      wsProducts.addRow(productsRows[0]);
-      
-      const prodHeader = wsProducts.getRow(1);
-      prodHeader.height = 26;
-      prodHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF1D4ED8' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      });
-      wsProducts.columns = productsRows[0].map(h => ({ header: h, width: Math.max(h.length + 4, 16) }));
-      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Instructions style skipped:', styleErr?.message);
     }
 
-    // ── Create Lookups sheet ─────────────────────────────────────────────────
-    const STATUS_OPTIONS    = ['active', 'draft', 'archived'];
-    const BOOL_OPTIONS      = ['true', 'false'];
-    const FOMO_TYPE_OPTIONS = ['viewing_now', 'product_left', 'custom'];
-    const GST_OPTIONS       = ['0', '5', '12', '18', '28'];
+    // ── Products sheet (headers + examples) ──────────────────────────────────
+    const productsRows = buildExampleProductAoa();
+    const headers = productsRows[0] || getProductSheetHeaders();
+    productsRows.forEach((row) => wsProducts.addRow(row));
+    try {
+      const prodHeader = wsProducts.getRow(1);
+      prodHeader.height = 26;
+      prodHeader.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF1D4ED8' },
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      });
+      wsProducts.columns = headers.map((h) => ({
+        width: Math.min(Math.max(String(h || '').length + 4, 14), 36),
+      }));
+      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Products style skipped:', styleErr?.message);
+    }
 
-    // Write lists to Lookups sheet columns
-    wsLookups.getColumn(1).values = ['category', ...categoryNames];
+    // ── Image ZIP guide ──────────────────────────────────────────────────────
+    const imageGuideRows = buildImageZipGuideAoa();
+    imageGuideRows.forEach((row) => wsImageGuide.addRow(row));
+    try {
+      wsImageGuide.getCell('A1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
+      wsImageGuide.columns = [{ width: 6 }, { width: 88 }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Image guide style skipped:', styleErr?.message);
+    }
+
+    // ── Lookups (hidden) — category list always at least header ──────────────
+    const catList = categoryNames.length > 0 ? categoryNames : ['(add categories in admin)'];
+    wsLookups.getColumn(1).values = ['category', ...catList];
     wsLookups.getColumn(2).values = ['status', ...STATUS_OPTIONS];
     wsLookups.getColumn(3).values = ['boolean', ...BOOL_OPTIONS];
     wsLookups.getColumn(4).values = ['fomoType', ...FOMO_TYPE_OPTIONS];
     wsLookups.getColumn(5).values = ['gstRate', ...GST_OPTIONS];
-
-    // Hide lookups sheet completely
     wsLookups.state = 'veryHidden';
 
-    // ── Build map from headers to column index ──────────────────────────────
+    // ── Data validations on Products sheet ───────────────────────────────────
     const colMap = {};
     const headerRow = wsProducts.getRow(1);
     headerRow.eachCell((cell, colNumber) => {
       const val = String(cell.value || '').trim();
-      const name = val.replace(/\s*\(.*\)/, '').trim(); // 'images (LEAVE BLANK)' -> 'images'
-      colMap[name] = colNumber;
+      const name = val.replace(/\s*\(.*\)/, '').trim(); // 'images (LEAVE BLANK)' → 'images'
+      if (name) colMap[name] = colNumber;
     });
 
-    // Define validation ranges referencing Lookups
+    const categoryEndRow = Math.max(2, catList.length + 1);
     const VALIDATIONS = {
-      'category': `Lookups!$A$2:$A$${categoryNames.length + 1}`,
-      'status': `Lookups!$B$2:$B$${STATUS_OPTIONS.length + 1}`,
-      'isfeatured': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'soldEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'fomoEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'fomoType': `Lookups!$D$2:$D$${FOMO_TYPE_OPTIONS.length + 1}`,
-      'isFragile': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'wholesale': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'gstRate': `Lookups!$E$2:$E$${GST_OPTIONS.length + 1}`
+      category: `Lookups!$A$2:$A$${categoryEndRow}`,
+      status: `Lookups!$B$2:$B$${STATUS_OPTIONS.length + 1}`,
+      isfeatured: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      soldEnabled: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      fomoEnabled: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      fomoType: `Lookups!$D$2:$D$${FOMO_TYPE_OPTIONS.length + 1}`,
+      isFragile: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      wholesale: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      gstRate: `Lookups!$E$2:$E$${GST_OPTIONS.length + 1}`,
     };
 
-    // Apply validations to wsProducts (rows 2 to 5000)
-    Object.keys(VALIDATIONS).forEach((colName) => {
-      const colNumber = colMap[colName];
-      if (!colNumber) return;
-
-      const colLetter = wsProducts.getColumn(colNumber).letter;
-      const validationFormula = VALIDATIONS[colName];
-
-      wsProducts.dataValidations.add(`${colLetter}2:${colLetter}5000`, {
-        type: 'list',
-        allowBlank: true,
-        formulae: [validationFormula],
-        showErrorMessage: true,
-        errorStyle: 'warning',
-        errorTitle: 'Invalid Selection',
-        error: `Please select a valid ${colName} from the list.`
+    try {
+      Object.keys(VALIDATIONS).forEach((colName) => {
+        const colNumber = colMap[colName];
+        if (!colNumber) return;
+        const colLetter = wsProducts.getColumn(colNumber).letter;
+        wsProducts.dataValidations.add(`${colLetter}2:${colLetter}5000`, {
+          type: 'list',
+          allowBlank: true,
+          formulae: [VALIDATIONS[colName]],
+          showErrorMessage: true,
+          errorStyle: 'warning',
+          errorTitle: 'Invalid Selection',
+          error: `Please select a valid ${colName} from the list.`,
+        });
       });
-    });
+    } catch (valErr) {
+      console.warn('downloadBulkUploadTemplate: data validations skipped:', valErr?.message);
+    }
 
     const buffer = await workbook.xlsx.writeBuffer();
+    if (!buffer || !buffer.length) {
+      throw new Error('Generated template buffer was empty');
+    }
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    bufferSent = true;
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
     res.setHeader('Content-Disposition', 'attachment; filename="bulk_upload_template.xlsx"');
     res.setHeader('Content-Length', buffer.length);
-    res.send(buffer);
-
+    return res.send(Buffer.from(buffer));
   } catch (error) {
     console.error('Download bulk upload template error:', error);
+    if (bufferSent || res.headersSent) return undefined;
     return res.status(500).json({
       success: false,
       message: 'Error generating template',
-      error: error.message
+      error: error.message,
     });
   }
 };

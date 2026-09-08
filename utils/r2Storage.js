@@ -1,6 +1,10 @@
 const crypto = require('crypto');
-const path = require('path');
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+} = require('@aws-sdk/client-s3');
 
 let r2Client = null;
 
@@ -18,6 +22,16 @@ function requireEnv(name) {
   return value;
 }
 
+function isR2Configured() {
+  return Boolean(
+    String(process.env.R2_ENDPOINT || '').trim() &&
+      String(process.env.R2_ACCESS_KEY_ID || '').trim() &&
+      String(process.env.R2_SECRET_ACCESS_KEY || '').trim() &&
+      String(process.env.R2_BUCKET_NAME || '').trim() &&
+      String(process.env.R2_PUBLIC_BASE_URL || '').trim()
+  );
+}
+
 function buildClient() {
   const endpoint = requireEnv('R2_ENDPOINT');
   const accessKeyId = requireEnv('R2_ACCESS_KEY_ID');
@@ -29,7 +43,7 @@ function buildClient() {
     region,
     endpoint,
     forcePathStyle,
-    credentials: { accessKeyId, secretAccessKey }
+    credentials: { accessKeyId, secretAccessKey },
   });
 }
 
@@ -80,28 +94,59 @@ async function uploadBufferToR2({
   publicIdName,
   contentType = 'application/octet-stream',
   extension = 'bin',
-  cacheControl = 'public, max-age=31536000, immutable'
+  cacheControl = 'public, max-age=31536000, immutable',
+  /** When set, skips dated folder layout — use for content-addressed caches. */
+  objectKey = null,
 }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new Error('Invalid upload buffer for R2');
   }
 
   const bucket = getBucketName();
-  const key = buildObjectKey(folderPath, publicIdName, extension);
+  const key = objectKey
+    ? String(objectKey).replace(/^\/+/, '').slice(0, 500)
+    : buildObjectKey(folderPath, publicIdName, extension);
+
+  if (!key) {
+    throw new Error('Invalid R2 object key');
+  }
 
   const putCommand = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
     Body: buffer,
     ContentType: contentType,
-    CacheControl: cacheControl
+    CacheControl: cacheControl,
   });
 
   await getClient().send(putCommand);
   return {
     key,
-    url: buildPublicUrl(key)
+    url: buildPublicUrl(key),
   };
+}
+
+/**
+ * Soft existence check for a key (404 → false; other errors → false).
+ */
+async function r2ObjectExists(key) {
+  const normalizedKey = String(key || '').trim().replace(/^\/+/, '');
+  if (!normalizedKey || !isR2Configured()) return false;
+  try {
+    await getClient().send(
+      new HeadObjectCommand({
+        Bucket: getBucketName(),
+        Key: normalizedKey,
+      })
+    );
+    return true;
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode || err?.statusCode;
+    if (status === 404 || err?.name === 'NotFound' || err?.Code === 'NotFound') {
+      return false;
+    }
+    return false;
+  }
 }
 
 function parseR2KeyFromUrl(url) {
@@ -123,7 +168,7 @@ async function deleteFromR2ByKey(key) {
   const bucket = getBucketName();
   const delCommand = new DeleteObjectCommand({
     Bucket: bucket,
-    Key: normalizedKey
+    Key: normalizedKey,
   });
   await getClient().send(delCommand);
 }
@@ -135,9 +180,11 @@ async function deleteFromR2ByUrl(url) {
 }
 
 module.exports = {
+  isR2Configured,
   uploadBufferToR2,
+  r2ObjectExists,
   deleteFromR2ByKey,
   deleteFromR2ByUrl,
   parseR2KeyFromUrl,
-  buildPublicUrl
+  buildPublicUrl,
 };

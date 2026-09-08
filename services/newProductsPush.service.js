@@ -8,7 +8,7 @@ const {
   dispatchWebPush,
   delay,
 } = require('../utils/webPushDispatch');
-const { getStorefrontFrontendBase } = require('../utils/storefrontFrontendUrl');
+const { buildStorefrontUrl, resolvePushAssetUrl } = require('../utils/storefrontFrontendUrl');
 const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
@@ -42,20 +42,31 @@ function buildActiveProductQuery(storefront, sinceDate) {
 }
 
 function buildPayload(storefront) {
-  const base = getStorefrontFrontendBase(storefront);
-  const path = newProductsPushTemplate.ctaPath || '/#best-sellers';
-  const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  const sf = normalizeCustomerStorefront(storefront);
+  const path =
+    sf === 'wholesale'
+      ? newProductsPushTemplate.wholesaleCtaPath ||
+        newProductsPushTemplate.ctaPath ||
+        '/TagProducts/today-arrival'
+      : newProductsPushTemplate.ctaPath || '/#best-sellers';
+  const url = buildStorefrontUrl(sf, path);
 
   return {
     title: newProductsPushTemplate.title,
     body: newProductsPushTemplate.body,
-    icon: newProductsPushTemplate.icon,
-    badge: newProductsPushTemplate.badge,
+    icon: resolvePushAssetUrl(newProductsPushTemplate.icon, sf),
+    badge: resolvePushAssetUrl(
+      newProductsPushTemplate.badge || newProductsPushTemplate.icon,
+      sf
+    ),
     tag: newProductsPushTemplate.tag,
+    actions: Array.isArray(newProductsPushTemplate.actions)
+      ? newProductsPushTemplate.actions
+      : [{ action: 'shop-new-arrivals', title: newProductsPushTemplate.ctaLabel || 'Shop New Arrivals' }],
     data: {
       type: 'new-products-digest',
       url,
-      storefront,
+      storefront: sf,
     },
   };
 }
@@ -179,4 +190,5 @@ module.exports = {
   sendNewProductsDigest,
   countNewProductsSince,
   buildActiveProductQuery,
+  buildPayload,
 };

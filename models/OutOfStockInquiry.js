@@ -80,6 +80,8 @@ const outOfStockInquirySchema = new mongoose.Schema(
     lastNotifyAttemptAt: { type: Date, default: null },
     lastNotifyError: { type: String, trim: true, maxlength: 500, default: null },
     notifyChannelsSent: { type: [String], default: [] },
+    /** Soft / hard channel failures kept even when another channel succeeds (debug + ops). */
+    notifyChannelErrors: { type: [String], default: [] },
   },
   { timestamps: true }
 );
