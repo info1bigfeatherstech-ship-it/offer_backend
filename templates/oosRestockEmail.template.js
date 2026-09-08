@@ -16,7 +16,8 @@ module.exports = {
     'You received this because you asked to be notified when this product was back in stock. If you already bought it, you can ignore this email.',
 
   // Web push (browser / PWA)
-  // Title: product in "quotes" + brand. Large `image` = product photo; small `icon`/`badge` = brand logo.
+  // Title: product in "quotes" + brand. icon/badge = brand logo only (no large product image —
+  // OS crops portrait photos in the notification image slot).
   pushBrandName: 'Offer Wale Baba',
   pushTitle: '"{{productName}}" · Offer Wale Baba',
   pushBody: 'Back in stock on Offer Wale Baba. Tap to view and order.',

@@ -310,23 +310,6 @@ function isMoqUnmetInquiry(inquiry) {
   return inquiry?.reason === 'moq_unmet' && inquiry?.storefront === 'wholesale';
 }
 
-/**
- * Absolute https image URL for push icon/image. Rejects relative / http / junk.
- * @param {unknown} raw
- * @returns {string|null}
- */
-function resolveHttpsImageUrl(raw) {
-  const value = String(raw || '').trim();
-  if (!value || value.length > 2048) return null;
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== 'https:') return null;
-    return parsed.href;
-  } catch {
-    return null;
-  }
-}
-
 async function sendRestockEmail(inquiry, ctx) {
   if (!inquiry.email) {
     const err = new Error('No email on inquiry');
@@ -548,15 +531,12 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   const brandAssetPath =
     template.pushBadgePath || template.pushIconPath || '/pwa-192x192.png';
   const brandAssetUrl = resolvePushAssetUrl(brandAssetPath, sf);
-  const productImageUrl = resolveHttpsImageUrl(
-    ctx.productImage || inquiry.productImage || null
-  );
   const tagPrefix = template.pushTagPrefix || 'oos-restock';
   const inquiryId = String(inquiry._id);
 
-  // Restock-only: large `image` = product photo; small `icon` + `badge` = brand logo
-  // (same-origin /pwa-192x192.png via resolvePushAssetUrl — SW loads from this site).
-  // Click uses same-origin path so SW opens this storefront's PDP (local or prod).
+  // Restock web push: brand logo only (no large `image`).
+  // OS notification "image" slots crop portrait product photos; logo + quoted title is clearer.
+  // Click uses same-origin PDP path so SW opens this storefront's product page.
   const brandIcon = brandAssetUrl || '/pwa-192x192.png';
   const payload = {
     title: title || `"${productNameForTitle}" · Offer Wale Baba`.slice(0, 80),
@@ -567,9 +547,6 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
         : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
     icon: brandIcon,
     badge: brandIcon,
-    // Never set icon to product photo — only the large `image` slot.
-    image:
-      productImageUrl && productImageUrl !== brandIcon ? productImageUrl : undefined,
     tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
     data: {
       type: 'back_in_stock',
