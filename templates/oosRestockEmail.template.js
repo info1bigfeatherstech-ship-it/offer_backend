@@ -15,10 +15,10 @@ module.exports = {
   footer:
     'You received this because you asked to be notified when this product was back in stock. If you already bought it, you can ignore this email.',
 
-  // Web push (browser / PWA) — product name in title (OS often bold), brand always in copy.
-  // icon prefers product image at send-time; badge stays brand logo.
+  // Web push (browser / PWA)
+  // Title: product in "quotes" + brand. Large `image` = product photo; small `icon`/`badge` = brand logo.
   pushBrandName: 'Offer Wale Baba',
-  pushTitle: '{{productName}} · Offer Wale Baba',
+  pushTitle: '"{{productName}}" · Offer Wale Baba',
   pushBody: 'Back in stock on Offer Wale Baba. Tap to view and order.',
   pushBadgePath: '/pwa-192x192.png',
   pushIconPath: '/pwa-192x192.png',
@@ -35,7 +35,7 @@ module.exports = {
     'You received this because you asked to be notified when this product had enough wholesale stock. If you already ordered, you can ignore this email.',
   moqTextBody:
     '{{productName}} is now available for wholesale order.\nEnough stock is now available to meet the wholesale minimum order quantity.',
-  moqPushTitle: '{{productName}} · Offer Wale Baba',
+  moqPushTitle: '"{{productName}}" · Offer Wale Baba',
   moqPushBody: 'Now available for wholesale on Offer Wale Baba. Tap to order.',
 
   htmlLayout: `

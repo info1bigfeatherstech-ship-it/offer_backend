@@ -107,7 +107,20 @@ function buildProductUrl(inquiry) {
   const slug = String(inquiry.productSlug || '').trim();
   const sf = resolveInquiryStorefront(inquiry);
   if (!slug) return buildStorefrontUrl(sf, '/');
-  return buildStorefrontUrl(sf, `/products/${encodeURIComponent(slug)}`);
+  return buildStorefrontUrl(sf, buildProductClickPath(slug, sf));
+}
+
+/**
+ * Same-origin PDP path for web-push click (SW resolves against its registration origin).
+ * ecomm → /products/:slug | wholesale → /product/:slug
+ */
+function buildProductClickPath(productSlug, storefront = 'ecomm') {
+  const slug = String(productSlug || '').trim();
+  if (!slug) return '/';
+  // Reject path traversal / absolute URLs masquerading as slugs
+  if (slug.includes('/') || slug.includes('\\') || slug.includes('..')) return '/';
+  const prefix = storefront === 'wholesale' ? '/product' : '/products';
+  return `${prefix}/${encodeURIComponent(slug)}`;
 }
 
 function fillTemplate(str, map) {
@@ -508,9 +521,12 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   }
 
   const sf = resolveInquiryStorefront(inquiry);
-  const productNameRaw = String(ctx.productName || inquiry.productName || 'Your item').trim();
-  // Title is the strongest OS surface — keep product readable; brand always appended via template.
-  const productNameForTitle = productNameRaw.slice(0, 48) || 'Your item';
+  const productNameRaw = String(ctx.productName || inquiry.productName || 'Your item')
+    .trim()
+    .replace(/["«»“”]/g, '')
+    .replace(/\s+/g, ' ');
+  // Title is the strongest OS surface — product in quotes; brand always present.
+  const productNameForTitle = productNameRaw.slice(0, 44) || 'Your item';
   const productName = productNameRaw.slice(0, 120) || 'Your item';
   const productSlug = ctx.productSlug || inquiry.productSlug || null;
   const productUrl = buildProductUrl({
@@ -518,10 +534,11 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
     productSlug,
     storefront: sf,
   });
+  const clickPath = buildProductClickPath(productSlug, sf);
   const moqCopy = isMoqUnmetInquiry(inquiry);
   const titleTemplate = moqCopy
-    ? template.moqPushTitle || '{{productName}} · Offer Wale Baba'
-    : template.pushTitle || '{{productName}} · Offer Wale Baba';
+    ? template.moqPushTitle || '"{{productName}}" · Offer Wale Baba'
+    : template.pushTitle || '"{{productName}}" · Offer Wale Baba';
   const bodyTemplate = moqCopy
     ? template.moqPushBody ||
       'Now available for wholesale on Offer Wale Baba. Tap to order.'
@@ -537,22 +554,23 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   const tagPrefix = template.pushTagPrefix || 'oos-restock';
   const inquiryId = String(inquiry._id);
 
-  // Restock-only: product photo as icon when available; badge stays brand logo.
-  // Cart / wishlist / new-products templates are unchanged elsewhere.
+  // Restock-only: large `image` = product photo; small `icon` + `badge` = brand logo.
+  // Click uses same-origin path so SW opens this storefront's PDP (local or prod).
   const payload = {
-    title: title || `${productNameForTitle} · Offer Wale Baba`.slice(0, 80),
+    title: title || `"${productNameForTitle}" · Offer Wale Baba`.slice(0, 80),
     body:
       body ||
       (moqCopy
         ? 'Now available for wholesale on Offer Wale Baba. Tap to order.'
         : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
-    icon: productImageUrl || brandAssetUrl,
+    icon: brandAssetUrl,
     badge: brandAssetUrl,
     image: productImageUrl || undefined,
     tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
     data: {
       type: 'back_in_stock',
-      url: productUrl,
+      url: clickPath,
+      absoluteUrl: productUrl,
       storefront: sf,
       inquiryId,
       productSlug: productSlug || null,
