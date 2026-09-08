@@ -297,6 +297,23 @@ function isMoqUnmetInquiry(inquiry) {
   return inquiry?.reason === 'moq_unmet' && inquiry?.storefront === 'wholesale';
 }
 
+/**
+ * Absolute https image URL for push icon/image. Rejects relative / http / junk.
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
+function resolveHttpsImageUrl(raw) {
+  const value = String(raw || '').trim();
+  if (!value || value.length > 2048) return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:') return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
 async function sendRestockEmail(inquiry, ctx) {
   if (!inquiry.email) {
     const err = new Error('No email on inquiry');
@@ -491,7 +508,10 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   }
 
   const sf = resolveInquiryStorefront(inquiry);
-  const productName = String(ctx.productName || inquiry.productName || 'Your item').slice(0, 120);
+  const productNameRaw = String(ctx.productName || inquiry.productName || 'Your item').trim();
+  // Title is the strongest OS surface — keep product readable; brand always appended via template.
+  const productNameForTitle = productNameRaw.slice(0, 48) || 'Your item';
+  const productName = productNameRaw.slice(0, 120) || 'Your item';
   const productSlug = ctx.productSlug || inquiry.productSlug || null;
   const productUrl = buildProductUrl({
     ...(inquiry.toObject?.() || inquiry),
@@ -499,22 +519,36 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
     storefront: sf,
   });
   const moqCopy = isMoqUnmetInquiry(inquiry);
-  const title = moqCopy
-    ? template.moqPushTitle || 'Now available for wholesale'
-    : template.pushTitle || 'Back in stock';
+  const titleTemplate = moqCopy
+    ? template.moqPushTitle || '{{productName}} · Offer Wale Baba'
+    : template.pushTitle || '{{productName}} · Offer Wale Baba';
   const bodyTemplate = moqCopy
-    ? template.moqPushBody || '{{productName}} now has enough stock for wholesale. Tap to order.'
-    : template.pushBody || '{{productName}} is available again. Tap to view and order.';
+    ? template.moqPushBody ||
+      'Now available for wholesale on Offer Wale Baba. Tap to order.'
+    : template.pushBody || 'Back in stock on Offer Wale Baba. Tap to view and order.';
+  const title = fillTemplate(titleTemplate, { productName: productNameForTitle }).slice(0, 80);
   const body = fillTemplate(bodyTemplate, { productName }).slice(0, 180);
-  const iconPath = template.pushIconPath || '/icons/icon-192.png';
+  const brandAssetPath =
+    template.pushBadgePath || template.pushIconPath || '/pwa-192x192.png';
+  const brandAssetUrl = resolvePushAssetUrl(brandAssetPath, sf);
+  const productImageUrl = resolveHttpsImageUrl(
+    ctx.productImage || inquiry.productImage || null
+  );
   const tagPrefix = template.pushTagPrefix || 'oos-restock';
   const inquiryId = String(inquiry._id);
 
+  // Restock-only: product photo as icon when available; badge stays brand logo.
+  // Cart / wishlist / new-products templates are unchanged elsewhere.
   const payload = {
-    title: String(title).slice(0, 80),
-    body,
-    icon: resolvePushAssetUrl(iconPath, sf),
-    badge: resolvePushAssetUrl(iconPath, sf),
+    title: title || `${productNameForTitle} · Offer Wale Baba`.slice(0, 80),
+    body:
+      body ||
+      (moqCopy
+        ? 'Now available for wholesale on Offer Wale Baba. Tap to order.'
+        : 'Back in stock on Offer Wale Baba. Tap to view and order.'),
+    icon: productImageUrl || brandAssetUrl,
+    badge: brandAssetUrl,
+    image: productImageUrl || undefined,
     tag: `${tagPrefix}:${inquiryId}`.slice(0, 120),
     data: {
       type: 'back_in_stock',
