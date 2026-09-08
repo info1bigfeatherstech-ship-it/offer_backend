@@ -106,26 +106,53 @@ function formatAdminCart(cart, extra = {}) {
 // =============================================
 const getAllUsers = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = '', role = '' } = req.query;
+    let { page = 1, limit = 20, search = '', role = '', engagement = 'all' } = req.query;
 
     page = Math.max(1, Number(page));
     limit = Math.min(100, Math.max(1, Number(limit)));
     const skip = (page - 1) * limit;
 
+    const engagementFilter =
+      engagementAnalyticsService.normalizeEngagementFilter(engagement);
+
     // Build query (always scoped by admin storefront)
     let query = scopedUserQueryFromReq(req);
-    
+
     if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } }
-      ];
+      const searchRx = { $regex: String(search).slice(0, 120), $options: 'i' };
+      query = mergeAnd(query, {
+        $or: [{ name: searchRx }, { email: searchRx }, { phone: searchRx }],
+      });
     }
-    
+
     if (role && ['user', 'wholesaler', 'admin'].includes(role)) {
       query = mergeAnd(query, { role });
     }
+
+    let pushUserIds = [];
+    if (
+      engagementFilter === 'push_on' ||
+      engagementFilter === 'push_off' ||
+      engagementFilter === 'push_and_pwa'
+    ) {
+      try {
+        pushUserIds = await engagementAnalyticsService.getActivePushUserIds(
+          scopedUserQueryFromReq(req)
+        );
+      } catch (pushErr) {
+        console.error('getAllUsers push filter lookup failed', pushErr?.message);
+        return res.status(500).json({
+          success: false,
+          message: 'Could not apply notification filter',
+        });
+      }
+    }
+
+    query = engagementAnalyticsService.applyEngagementFilterToUserQuery(
+      query,
+      engagementFilter,
+      pushUserIds
+    );
 
     const [users, total] = await Promise.all([
       User.find(query)
@@ -134,45 +161,70 @@ const getAllUsers = async (req, res) => {
         .skip(skip)
         .limit(limit)
         .lean(),
-      User.countDocuments(query)
+      User.countDocuments(query),
     ]);
 
+    let pushMetaByUserId = new Map();
+    try {
+      pushMetaByUserId = await engagementAnalyticsService.getPushMetaForUserIds(
+        users.map((u) => u._id)
+      );
+    } catch (metaErr) {
+      console.warn('getAllUsers push meta enrich failed', metaErr?.message);
+      pushMetaByUserId = new Map();
+    }
+
     // Get additional stats for each user
-    const usersWithStats = await Promise.all(users.map(async (user) => {
-      // Get cart count
-      const cartt = await findCartForStorefront(user._id, resolveCustomerStorefrontFromReq(req));
-      const cartItemsCount = cartt?.items?.length || 0;
-      
-      // Get wishlist count
-      const wishlist = await Wishlist.findOne({ userId: user._id });
-      const wishlistCount = wishlist?.products?.length || 0;
-      
-      return {
-        ...user,
-        cartItemsCount,
-        wishlistCount,
-        lastActive: user.updatedAt || user.createdAt
-      };
-    }));
+    const usersWithStats = await Promise.all(
+      users.map(async (user) => {
+        let cartItemsCount = 0;
+        let wishlistCount = 0;
+        try {
+          const cartt = await findCartForStorefront(
+            user._id,
+            resolveCustomerStorefrontFromReq(req)
+          );
+          cartItemsCount = cartt?.items?.length || 0;
+        } catch {
+          cartItemsCount = 0;
+        }
+        try {
+          const wishlist = await Wishlist.findOne({ userId: user._id });
+          wishlistCount = wishlist?.products?.length || 0;
+        } catch {
+          wishlistCount = 0;
+        }
+
+        return engagementAnalyticsService.attachEngagementFields(
+          {
+            ...user,
+            cartItemsCount,
+            wishlistCount,
+            lastActive: user.updatedAt || user.createdAt,
+          },
+          pushMetaByUserId
+        );
+      })
+    );
 
     return res.status(200).json({
       success: true,
       scope: scopeLabelFromReq(req),
+      engagementFilter,
       data: usersWithStats,
       pagination: {
         total,
         page,
         limit,
-        totalPages: Math.ceil(total / limit)
-      }
+        totalPages: Math.max(1, Math.ceil(total / limit) || 1),
+      },
     });
-
   } catch (error) {
     console.error('Get all users error:', error);
     return res.status(500).json({
       success: false,
       message: 'Error fetching users',
-      error: error.message
+      error: error.message,
     });
   }
 };

@@ -23,6 +23,8 @@ const addressSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true
+    // Length enforced in addressValidation (MAX_FULL_NAME_LEN) so legacy
+    // over-long names can still receive meta-only updates (e.g. isDefault).
   },
 
   phone: {

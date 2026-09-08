@@ -49,6 +49,7 @@ function pickPrimaryBaseUrl(raw, fallback = ECOMM_PUBLIC_DEFAULT, { allowLocal =
   if (allowLocal && parts.length) {
     return parts[0].replace(/\/$/, '');
   }
+  if (fallback == null || fallback === '') return null;
   return String(fallback || ECOMM_PUBLIC_DEFAULT).replace(/\/$/, '');
 }
 

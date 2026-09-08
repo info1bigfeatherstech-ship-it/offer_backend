@@ -12,6 +12,7 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const logger = require('./logger');
 const shippingProviderSettingsService = require('../services/shippingProviderSettings.service');
+const { sanitizeCourierConsigneeName } = require('./addressValidation');
 
 const DEFAULT_BASE = 'https://shipping-api.com/app/api/v1';
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -24,12 +25,52 @@ function kgToGrams(weightKg) {
 function parseShipmozoResult(data) {
   const result = data?.result != null ? String(data.result) : '';
   const ok = result === '1' || result === 'true' || data?.success === true;
+  const message = extractShipmozoFailureMessage(data, ok);
   return {
     ok,
-    message: data?.message || (ok ? 'Success' : 'Shipmozo request failed'),
+    message,
     data: data?.data ?? null,
     raw: data
   };
+}
+
+/**
+ * Prefer a useful human message when Shipmozo returns opaque "Error".
+ */
+function extractShipmozoFailureMessage(data, ok) {
+  if (ok) return data?.message || 'Success';
+
+  const candidates = [
+    data?.message,
+    data?.error,
+    data?.msg,
+    data?.data?.message,
+    data?.data?.error,
+    data?.data?.msg,
+    Array.isArray(data?.errors) ? data.errors.map((e) => (typeof e === 'string' ? e : e?.message)).filter(Boolean).join('; ') : null,
+    data?.response?.message,
+  ];
+
+  for (const c of candidates) {
+    const s = c != null ? String(c).trim() : '';
+    if (!s) continue;
+    if (/^error$/i.test(s)) continue;
+    return s;
+  }
+
+  // Last resort: short JSON snippet (not huge dumps)
+  try {
+    if (data && typeof data === 'object') {
+      const compact = JSON.stringify(data);
+      if (compact && compact !== '{}' && compact.length <= 280) {
+        return `Shipmozo rejected the request: ${compact}`;
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+
+  return data?.message ? String(data.message) : 'Shipmozo request failed';
 }
 
 /**
@@ -711,7 +752,7 @@ class ShipmozoService {
       order_id: order.orderId,
       order_date: orderDate,
       order_type: 'ESSENTIALS',
-      consignee_name: addr.fullName || 'Customer',
+      consignee_name: sanitizeCourierConsigneeName(addr.fullName),
       consignee_phone: Number(phone),
       consignee_alternate_phone: '',
       consignee_email: addr.email || process.env.STORE_EMAIL || '',
@@ -1079,7 +1120,7 @@ class ShipmozoService {
       order_id: order.orderId,
       order_date: (order.createdAt || new Date()).toISOString().slice(0, 10),
       order_type: 'ESSENTIALS',
-      pickup_name: addr.fullName || 'Customer',
+      pickup_name: sanitizeCourierConsigneeName(addr.fullName),
       pickup_phone: Number(phone) || 9999999999,
       pickup_email: addr.email || '',
       pickup_address_line_one:

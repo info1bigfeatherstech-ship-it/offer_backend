@@ -7475,212 +7475,194 @@ const exportProductsCSV = async (req, res) => {
 };
 
 // =============================================
-// DOWNLOAD BULK UPLOAD TEMPLATE (with data validation)
+// DOWNLOAD BULK UPLOAD TEMPLATE (code-generated)
+// Instructions + ZIP guide + headers/examples come from
+// templates/bulkUploadTemplate.meta.js — no external XLSX on disk.
+// Categories dropdown refreshed from DB on every download.
 // =============================================
 const downloadBulkUploadTemplate = async (req, res) => {
+  let bufferSent = false;
   try {
     const ExcelJS = require('exceljs');
-    const XLSX = require('xlsx');
-    const path = require('path');
-    const fs = require('fs');
+    const templateMeta = require('../templates/bulkUploadTemplate.meta');
 
-    const templatePath = 'c:/BigFeathers/offerWaaleBaba/OWB-bulkUploadFormat-ForNewProducts-FinalUpdated.xlsx';
+    const {
+      STATUS_OPTIONS,
+      BOOL_OPTIONS,
+      FOMO_TYPE_OPTIONS,
+      GST_OPTIONS,
+      buildInstructionsAoa,
+      buildImageZipGuideAoa,
+      buildExampleProductAoa,
+      getProductSheetHeaders,
+    } = templateMeta;
 
-    // ── Fetch dynamic categories ─────────────────────────────────────────────
-    const categories = await Category.find({ status: 'active' })
-      .sort({ name: 1 })
-      .lean();
-    const categoryNames = categories.map(c => c.name);
+    // ── Fetch dynamic categories (fail soft → empty dropdown, still download) ─
+    let categoryNames = [];
+    try {
+      const categories = await Category.find({ status: 'active' })
+        .sort({ name: 1 })
+        .select('name')
+        .lean();
+      categoryNames = (categories || [])
+        .map((c) => String(c?.name || '').trim())
+        .filter(Boolean);
+    } catch (catErr) {
+      console.error('downloadBulkUploadTemplate: category lookup failed:', catErr?.message || catErr);
+      categoryNames = [];
+    }
 
     const workbook = new ExcelJS.Workbook();
-    
-    // Set active worksheet tab to BulkUpload_NewProducts (index 1) when workbook is opened
+    workbook.creator = 'OfferWaleBaba';
+    workbook.created = new Date();
     workbook.views = [
       {
         firstSheet: 0,
-        activeTab: 1, // 0-indexed: index 1 refers to BulkUpload_NewProducts worksheet
-        visibility: 'visible'
-      }
+        activeTab: 1, // open on BulkUpload_NewProducts
+        visibility: 'visible',
+      },
     ];
-    
-    // Create worksheets
+
     const wsInstructions = workbook.addWorksheet('Instructions');
     const wsProducts = workbook.addWorksheet('BulkUpload_NewProducts');
     const wsImageGuide = workbook.addWorksheet('Image_ZIP_Guide');
     const wsLookups = workbook.addWorksheet('Lookups');
 
-    let productsRows = [];
-
-    if (fs.existsSync(templatePath)) {
-      // ── Use SheetJS (xlsx) to read the template file ───────────────────────
-      const workbookTemplate = XLSX.readFile(templatePath);
-      
-      // 1. Read Instructions
-      const instructionsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Instructions'], { header: 1 });
-      instructionsRows.forEach(row => {
-        const fieldName = String(row[1] || '').trim();
-        if (['weight', 'length', 'width', 'height'].includes(fieldName)) {
-          row[2] = '✅ Yes'; // Update validation column description to show "Required"
-        }
-        wsInstructions.addRow(row);
-      });
-
-      // Style Instructions sheet
+    // ── Instructions ─────────────────────────────────────────────────────────
+    const instructionsRows = buildInstructionsAoa();
+    instructionsRows.forEach((row) => wsInstructions.addRow(row));
+    try {
       wsInstructions.getCell('A1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
-      const instHeader = wsInstructions.getRow(5);
-      instHeader.height = 24;
-      instHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF475569' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'left' };
-      });
+      const instHeader = wsInstructions.getRow(6); // header after intro rows
+      if (String(instHeader.getCell(1).value || '') === 'Column') {
+        instHeader.height = 24;
+        instHeader.eachCell((cell) => {
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF475569' },
+          };
+          cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+        });
+      }
       wsInstructions.columns = [
-        { width: 10 }, // Column
-        { width: 22 }, // Field Name
-        { width: 12 }, // Required?
-        { width: 12 }, // Data Type
-        { width: 45 }, // Allowed Values / Format
-        { width: 30 }, // Example
-        { width: 70 }  // Notes
+        { width: 10 },
+        { width: 22 },
+        { width: 12 },
+        { width: 12 },
+        { width: 45 },
+        { width: 36 },
+        { width: 72 },
       ];
-
-      // 2. Read Products & examples
-      productsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['BulkUpload_NewProducts'], { header: 1 });
-      productsRows.forEach(row => {
-        wsProducts.addRow(row);
-      });
-
-      // Style Products header
-      const prodHeader = wsProducts.getRow(1);
-      prodHeader.height = 26;
-      prodHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF1D4ED8' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      });
-      wsProducts.columns = productsRows[0].map(h => ({
-        header: h,
-        width: Math.max(String(h || '').length + 4, 16)
-      }));
-      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
-
-      // 3. Read Image Guide
-      const imageGuideRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Image_ZIP_Guide'], { header: 1 });
-      imageGuideRows.forEach(row => {
-        wsImageGuide.addRow(row);
-      });
-
-      // Style Image Guide
-      wsImageGuide.getCell('B1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
-      wsImageGuide.columns = [
-        { width: 6 },
-        { width: 80 }
-      ];
-    } else {
-      // Fallback if template is not found
-      productsRows = [[
-        'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
-        'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
-        'weight', 'length', 'width', 'height',
-        'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
-        'productAttributes', 'images (LEAVE BLANK)', 'hsnCode', 'gstRate', 'isFragile',
-        'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
-      ]];
-      wsProducts.addRow(productsRows[0]);
-      
-      const prodHeader = wsProducts.getRow(1);
-      prodHeader.height = 26;
-      prodHeader.eachCell(cell => {
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF1D4ED8' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      });
-      wsProducts.columns = productsRows[0].map(h => ({ header: h, width: Math.max(h.length + 4, 16) }));
-      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Instructions style skipped:', styleErr?.message);
     }
 
-    // ── Create Lookups sheet ─────────────────────────────────────────────────
-    const STATUS_OPTIONS    = ['active', 'draft', 'archived'];
-    const BOOL_OPTIONS      = ['true', 'false'];
-    const FOMO_TYPE_OPTIONS = ['viewing_now', 'product_left', 'custom'];
-    const GST_OPTIONS       = ['0', '5', '12', '18', '28'];
+    // ── Products sheet (headers + examples) ──────────────────────────────────
+    const productsRows = buildExampleProductAoa();
+    const headers = productsRows[0] || getProductSheetHeaders();
+    productsRows.forEach((row) => wsProducts.addRow(row));
+    try {
+      const prodHeader = wsProducts.getRow(1);
+      prodHeader.height = 26;
+      prodHeader.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF1D4ED8' },
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      });
+      wsProducts.columns = headers.map((h) => ({
+        width: Math.min(Math.max(String(h || '').length + 4, 14), 36),
+      }));
+      wsProducts.views = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Products style skipped:', styleErr?.message);
+    }
 
-    // Write lists to Lookups sheet columns
-    wsLookups.getColumn(1).values = ['category', ...categoryNames];
+    // ── Image ZIP guide ──────────────────────────────────────────────────────
+    const imageGuideRows = buildImageZipGuideAoa();
+    imageGuideRows.forEach((row) => wsImageGuide.addRow(row));
+    try {
+      wsImageGuide.getCell('A1').font = { size: 14, bold: true, color: { argb: 'FF1E293B' } };
+      wsImageGuide.columns = [{ width: 6 }, { width: 88 }];
+    } catch (styleErr) {
+      console.warn('downloadBulkUploadTemplate: Image guide style skipped:', styleErr?.message);
+    }
+
+    // ── Lookups (hidden) — category list always at least header ──────────────
+    const catList = categoryNames.length > 0 ? categoryNames : ['(add categories in admin)'];
+    wsLookups.getColumn(1).values = ['category', ...catList];
     wsLookups.getColumn(2).values = ['status', ...STATUS_OPTIONS];
     wsLookups.getColumn(3).values = ['boolean', ...BOOL_OPTIONS];
     wsLookups.getColumn(4).values = ['fomoType', ...FOMO_TYPE_OPTIONS];
     wsLookups.getColumn(5).values = ['gstRate', ...GST_OPTIONS];
-
-    // Hide lookups sheet completely
     wsLookups.state = 'veryHidden';
 
-    // ── Build map from headers to column index ──────────────────────────────
+    // ── Data validations on Products sheet ───────────────────────────────────
     const colMap = {};
     const headerRow = wsProducts.getRow(1);
     headerRow.eachCell((cell, colNumber) => {
       const val = String(cell.value || '').trim();
-      const name = val.replace(/\s*\(.*\)/, '').trim(); // 'images (LEAVE BLANK)' -> 'images'
-      colMap[name] = colNumber;
+      const name = val.replace(/\s*\(.*\)/, '').trim(); // 'images (LEAVE BLANK)' → 'images'
+      if (name) colMap[name] = colNumber;
     });
 
-    // Define validation ranges referencing Lookups
+    const categoryEndRow = Math.max(2, catList.length + 1);
     const VALIDATIONS = {
-      'category': `Lookups!$A$2:$A$${categoryNames.length + 1}`,
-      'status': `Lookups!$B$2:$B$${STATUS_OPTIONS.length + 1}`,
-      'isfeatured': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'soldEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'fomoEnabled': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'fomoType': `Lookups!$D$2:$D$${FOMO_TYPE_OPTIONS.length + 1}`,
-      'isFragile': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'wholesale': `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
-      'gstRate': `Lookups!$E$2:$E$${GST_OPTIONS.length + 1}`
+      category: `Lookups!$A$2:$A$${categoryEndRow}`,
+      status: `Lookups!$B$2:$B$${STATUS_OPTIONS.length + 1}`,
+      isfeatured: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      soldEnabled: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      fomoEnabled: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      fomoType: `Lookups!$D$2:$D$${FOMO_TYPE_OPTIONS.length + 1}`,
+      isFragile: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      wholesale: `Lookups!$C$2:$C$${BOOL_OPTIONS.length + 1}`,
+      gstRate: `Lookups!$E$2:$E$${GST_OPTIONS.length + 1}`,
     };
 
-    // Apply validations to wsProducts (rows 2 to 5000)
-    Object.keys(VALIDATIONS).forEach((colName) => {
-      const colNumber = colMap[colName];
-      if (!colNumber) return;
-
-      const colLetter = wsProducts.getColumn(colNumber).letter;
-      const validationFormula = VALIDATIONS[colName];
-
-      wsProducts.dataValidations.add(`${colLetter}2:${colLetter}5000`, {
-        type: 'list',
-        allowBlank: true,
-        formulae: [validationFormula],
-        showErrorMessage: true,
-        errorStyle: 'warning',
-        errorTitle: 'Invalid Selection',
-        error: `Please select a valid ${colName} from the list.`
+    try {
+      Object.keys(VALIDATIONS).forEach((colName) => {
+        const colNumber = colMap[colName];
+        if (!colNumber) return;
+        const colLetter = wsProducts.getColumn(colNumber).letter;
+        wsProducts.dataValidations.add(`${colLetter}2:${colLetter}5000`, {
+          type: 'list',
+          allowBlank: true,
+          formulae: [VALIDATIONS[colName]],
+          showErrorMessage: true,
+          errorStyle: 'warning',
+          errorTitle: 'Invalid Selection',
+          error: `Please select a valid ${colName} from the list.`,
+        });
       });
-    });
+    } catch (valErr) {
+      console.warn('downloadBulkUploadTemplate: data validations skipped:', valErr?.message);
+    }
 
     const buffer = await workbook.xlsx.writeBuffer();
+    if (!buffer || !buffer.length) {
+      throw new Error('Generated template buffer was empty');
+    }
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    bufferSent = true;
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
     res.setHeader('Content-Disposition', 'attachment; filename="bulk_upload_template.xlsx"');
     res.setHeader('Content-Length', buffer.length);
-    res.send(buffer);
-
+    return res.send(Buffer.from(buffer));
   } catch (error) {
     console.error('Download bulk upload template error:', error);
+    if (bufferSent || res.headersSent) return undefined;
     return res.status(500).json({
       success: false,
       message: 'Error generating template',
-      error: error.message
+      error: error.message,
     });
   }
 };

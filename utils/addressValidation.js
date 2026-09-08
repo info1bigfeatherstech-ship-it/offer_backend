@@ -7,6 +7,8 @@
  *   line2 = addressLine2, area, landmark
  * Shiprocket rejects when len(line1) + len(line2) > 190.
  * We enforce the same combined cap at save time (customer + admin) so Ship Now cannot fail later.
+ *
+ * Consignee / billing name has a separate courier-safe cap (fullName).
  */
 
 const MIN_ADDRESS_LINE1_LEN = 10;
@@ -16,10 +18,33 @@ const MAX_ADDRESS_LINE_LEN = 200;
 const MIN_COMBINED_STREET_CHARS = 3;
 /** Shiprocket billing_address + billing_address_2 combined character limit. */
 const MAX_COURIER_COMBINED_STREET_CHARS = 190;
+/**
+ * Recipient name for courier APIs (Shipmozo consignee_name / Shiprocket billing_customer_name).
+ * Long pasted address+phone dumps in fullName have caused live push-order failures.
+ */
+const MAX_FULL_NAME_LEN = 80;
+const MAX_COURIER_CONSIGNEE_NAME_LEN = 80;
 
 function trimStr(value) {
   if (value == null) return '';
   return String(value).trim();
+}
+
+/**
+ * Courier-safe recipient name: collapse whitespace, hard truncate.
+ * Does not invent a name when empty — returns fallback.
+ *
+ * @param {unknown} name
+ * @param {string} [fallback='Customer']
+ * @returns {string}
+ */
+function sanitizeCourierConsigneeName(name, fallback = 'Customer') {
+  let s = trimStr(name).replace(/\s+/g, ' ');
+  if (!s) return fallback;
+  if (s.length > MAX_COURIER_CONSIGNEE_NAME_LEN) {
+    s = s.slice(0, MAX_COURIER_CONSIGNEE_NAME_LEN).trim();
+  }
+  return s || fallback;
 }
 
 /**
@@ -142,6 +167,18 @@ function validatePhysicalAddressForSave(body) {
 
   if (!fullName) {
     errors.push({ field: 'fullName', code: 'REQUIRED', message: 'Full name is required.' });
+  } else if (fullName.length > MAX_FULL_NAME_LEN) {
+    errors.push({
+      field: 'fullName',
+      code: 'FULL_NAME_TOO_LONG',
+      message: `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`
+    });
+  } else if (fullName.length < 2) {
+    errors.push({
+      field: 'fullName',
+      code: 'FULL_NAME_TOO_SHORT',
+      message: 'Full name must be at least 2 characters.'
+    });
   }
   if (!phoneRaw) {
     errors.push({ field: 'phone', code: 'REQUIRED', message: 'Phone number is required.' });
@@ -258,10 +295,13 @@ module.exports = {
   MAX_ADDRESS_LINE_LEN,
   MIN_COMBINED_STREET_CHARS,
   MAX_COURIER_COMBINED_STREET_CHARS,
+  MAX_FULL_NAME_LEN,
+  MAX_COURIER_CONSIGNEE_NAME_LEN,
   buildCourierStreetLines,
   validateCourierComposedStreet,
   validateStreetLines,
   validatePhysicalAddressForSave,
   shouldRunFullAddressValidation,
+  sanitizeCourierConsigneeName,
   ADDRESS_META_ONLY_KEYS
 };

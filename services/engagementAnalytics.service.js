@@ -74,10 +74,13 @@ async function getEngagementSummary(userMatch) {
       pushNotificationUsers: 0,
       pushNotificationDevices: 0,
       scopedCustomers: 0,
+      pushNotificationUsersOff: 0,
+      pwaInstallUsersOff: 0,
+      pushAndPwaUsers: 0,
     };
   }
 
-  const [pwaInstallUsers, pushStats] = await Promise.all([
+  const [pwaInstallUsers, pushStats, pushUserIds] = await Promise.all([
     User.countDocuments({
       _id: { $in: ids },
       'pwaInstall.installedAt': { $ne: null, $exists: true },
@@ -98,13 +101,197 @@ async function getEngagementSummary(userMatch) {
         },
       },
     ]),
+    PushSubscription.distinct('userId', { isActive: true, userId: { $in: ids } }),
   ]);
+
+  const activePushIds = (pushUserIds || [])
+    .filter(Boolean)
+    .map((id) =>
+      id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id))
+    );
+
+  const pushAndPwaUsers = activePushIds.length
+    ? await User.countDocuments({
+        _id: { $in: activePushIds },
+        'pwaInstall.installedAt': { $ne: null, $exists: true },
+      })
+    : 0;
 
   return {
     pwaInstallUsers,
     pushNotificationUsers: pushStats[0]?.pushUsers || 0,
     pushNotificationDevices: pushStats[0]?.pushDevices || 0,
     scopedCustomers: ids.length,
+    pushNotificationUsersOff: Math.max(0, ids.length - (pushStats[0]?.pushUsers || 0)),
+    pwaInstallUsersOff: Math.max(0, ids.length - pwaInstallUsers),
+    pushAndPwaUsers,
+  };
+}
+
+/**
+ * Active push subscriber userIds within an admin storefront userMatch.
+ */
+async function getActivePushUserIds(userMatch) {
+  const match = userMatch && typeof userMatch === 'object' ? userMatch : {};
+  const scopedUserIds = await User.find(match).select('_id').lean();
+  const ids = scopedUserIds.map((u) => u._id);
+  if (!ids.length) return [];
+
+  const activeUserIds = await PushSubscription.distinct('userId', {
+    isActive: true,
+    userId: { $in: ids },
+  });
+
+  return activeUserIds
+    .filter(Boolean)
+    .map((id) =>
+      id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id))
+    );
+}
+
+/**
+ * Batch push device meta for a page of users.
+ * @returns {Map<string, { deviceCount: number, subscribedAt: Date|null, lastPushAt: Date|null }>}
+ */
+async function getPushMetaForUserIds(userIds = []) {
+  const map = new Map();
+  const ids = (userIds || [])
+    .filter(Boolean)
+    .map((id) =>
+      id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id))
+    );
+  if (!ids.length) return map;
+
+  const rows = await PushSubscription.aggregate([
+    { $match: { isActive: true, userId: { $in: ids } } },
+    {
+      $group: {
+        _id: '$userId',
+        deviceCount: { $sum: 1 },
+        subscribedAt: { $min: '$createdAt' },
+        lastPushAt: { $max: '$lastPushAt' },
+      },
+    },
+  ]);
+
+  for (const row of rows) {
+    map.set(String(row._id), {
+      deviceCount: row.deviceCount || 0,
+      subscribedAt: row.subscribedAt || null,
+      lastPushAt: row.lastPushAt || null,
+    });
+  }
+  return map;
+}
+
+/**
+ * Normalize engagement filter query value.
+ * @returns {'all'|'push_on'|'push_off'|'pwa_on'|'pwa_off'|'push_and_pwa'}
+ */
+function normalizeEngagementFilter(raw) {
+  const key = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  const aliases = {
+    both: 'push_and_pwa',
+    ready: 'push_and_pwa',
+    engaged: 'push_and_pwa',
+    app_and_push: 'push_and_pwa',
+  };
+  const normalized = aliases[key] || key;
+  const allowed = new Set([
+    'all',
+    'push_on',
+    'push_off',
+    'pwa_on',
+    'pwa_off',
+    'push_and_pwa',
+  ]);
+  if (!normalized || !allowed.has(normalized)) return 'all';
+  return normalized;
+}
+
+/**
+ * Apply engagement filter onto a user Mongo query.
+ * For push_* / push_and_pwa filters, pass preloaded active push user ObjectIds.
+ */
+function applyEngagementFilterToUserQuery(baseQuery, engagement, pushUserIds = []) {
+  const key = normalizeEngagementFilter(engagement);
+  const base = baseQuery && typeof baseQuery === 'object' ? baseQuery : {};
+
+  if (key === 'all') return base;
+
+  if (key === 'pwa_on') {
+    return {
+      $and: [
+        base,
+        {
+          'pwaInstall.installedAt': { $ne: null, $exists: true },
+        },
+      ],
+    };
+  }
+
+  if (key === 'pwa_off') {
+    return {
+      $and: [
+        base,
+        {
+          $or: [
+            { pwaInstall: { $exists: false } },
+            { 'pwaInstall.installedAt': null },
+            { 'pwaInstall.installedAt': { $exists: false } },
+          ],
+        },
+      ],
+    };
+  }
+
+  const ids = Array.isArray(pushUserIds) ? pushUserIds : [];
+  if (key === 'push_on') {
+    if (!ids.length) {
+      return { $and: [base, { _id: { $in: [] } }] };
+    }
+    return { $and: [base, { _id: { $in: ids } }] };
+  }
+
+  if (key === 'push_off') {
+    if (!ids.length) return base;
+    return { $and: [base, { _id: { $nin: ids } }] };
+  }
+
+  if (key === 'push_and_pwa') {
+    if (!ids.length) {
+      return { $and: [base, { _id: { $in: [] } }] };
+    }
+    return {
+      $and: [
+        base,
+        { _id: { $in: ids } },
+        { 'pwaInstall.installedAt': { $ne: null, $exists: true } },
+      ],
+    };
+  }
+
+  return base;
+}
+
+/**
+ * Attach engagement fields for admin customer rows.
+ */
+function attachEngagementFields(user, pushMetaByUserId) {
+  const meta = pushMetaByUserId?.get(String(user._id)) || null;
+  const deviceCount = meta?.deviceCount || 0;
+  return {
+    ...user,
+    notificationsEnabled: deviceCount > 0,
+    pushDeviceCount: deviceCount,
+    pushSubscribedAt: meta?.subscribedAt || null,
+    pushLastPushAt: meta?.lastPushAt || null,
+    pwaInstalled: Boolean(user?.pwaInstall?.installedAt),
+    pwaInstalledAt: user?.pwaInstall?.installedAt || null,
+    pwaLastConfirmedAt: user?.pwaInstall?.lastConfirmedAt || null,
   };
 }
 
@@ -228,6 +415,11 @@ async function listPwaInstalls(userMatch, query = {}) {
 module.exports = {
   recordPwaInstall,
   getEngagementSummary,
+  getActivePushUserIds,
+  getPushMetaForUserIds,
+  normalizeEngagementFilter,
+  applyEngagementFilterToUserQuery,
+  attachEngagementFields,
   listPushSubscribers,
   listPwaInstalls,
 };
