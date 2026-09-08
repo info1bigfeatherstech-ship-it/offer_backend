@@ -508,8 +508,8 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
     .trim()
     .replace(/["«»“”]/g, '')
     .replace(/\s+/g, ' ');
-  // Title is the strongest OS surface — product in quotes; brand always present.
-  const productNameForTitle = productNameRaw.slice(0, 44) || 'Your item';
+  // Title is product name only (no quotes / brand suffix).
+  const productNameForTitle = productNameRaw.slice(0, 80) || 'Your item';
   const productName = productNameRaw.slice(0, 120) || 'Your item';
   const productSlug = ctx.productSlug || inquiry.productSlug || null;
   const productUrl = buildProductUrl({
@@ -520,8 +520,8 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   const clickPath = buildProductClickPath(productSlug, sf);
   const moqCopy = isMoqUnmetInquiry(inquiry);
   const titleTemplate = moqCopy
-    ? template.moqPushTitle || '"{{productName}}" · Offer Wale Baba'
-    : template.pushTitle || '"{{productName}}" · Offer Wale Baba';
+    ? template.moqPushTitle || '{{productName}}'
+    : template.pushTitle || '{{productName}}';
   const bodyTemplate = moqCopy
     ? template.moqPushBody ||
       'Now available for wholesale on Offer Wale Baba. Tap to order.'
@@ -555,7 +555,7 @@ async function sendRestockWebPush(inquiry, ctx, resolvedUserId = null) {
   }
 
   const payload = {
-    title: title || `"${productNameForTitle}" · Offer Wale Baba`.slice(0, 80),
+    title: title || productNameForTitle.slice(0, 80),
     body:
       body ||
       (moqCopy
