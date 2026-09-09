@@ -7,7 +7,10 @@ const {
   buildCourierStreetLines,
   validateCourierComposedStreet,
   validatePhysicalAddressForSave,
-  MAX_COURIER_COMBINED_STREET_CHARS
+  sanitizeCourierConsigneeName,
+  MAX_COURIER_COMBINED_STREET_CHARS,
+  MAX_FULL_NAME_LEN,
+  MAX_COURIER_CONSIGNEE_NAME_LEN
 } = require('../utils/addressValidation');
 
 function testComposeMatchesShiprocketShape() {
@@ -86,10 +89,60 @@ function testAcceptReasonableAddress() {
   assert.ok(courier.combinedLength <= MAX_COURIER_COMBINED_STREET_CHARS);
 }
 
+function testFullNameShipmozoCap() {
+  assert.strictEqual(MAX_FULL_NAME_LEN, 50);
+  assert.strictEqual(MAX_COURIER_CONSIGNEE_NAME_LEN, 50);
+
+  const tooLong = validatePhysicalAddressForSave({
+    fullName: 'A'.repeat(51),
+    phone: '9876543210',
+    houseNumber: '42B',
+    building: 'Sunrise',
+    floor: '4',
+    addressLine1: 'MG Road near metro station',
+    addressLine2: 'Wing A',
+    area: 'Andheri East',
+    landmark: 'Near City Mall',
+    city: 'Mumbai',
+    state: 'Maharashtra',
+    postalCode: '400069',
+    country: 'India'
+  });
+  assert.strictEqual(tooLong.ok, false);
+  assert.ok(
+    tooLong.errors.some((e) => e.code === 'FULL_NAME_TOO_LONG'),
+    'expected FULL_NAME_TOO_LONG'
+  );
+
+  const atLimit = validatePhysicalAddressForSave({
+    fullName: 'A'.repeat(50),
+    phone: '9876543210',
+    houseNumber: '42B',
+    building: 'Sunrise',
+    floor: '4',
+    addressLine1: 'MG Road near metro station',
+    addressLine2: 'Wing A',
+    area: 'Andheri East',
+    landmark: 'Near City Mall',
+    city: 'Mumbai',
+    state: 'Maharashtra',
+    postalCode: '400069',
+    country: 'India'
+  });
+  assert.strictEqual(atLimit.ok, true, atLimit.message);
+
+  const sanitized = sanitizeCourierConsigneeName(
+    'Davichand Sharma C/O Rajesh Thakkar Mathur Building 8 B Ground Floor New Owners'
+  );
+  assert.strictEqual(sanitized.length, 50);
+  assert.strictEqual(sanitizeCourierConsigneeName('Davichand Sharma'), 'Davichand Sharma');
+}
+
 function run() {
   testComposeMatchesShiprocketShape();
   testRejectLongAddressOnSave();
   testAcceptReasonableAddress();
+  testFullNameShipmozoCap();
   console.log('All address validation tests passed.');
 }
 

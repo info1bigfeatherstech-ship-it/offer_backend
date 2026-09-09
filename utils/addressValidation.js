@@ -20,10 +20,11 @@ const MIN_COMBINED_STREET_CHARS = 3;
 const MAX_COURIER_COMBINED_STREET_CHARS = 190;
 /**
  * Recipient name for courier APIs (Shipmozo consignee_name / Shiprocket billing_customer_name).
- * Long pasted address+phone dumps in fullName have caused live push-order failures.
+ * Shipmozo rejects names longer than 50 characters ("may not be greater than 50").
+ * Keep form validation and courier sanitize on the same cap.
  */
-const MAX_FULL_NAME_LEN = 80;
-const MAX_COURIER_CONSIGNEE_NAME_LEN = 80;
+const MAX_FULL_NAME_LEN = 50;
+const MAX_COURIER_CONSIGNEE_NAME_LEN = 50;
 
 function trimStr(value) {
   if (value == null) return '';
