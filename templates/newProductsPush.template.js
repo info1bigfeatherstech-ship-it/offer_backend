@@ -5,8 +5,8 @@
  * - wholesale: https://offerwalebaba.in/TagProducts/today-arrival
  */
 module.exports = {
-  title: 'New products on Offer Wale Baba',
-  body: 'Explore latest arrivals on Offer Wale Baba.',
+  title: 'New Products Addedon Offer Wale Baba',
+  body: 'Explore our latest arrivals today on Offer Wale Baba !',
   icon: '/pwa-192x192.png',
   badge: '/pwa-192x192.png',
   tag: 'new-products-digest',

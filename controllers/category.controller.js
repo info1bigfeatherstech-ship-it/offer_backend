@@ -465,22 +465,21 @@ const deleteCategory = async (req, res) => {
       });
     }
 
-    if (category.status !== 'active') {
+    // Hard delete is only allowed after the category has been inactivated (hide/toggle).
+    if (category.status === 'active') {
       return res.status(400).json({
         success: false,
-        message: 'Category is already inactive'
+        message: 'Cannot delete an active category. Hide/inactivate it first.'
       });
     }
 
-    const childCategories = await Category.countDocuments({
-      parent: id,
-      status: 'active'
-    });
+    // Block if any child categories remain (active or inactive) to avoid orphaned refs.
+    const childCategories = await Category.countDocuments({ parent: id });
 
     if (childCategories > 0) {
       return res.status(400).json({
         success: false,
-        message: `Cannot delete category. ${childCategories} active subcategory(s) exist.`
+        message: `Cannot delete category. ${childCategories} subcategory(s) still exist. Remove or reassign them first.`
       });
     }
 
@@ -497,18 +496,15 @@ const deleteCategory = async (req, res) => {
 
     const previousBannerPublicId = category.image?.publicId;
     const previousCardPublicId = category.cardImage?.publicId;
-    category.status = 'inactive';
-    category.showInMenu = false;
-    category.image = { url: '', publicId: '' };
-    category.cardImage = { url: '', publicId: '' };
-    await category.save();
+
+    await Category.findByIdAndDelete(id);
 
     for (const previousPublicId of [previousBannerPublicId, previousCardPublicId]) {
       if (!previousPublicId) continue;
       try {
         await deleteFromCloudinary(previousPublicId);
       } catch (mediaErr) {
-        // Non-fatal cleanup error: category state change should still succeed.
+        // Non-fatal cleanup: category row is already removed.
         console.error('Category media cleanup failed:', mediaErr.message);
       }
     }
@@ -518,8 +514,8 @@ const deleteCategory = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: 'Category archived successfully',
-      category
+      message: 'Category deleted permanently',
+      id
     });
 
   } catch (error) {
