@@ -3,17 +3,21 @@
  *
  * Safety:
  * - Only `pending` orders without Shiprocket shipment refs
- * - Name + phone are frozen from existing addressSnapshot
- * - Updates order.addressSnapshot for THIS order only
- * - Optionally updates linked Address doc only when it belongs to the same order.userId
- * - Re-quotes shipping (never increases customer delivery); refunds excess when fully paid
+ * - Phone is frozen from existing addressSnapshot (identity / courier contact)
+ * - fullName is editable (capped by addressValidation / Shipmozo 50-char limit)
+ * - Name-only patches update snapshot (and optional saved Address) without
+ *   shipping reprice, money mutation, refunds, or amendment notifications
+ * - Street/location patches re-quote shipping (never increases customer delivery);
+ *   refunds excess when fully paid
  */
 
 const Order = require('../models/Order');
 const Address = require('../models/Address');
 const logger = require('../utils/logger');
-const { roundMoney2 } = require('./checkoutComputation.service');
-const { validatePhysicalAddressForSave } = require('../utils/addressValidation');
+const {
+  validatePhysicalAddressForSave,
+  MAX_FULL_NAME_LEN
+} = require('../utils/addressValidation');
 const { computeLocalAddressQuality } = require('./addressIntelligence.service');
 const {
   assertEditablePendingOrder,
@@ -26,6 +30,7 @@ const {
 const { notifyOrderAmended } = require('./orderAmendmentNotification.service');
 
 const EDITABLE_ADDRESS_FIELDS = Object.freeze([
+  'fullName',
   'houseNumber',
   'building',
   'floor',
@@ -39,7 +44,8 @@ const EDITABLE_ADDRESS_FIELDS = Object.freeze([
   'country'
 ]);
 
-const FROZEN_CONTACT_FIELDS = Object.freeze(['fullName', 'phone']);
+/** Phone stays frozen; fullName may be corrected by admin before accept. */
+const FROZEN_CONTACT_FIELDS = Object.freeze(['phone']);
 
 function pickEditableAddressPatch(body) {
   const src = body && typeof body === 'object' ? body : {};
@@ -52,6 +58,55 @@ function pickEditableAddressPatch(body) {
   return patch;
 }
 
+/** True when the only editable key present is fullName (shipping-irrelevant). */
+function isNameOnlyAddressPatch(patch) {
+  if (!patch || typeof patch !== 'object') return false;
+  const keys = Object.keys(patch);
+  return keys.length === 1 && keys[0] === 'fullName';
+}
+
+function normalizeRecipientFullName(raw) {
+  const fullName = raw == null ? '' : String(raw).trim();
+  if (!fullName) {
+    throw createEditError(400, 'ADDRESS_VALIDATION_FAILED', 'Full name is required.', {
+      errors: [{ field: 'fullName', code: 'REQUIRED', message: 'Full name is required.' }]
+    });
+  }
+  if (fullName.length < 2) {
+    throw createEditError(
+      400,
+      'ADDRESS_VALIDATION_FAILED',
+      'Full name must be at least 2 characters.',
+      {
+        errors: [
+          {
+            field: 'fullName',
+            code: 'FULL_NAME_TOO_SHORT',
+            message: 'Full name must be at least 2 characters.'
+          }
+        ]
+      }
+    );
+  }
+  if (fullName.length > MAX_FULL_NAME_LEN) {
+    throw createEditError(
+      400,
+      'ADDRESS_VALIDATION_FAILED',
+      `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`,
+      {
+        errors: [
+          {
+            field: 'fullName',
+            code: 'FULL_NAME_TOO_LONG',
+            message: `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`
+          }
+        ]
+      }
+    );
+  }
+  return fullName;
+}
+
 function buildMergedAddressCandidate(snapshot, patch) {
   const snap = snapshot && typeof snapshot === 'object' ? snapshot : {};
   const next = { ...snap };
@@ -60,7 +115,7 @@ function buildMergedAddressCandidate(snapshot, patch) {
       next[key] = patch[key];
     }
   }
-  next.fullName = snap.fullName;
+  // Always keep original phone — never accept phone from client patch.
   next.phone = snap.phone;
   return next;
 }
@@ -81,6 +136,157 @@ function formatAddressLines(addr) {
   ]
     .filter(Boolean)
     .join(', ');
+}
+
+async function maybeUpdateSavedAddressFields({
+  order,
+  orderId,
+  alsoUpdateSavedAddress,
+  fields
+}) {
+  if (!alsoUpdateSavedAddress) return false;
+  try {
+    const addressId = order.address;
+    if (!addressId) return false;
+    const saved = await Address.findById(addressId);
+    if (saved && String(saved.userId) === String(order.userId)) {
+      for (const [key, value] of Object.entries(fields || {})) {
+        saved[key] = value;
+      }
+      await saved.save();
+      return true;
+    }
+    if (saved) {
+      logger.warn('[adminPendingAddressEdit] skipped Address book update — userId mismatch', {
+        orderId,
+        orderUserId: String(order.userId),
+        addressUserId: String(saved.userId)
+      });
+    }
+  } catch (err) {
+    logger.error('[adminPendingAddressEdit] Address book update failed', {
+      orderId,
+      message: err.message
+    });
+  }
+  return false;
+}
+
+/**
+ * Name-only path: mutate addressSnapshot.fullName only.
+ * No shipping reprice, money fields, refunds, or amendment push notifications.
+ */
+async function previewOrApplyNameOnlyEdit({
+  order,
+  orderId,
+  beforeSnap,
+  beforeMoney,
+  nextFullName,
+  alsoUpdateSavedAddress,
+  commit
+}) {
+  const nextSnapshot = {
+    ...beforeSnap,
+    fullName: nextFullName
+  };
+
+  const localQuality = computeLocalAddressQuality(nextSnapshot);
+  const shippingSnapshot =
+    order.shippingSnapshot && typeof order.shippingSnapshot === 'object'
+      ? order.shippingSnapshot
+      : {};
+
+  const preview = {
+    orderId,
+    nameOnly: true,
+    before: {
+      ...beforeMoney,
+      address: formatAddressLines(beforeSnap),
+      contact: {
+        fullName: beforeSnap.fullName || null,
+        phone: beforeSnap.phone || null
+      },
+      contactFrozen: {
+        phone: beforeSnap.phone || null
+      }
+    },
+    after: {
+      subtotal: beforeMoney.subtotal,
+      deliveryCharges: beforeMoney.deliveryCharges,
+      tax: beforeMoney.tax,
+      discount: beforeMoney.discount,
+      totalAmount: beforeMoney.totalAmount,
+      amountPaidInr: beforeMoney.amountPaidInr,
+      balanceDueInr: beforeMoney.balanceDueInr,
+      paymentStatus: beforeMoney.paymentStatus,
+      address: formatAddressLines(nextSnapshot),
+      addressSnapshot: nextSnapshot,
+      contact: {
+        fullName: nextSnapshot.fullName || null,
+        phone: nextSnapshot.phone || null
+      },
+      contactFrozen: {
+        phone: nextSnapshot.phone || null
+      },
+      localAddressQuality: localQuality
+    },
+    refundInr: 0,
+    shipping: {
+      oldDelivery: beforeMoney.deliveryCharges,
+      quotedDelivery: beforeMoney.deliveryCharges,
+      customerDelivery: beforeMoney.deliveryCharges,
+      shippingIncreasedAbsorbed: false,
+      courierName: shippingSnapshot.courierName || null,
+      courierCompanyId: shippingSnapshot.courierCompanyId || null,
+      estimatedDays: shippingSnapshot.estimatedDays || null
+    },
+    alsoUpdateSavedAddress: Boolean(alsoUpdateSavedAddress),
+    commit: false
+  };
+
+  if (!commit) {
+    return { success: true, preview };
+  }
+
+  order.addressSnapshot = nextSnapshot;
+  order.markModified('addressSnapshot');
+
+  order.customerNotes = Array.isArray(order.customerNotes) ? order.customerNotes : [];
+  order.customerNotes.push({
+    kind: 'recipient_name_updated',
+    message: 'Recipient name was corrected by our team for accurate courier labeling.',
+    createdAt: new Date(),
+    metadata: {
+      beforeFullName: beforeSnap.fullName || null,
+      afterFullName: nextFullName,
+      nameOnly: true
+    }
+  });
+  order.markModified('customerNotes');
+
+  await order.save();
+
+  const savedAddressUpdated = await maybeUpdateSavedAddressFields({
+    order,
+    orderId,
+    alsoUpdateSavedAddress,
+    fields: { fullName: nextFullName }
+  });
+
+  return {
+    success: true,
+    orderId,
+    nameOnly: true,
+    refundInr: 0,
+    refundWarning: null,
+    shipping: preview.shipping,
+    addressSnapshot: nextSnapshot,
+    localAddressQuality: localQuality,
+    savedAddressUpdated,
+    paymentStatus: order.paymentStatus,
+    totalAmount: order.totalAmount,
+    deliveryCharges: order.deliveryCharges
+  };
 }
 
 /**
@@ -113,10 +319,27 @@ async function previewOrApplyPendingAddressEdit(opts) {
       : {};
   const beforeMoney = snapshotMoney(order);
 
+  // ——— Name-only: no shipping / money / refund side effects ———
+  if (isNameOnlyAddressPatch(patch)) {
+    const nextFullName = normalizeRecipientFullName(patch.fullName);
+    if (String(beforeSnap.fullName || '').trim() === nextFullName) {
+      throw createEditError(400, 'ADDRESS_PATCH_REQUIRED', 'Recipient name is unchanged.');
+    }
+    return previewOrApplyNameOnlyEdit({
+      order,
+      orderId,
+      beforeSnap,
+      beforeMoney,
+      nextFullName,
+      alsoUpdateSavedAddress: Boolean(opts.alsoUpdateSavedAddress),
+      commit: Boolean(opts.commit)
+    });
+  }
+
   const mergedRaw = buildMergedAddressCandidate(beforeSnap, patch);
   const validated = validatePhysicalAddressForSave({
     ...mergedRaw,
-    fullName: beforeSnap.fullName,
+    // Phone always from existing snapshot (never from admin patch).
     phone: beforeSnap.phone
   });
   if (!validated.ok) {
@@ -128,7 +351,6 @@ async function previewOrApplyPendingAddressEdit(opts) {
   const nextSnapshot = {
     ...beforeSnap,
     ...validated.data,
-    fullName: beforeSnap.fullName,
     phone: String(beforeSnap.phone || '').replace(/\D/g, '').slice(-10) || beforeSnap.phone
   };
 
@@ -147,11 +369,16 @@ async function previewOrApplyPendingAddressEdit(opts) {
 
   const preview = {
     orderId,
+    nameOnly: false,
     before: {
       ...beforeMoney,
       address: formatAddressLines(beforeSnap),
-      contactFrozen: {
+      contact: {
         fullName: beforeSnap.fullName || null,
+        phone: beforeSnap.phone || null
+      },
+      // Back-compat for older clients; phone is the only frozen contact field.
+      contactFrozen: {
         phone: beforeSnap.phone || null
       }
     },
@@ -166,8 +393,11 @@ async function previewOrApplyPendingAddressEdit(opts) {
       paymentStatus: settlement.paymentStatus,
       address: formatAddressLines(nextSnapshot),
       addressSnapshot: nextSnapshot,
-      contactFrozen: {
+      contact: {
         fullName: nextSnapshot.fullName || null,
+        phone: nextSnapshot.phone || null
+      },
+      contactFrozen: {
         phone: nextSnapshot.phone || null
       },
       localAddressQuality: localQuality
@@ -190,7 +420,7 @@ async function previewOrApplyPendingAddressEdit(opts) {
     return { success: true, preview };
   }
 
-  // ——— Commit ———
+  // ——— Commit (street / location change) ———
   order.addressSnapshot = nextSnapshot;
   order.markModified('addressSnapshot');
   order.subtotal = priced.subtotal;
@@ -244,35 +474,18 @@ async function previewOrApplyPendingAddressEdit(opts) {
 
   await order.save();
 
-  let savedAddressUpdated = false;
-  if (opts.alsoUpdateSavedAddress) {
-    try {
-      const addressId = order.address;
-      if (addressId) {
-        const saved = await Address.findById(addressId);
-        if (saved && String(saved.userId) === String(order.userId)) {
-          for (const key of EDITABLE_ADDRESS_FIELDS) {
-            if (Object.prototype.hasOwnProperty.call(validated.data, key)) {
-              saved[key] = validated.data[key];
-            }
-          }
-          await saved.save();
-          savedAddressUpdated = true;
-        } else if (saved) {
-          logger.warn('[adminPendingAddressEdit] skipped Address book update — userId mismatch', {
-            orderId,
-            orderUserId: String(order.userId),
-            addressUserId: String(saved.userId)
-          });
-        }
-      }
-    } catch (err) {
-      logger.error('[adminPendingAddressEdit] Address book update failed', {
-        orderId,
-        message: err.message
-      });
+  const savedFields = {};
+  for (const key of EDITABLE_ADDRESS_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(validated.data, key)) {
+      savedFields[key] = validated.data[key];
     }
   }
+  const savedAddressUpdated = await maybeUpdateSavedAddressFields({
+    order,
+    orderId,
+    alsoUpdateSavedAddress: Boolean(opts.alsoUpdateSavedAddress),
+    fields: savedFields
+  });
 
   try {
     await notifyOrderAmended(order, noteMessage, {
@@ -287,6 +500,7 @@ async function previewOrApplyPendingAddressEdit(opts) {
   return {
     success: true,
     orderId,
+    nameOnly: false,
     refundInr: settlement.refundInr,
     refundWarning: refundOutcome.warning,
     shipping: preview.shipping,
@@ -304,5 +518,7 @@ module.exports = {
   FROZEN_CONTACT_FIELDS,
   previewOrApplyPendingAddressEdit,
   pickEditableAddressPatch,
-  buildMergedAddressCandidate
+  buildMergedAddressCandidate,
+  isNameOnlyAddressPatch,
+  normalizeRecipientFullName
 };

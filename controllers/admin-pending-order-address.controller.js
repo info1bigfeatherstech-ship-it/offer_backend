@@ -101,9 +101,11 @@ exports.applyPendingAddressEdit = async (req, res) => {
     });
     return res.json({
       success: true,
-      message: result.refundInr > 0
-        ? 'Address updated and refund initiated where applicable.'
-        : 'Address updated successfully.',
+      message: result.nameOnly
+        ? 'Recipient name updated. Shipping and order totals were not changed.'
+        : result.refundInr > 0
+          ? 'Address updated and refund initiated where applicable.'
+          : 'Address updated successfully.',
       data: result
     });
   } catch (err) {

@@ -16,7 +16,8 @@ const {
   pickEditableAddressPatch,
   buildMergedAddressCandidate,
   EDITABLE_ADDRESS_FIELDS,
-  FROZEN_CONTACT_FIELDS
+  FROZEN_CONTACT_FIELDS,
+  isNameOnlyAddressPatch
 } = require('../services/adminPendingOrderAddressEdit.service');
 
 function testNormalizeScore() {
@@ -97,21 +98,23 @@ function testLocalQuality() {
 
 function testAddressPatchFreeze() {
   assert.ok(EDITABLE_ADDRESS_FIELDS.includes('postalCode'));
-  assert.ok(FROZEN_CONTACT_FIELDS.includes('fullName'));
+  assert.ok(EDITABLE_ADDRESS_FIELDS.includes('fullName'));
+  assert.ok(!FROZEN_CONTACT_FIELDS.includes('fullName'));
   assert.ok(FROZEN_CONTACT_FIELDS.includes('phone'));
 
   const patch = pickEditableAddressPatch({
     city: 'Pune',
-    fullName: 'Hacker',
+    fullName: 'Corrected Name',
     phone: '1111111111',
     postalCode: '411001'
   });
   assert.strictEqual(patch.city, 'Pune');
   assert.strictEqual(patch.postalCode, '411001');
-  assert.strictEqual(patch.fullName, undefined);
+  assert.strictEqual(patch.fullName, 'Corrected Name');
+  // Phone must never be accepted from the patch body.
   assert.strictEqual(patch.phone, undefined);
 
-  const merged = buildMergedAddressCandidate(
+  const mergedStreetOnly = buildMergedAddressCandidate(
     {
       fullName: 'Real Name',
       phone: '9876543210',
@@ -124,10 +127,27 @@ function testAddressPatchFreeze() {
     },
     { city: 'Pune', postalCode: '411001' }
   );
-  assert.strictEqual(merged.fullName, 'Real Name');
-  assert.strictEqual(merged.phone, '9876543210');
-  assert.strictEqual(merged.city, 'Pune');
-  assert.strictEqual(merged.postalCode, '411001');
+  assert.strictEqual(mergedStreetOnly.fullName, 'Real Name');
+  assert.strictEqual(mergedStreetOnly.phone, '9876543210');
+  assert.strictEqual(mergedStreetOnly.city, 'Pune');
+  assert.strictEqual(mergedStreetOnly.postalCode, '411001');
+
+  const mergedNameFix = buildMergedAddressCandidate(
+    {
+      fullName: 'junk address in name field',
+      phone: '9876543210',
+      city: 'Mumbai',
+      postalCode: '400055'
+    },
+    { fullName: 'Tamanna Walia', phone: '0000000000' }
+  );
+  assert.strictEqual(mergedNameFix.fullName, 'Tamanna Walia');
+  assert.strictEqual(mergedNameFix.phone, '9876543210');
+
+  assert.strictEqual(isNameOnlyAddressPatch({ fullName: 'A' }), true);
+  assert.strictEqual(isNameOnlyAddressPatch({ fullName: 'A', city: 'Pune' }), false);
+  assert.strictEqual(isNameOnlyAddressPatch({ city: 'Pune' }), false);
+  assert.strictEqual(isNameOnlyAddressPatch({}), false);
 }
 
 function run() {
