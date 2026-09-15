@@ -4,22 +4,28 @@
  * when later statuses (e.g. RTO Acknowledged) were synced.
  */
 
+const {
+  resolveShipmentEventTimeRaw,
+  resolveShipmentEventAt
+} = require('./trackingEventTime');
+
 const RTO_DELIVERED_BLOB_RE =
   /rto delivered|return delivered|delivered to seller|delivered to warehouse|rto received at warehouse|rto received|rto complete|returned to seller|shipment rto delivered/i;
 
 const NDR_OR_FAULT_BLOB_RE =
-  /ndr|undelivered|not available|refus|customer not|wrong address|consignee|could not deliver|maximum attempt/i;
+  /ndr|undelivered|not available|not contactable|contactable|refus|customer not|wrong address|consignee|could not deliver|maximum attempt|not reachable/i;
 
 /**
  * @param {object|null|undefined} ev
  * @returns {string}
  */
 function eventFingerprint(ev) {
-  const at = String(ev?.at || ev?.date || ev?.datetime || '').trim();
+  const at = String(resolveShipmentEventTimeRaw(ev) || '').trim();
   const status = String(ev?.status || '').trim().toLowerCase();
   const desc = String(ev?.description || '').trim().toLowerCase();
   const reason = String(ev?.reason || ev?.rto_reason || ev?.remarks || '').trim().toLowerCase();
-  return `${at}|${status}|${desc}|${reason}`;
+  const location = String(ev?.location || '').trim().toLowerCase();
+  return `${at}|${status}|${desc}|${reason}|${location}`;
 }
 
 /**
@@ -56,8 +62,8 @@ function isHighValueTrackingEvent(ev) {
  * @returns {number}
  */
 function eventTimeMs(ev) {
-  const t = Date.parse(String(ev?.at || ev?.date || ev?.datetime || ''));
-  return Number.isFinite(t) ? t : 0;
+  const at = resolveShipmentEventAt(ev);
+  return at ? at.getTime() : 0;
 }
 
 /**

@@ -3491,14 +3491,20 @@ function buildLiveTimelineFromEvents(events, fallbackTimeline) {
     if (!Array.isArray(events) || events.length === 0) {
         return fallbackTimeline;
     }
+    const { resolveShipmentEventAt } = require('../services/shipmentOps/trackingEventTime');
     const normalized = events
-        .map((event) => ({
-            status: event?.status || event?.description || 'Shipment Update',
-            completed: true,
-            timestamp: normalizeShipmentEventTimestamp(event?.at),
-            location: event?.location || null,
-            description: event?.description || null
-        }))
+        .map((event) => {
+            const at =
+                resolveShipmentEventAt(event) ||
+                normalizeShipmentEventTimestamp(event?.at);
+            return {
+                status: event?.status || event?.description || 'Shipment Update',
+                completed: true,
+                timestamp: at,
+                location: event?.location || null,
+                description: event?.description || null
+            };
+        })
         .filter((event) => Boolean(event.timestamp))
         .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 

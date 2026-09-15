@@ -16,13 +16,13 @@ function getMinRefundThreshold() {
 }
 
 const CUSTOMER_RTO_REASON_RE =
-  /refus|unavail|not available|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|customer unavailable|refused to accept/i;
+  /refus|unavail|not available|not contactable|contactable|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|customer unavailable|refused to accept/i;
 const COURIER_RTO_REASON_RE =
   /wrong address|address issue|pincode|pin code|delivery failed|undelivered|could not deliver|oda|out of delivery|non serviceable|nsz|misroute|damaged in transit|maximum attempt|address incomplete|invalid address/i;
 
 /** Mongo $regex strings (Shiprocket providerStatus) */
 const CUSTOMER_RTO_PROVIDER_REGEX =
-  'refus|unavail|not available|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|refused to accept';
+  'refus|unavail|not available|not contactable|contactable|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|refused to accept';
 const COURIER_RTO_PROVIDER_REGEX =
   'wrong address|address issue|pincode|pin code|delivery failed|undelivered|could not deliver|oda|out of delivery|non serviceable|nsz|misroute|damaged in transit|maximum attempt|address incomplete|invalid address';
 
@@ -842,7 +842,7 @@ function isLikelyNdrFaultReason(text) {
   if (!t || isLikelyRtoStatusLabel(t) || isRtoReasonNoise(t)) return false;
   if (CUSTOMER_RTO_REASON_RE.test(t) || COURIER_RTO_REASON_RE.test(t)) return true;
   // Sentence-like carrier remarks under NDR attempts
-  if (/customer|consignee|address|attempt|refused|unavailable|not reachable|wrong|incomplete/i.test(t) && t.length >= 12) {
+  if (/customer|consignee|address|attempt|refused|unavailable|not reachable|not contactable|contactable|wrong|incomplete/i.test(t) && t.length >= 12) {
     return true;
   }
   return false;
@@ -859,6 +859,9 @@ function collectEventReasonCandidates(ev) {
     if (s) out.push(s);
   };
   if (!ev || typeof ev !== 'object') return out;
+  // Shipmozo NDR often only puts the fault in `status` (e.g. "Not Contactable"),
+  // with no separate reason/remarks field.
+  push(ev.status);
   push(ev.reason);
   push(ev.rto_reason);
   push(ev.ndr_reason);
@@ -870,6 +873,7 @@ function collectEventReasonCandidates(ev) {
   push(ev.message);
   const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
   if (raw) {
+    push(raw.status);
     push(raw.reason);
     push(raw.ndr_reason);
     push(raw.rto_reason);
