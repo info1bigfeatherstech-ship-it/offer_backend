@@ -247,6 +247,12 @@ const orderSchema = new mongoose.Schema(
       },
       rtoRefundAmount: { type: Number, default: null },
       rtoRefundId: { type: String, default: null },
+      /** standard = deductions; full_paid_amount = refund amountPaidInr (no-attempt courier RTO) */
+      rtoRefundMode: {
+        type: String,
+        enum: ['standard', 'full_paid_amount', null],
+        default: null
+      },
       rtoRefundedAt: { type: Date, default: null },
       rtoResolvedAt: { type: Date, default: null },
       rtoResolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
