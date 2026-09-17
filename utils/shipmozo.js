@@ -13,6 +13,7 @@ const Product = require('../models/Product');
 const logger = require('./logger');
 const shippingProviderSettingsService = require('../services/shippingProviderSettings.service');
 const { sanitizeCourierConsigneeName } = require('./addressValidation');
+const { parseShipmentEventDate } = require('../services/shipmentOps/trackingEventTime');
 
 const DEFAULT_BASE = 'https://shipping-api.com/app/api/v1';
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -789,6 +790,7 @@ class ShipmozoService {
     }
 
     const refId = String(res.data?.reference_id || res.data?.order_id || order.orderId);
+    const codCollectInr = roundMoney2(Math.max(0, Number(parts.codAmount) || 0));
     return {
       success: true,
       mock: false,
@@ -800,6 +802,7 @@ class ShipmozoService {
       trackingNumber: null,
       courier: null,
       providerStatus: 'PUSHED',
+      codCollectInr,
       raw: res.raw
     };
   }
@@ -942,12 +945,26 @@ class ShipmozoService {
         ? d.scans
         : [];
 
-    const events = scans.map((s) => ({
-      status: s.status || s.current_status || s.scan_status || s.message || '',
-      location: s.location || s.city || '',
-      time: s.time || s.status_time || s.timestamp || s.date || null,
-      raw: s
-    }));
+    const events = scans
+      .filter((s) => s && typeof s === 'object')
+      .map((s) => {
+        const rawTime = s.time || s.status_time || s.timestamp || s.date || null;
+        const at = parseShipmentEventDate(rawTime);
+        const status = String(
+          s.status || s.current_status || s.scan_status || s.message || ''
+        ).trim();
+        return {
+          status: status || 'Update',
+          location: String(s.location || s.city || '').trim() || null,
+          description:
+            String(s.description || s.remark || s.remarks || s.comment || '').trim() || null,
+          // Canonical fields used by timeline / merge / RTO reason resolution
+          time: rawTime,
+          date: rawTime,
+          at: at || undefined,
+          raw: s
+        };
+      });
 
     return {
       success: true,

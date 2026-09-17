@@ -16,13 +16,21 @@ function getMinRefundThreshold() {
 }
 
 const CUSTOMER_RTO_REASON_RE =
-  /refus|unavail|not available|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|customer unavailable|refused to accept/i;
+  /refus|unavail|not available|not contactable|contactable|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|customer unavailable|refused to accept/i;
 const COURIER_RTO_REASON_RE =
   /wrong address|address issue|pincode|pin code|delivery failed|undelivered|could not deliver|oda|out of delivery|non serviceable|nsz|misroute|damaged in transit|maximum attempt|address incomplete|invalid address/i;
 
+/**
+ * Scans / statuses that mean the courier attempted delivery or the customer was
+ * at fault — blocks the admin "Refund full amount" (no-deduction) path.
+ * Pure RTO without OFD / NDR / refuse / unavailable must NOT match.
+ */
+const DELIVERY_ATTEMPT_OR_CUSTOMER_FAULT_RE =
+  /out\s*for\s*delivery|assigned\s*for\s*delivery|\bofd\b|\bndr\b|undelivered|not\s*contactable|not\s*reachable|not\s*available|customer\s*not|unavailable|refus|rejected\s*by\s*customer|consignee\s*refus|did\s*not\s*accept|delivery\s*failed|delivery\s*attempt|maximum\s*attempt|buyer\s*cancel|customer\s*unavailable|refused\s*to\s*accept|could\s*not\s*deliver/i;
+
 /** Mongo $regex strings (Shiprocket providerStatus) */
 const CUSTOMER_RTO_PROVIDER_REGEX =
-  'refus|unavail|not available|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|refused to accept';
+  'refus|unavail|not available|not contactable|contactable|customer not|rejected by customer|buyer cancel|consignee refused|did not accept|not reachable|refused to accept';
 const COURIER_RTO_PROVIDER_REGEX =
   'wrong address|address issue|pincode|pin code|delivery failed|undelivered|could not deliver|oda|out of delivery|non serviceable|nsz|misroute|damaged in transit|maximum attempt|address incomplete|invalid address';
 
@@ -842,7 +850,7 @@ function isLikelyNdrFaultReason(text) {
   if (!t || isLikelyRtoStatusLabel(t) || isRtoReasonNoise(t)) return false;
   if (CUSTOMER_RTO_REASON_RE.test(t) || COURIER_RTO_REASON_RE.test(t)) return true;
   // Sentence-like carrier remarks under NDR attempts
-  if (/customer|consignee|address|attempt|refused|unavailable|not reachable|wrong|incomplete/i.test(t) && t.length >= 12) {
+  if (/customer|consignee|address|attempt|refused|unavailable|not reachable|not contactable|contactable|wrong|incomplete/i.test(t) && t.length >= 12) {
     return true;
   }
   return false;
@@ -859,6 +867,9 @@ function collectEventReasonCandidates(ev) {
     if (s) out.push(s);
   };
   if (!ev || typeof ev !== 'object') return out;
+  // Shipmozo NDR often only puts the fault in `status` (e.g. "Not Contactable"),
+  // with no separate reason/remarks field.
+  push(ev.status);
   push(ev.reason);
   push(ev.rto_reason);
   push(ev.ndr_reason);
@@ -870,6 +881,7 @@ function collectEventReasonCandidates(ev) {
   push(ev.message);
   const raw = ev.raw && typeof ev.raw === 'object' ? ev.raw : null;
   if (raw) {
+    push(raw.status);
     push(raw.reason);
     push(raw.ndr_reason);
     push(raw.rto_reason);
@@ -880,6 +892,159 @@ function collectEventReasonCandidates(ev) {
     push(raw.message);
   }
   return out;
+}
+
+/**
+ * Collect free-text blobs used to decide attempt / customer-fault for full-amount RTO.
+ * @param {import('mongoose').Document|object} order
+ * @returns {string[]}
+ */
+function collectRtoEvidenceTexts(order) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v || '').trim();
+    if (s) out.push(s);
+  };
+  const ri = order?.returnInfo || {};
+  push(order?.shipmentInfo?.providerStatus);
+  push(ri.rtoShiprocketReason);
+  push(ri.rtoRejectionNote);
+  const events = Array.isArray(order?.shipmentInfo?.rawEvents) ? order.shipmentInfo.rawEvents : [];
+  for (const ev of events) {
+    for (const c of collectEventReasonCandidates(ev)) push(c);
+  }
+  return out;
+}
+
+/**
+ * True when tracking / stored reason shows a delivery attempt or customer fault.
+ * Used to hide "Refund full amount" and keep the standard deduction refund path.
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean}
+ */
+function orderHasDeliveryAttemptOrCustomerFault(order) {
+  try {
+    const ri = order?.returnInfo || {};
+    if (String(ri.rtoReasonCategory || '').toLowerCase() === 'customer') {
+      return true;
+    }
+    for (const text of collectRtoEvidenceTexts(order)) {
+      if (DELIVERY_ATTEMPT_OR_CUSTOMER_FAULT_RE.test(text)) return true;
+      if (CUSTOMER_RTO_REASON_RE.test(text)) return true;
+    }
+    return false;
+  } catch (_) {
+    // Fail closed: treat as attempt/fault so we never auto-offer full refund on parse errors.
+    return true;
+  }
+}
+
+/**
+ * Courier silent RTO: warehouse RTO with no OFD / NDR / refuse / unavailable evidence.
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean}
+ */
+function isCourierNoAttemptRto(order) {
+  return !orderHasDeliveryAttemptOrCustomerFault(order);
+}
+
+/**
+ * Refund the amount the customer actually paid online — zero shipping/platform deductions.
+ * Allowed for full_paid and partial_paid online; blocked for COD.
+ * @param {import('mongoose').Document|object} order
+ * @returns {object}
+ */
+function calculateFullPaidAmountRtoRefund(order) {
+  const method = String(order?.paymentInfo?.method || '').toLowerCase();
+  const paymentType = classifyRtoPaymentType(order);
+  const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
+  const alreadyRefundedInr = roundMoney2(
+    (order?.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
+  );
+  const remainingPaidInr = roundMoney2(Math.max(0, paidInr - alreadyRefundedInr));
+
+  const deductions = {
+    forwardShipping: 0,
+    rtoShipping: 0,
+    platformFee: 0,
+    platformFeePercent: 0,
+    orderTotal: getRtoOrderTotal(order),
+    cartValue: roundMoney2(Number(order?.subtotal) || 0)
+  };
+
+  const buildBlocked = (reason, extra = {}) => ({
+    eligible: false,
+    reason,
+    refundMode: 'full_paid_amount',
+    cartValue: deductions.cartValue,
+    orderTotal: deductions.orderTotal,
+    minGateAmount: getOrderAmountForRtoMinGate(order),
+    deductions,
+    totalDeductions: 0,
+    netRefund: 0,
+    maxRefundableInr: 0,
+    amountPaidInr: paidInr,
+    alreadyRefundedInr,
+    minOrderValue: getMinOrderValueForRefund(),
+    minRefundThreshold: 0,
+    ...extra
+  });
+
+  if (method === 'cod' || paymentType.key === 'cod') {
+    return buildBlocked('cod_no_refund');
+  }
+  if (method !== 'online' && method !== 'prepaid') {
+    return buildBlocked('unsupported_payment_method');
+  }
+  if (paidInr <= 0.01) {
+    return buildBlocked('no_online_amount_paid');
+  }
+  if (remainingPaidInr <= 0.01) {
+    return buildBlocked('already_fully_refunded', { netRefund: 0, maxRefundableInr: 0 });
+  }
+  if (!isCourierNoAttemptRto(order)) {
+    return buildBlocked('delivery_attempt_or_customer_fault');
+  }
+
+  return {
+    eligible: true,
+    reason: 'full_paid_amount_no_attempt',
+    refundMode: 'full_paid_amount',
+    cartValue: deductions.cartValue,
+    orderTotal: deductions.orderTotal,
+    minGateAmount: getOrderAmountForRtoMinGate(order),
+    deductions,
+    totalDeductions: 0,
+    netRefund: remainingPaidInr,
+    maxRefundableInr: remainingPaidInr,
+    amountPaidInr: paidInr,
+    alreadyRefundedInr,
+    minOrderValue: getMinOrderValueForRefund(),
+    minRefundThreshold: 0
+  };
+}
+
+/**
+ * Whether admin may offer "Refund full amount" (Razorpay of amountPaidInr).
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean}
+ */
+function canOfferFullPaidAmountRtoRefund(order) {
+  try {
+    if (!isRtoWarehouseDeliveredForOrder(order)) return false;
+    if (hasRtoRefundBeenInitiated(order)) return false;
+    const ri = order?.returnInfo || {};
+    const st = String(ri.rtoStatus || 'pending').trim().toLowerCase();
+    if (ri.rtoRejectedAt) return false;
+    if (['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(st)) {
+      return false;
+    }
+    if (!order?.paymentInfo?.razorpayPaymentId) return false;
+    const calc = calculateFullPaidAmountRtoRefund(order);
+    return Boolean(calc.eligible && calc.maxRefundableInr > 0.01);
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -1167,6 +1332,10 @@ function hasRtoRefundBeenInitiated(order) {
 module.exports = {
   calculatePlatformFee,
   calculateRtoRefund,
+  calculateFullPaidAmountRtoRefund,
+  canOfferFullPaidAmountRtoRefund,
+  orderHasDeliveryAttemptOrCustomerFault,
+  isCourierNoAttemptRto,
   getRtoOrderTotal,
   getOrderAmountForRtoMinGate,
   getMinOrderValueForRefund,
@@ -1203,5 +1372,6 @@ module.exports = {
   buildCustomerRtoSectionMatch,
   buildCourierRtoSectionMatch,
   CUSTOMER_RTO_REASON_RE,
-  COURIER_RTO_REASON_RE
+  COURIER_RTO_REASON_RE,
+  DELIVERY_ATTEMPT_OR_CUSTOMER_FAULT_RE
 };

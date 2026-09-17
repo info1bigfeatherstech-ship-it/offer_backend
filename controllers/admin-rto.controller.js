@@ -18,6 +18,9 @@ const {
 } = require('../services/adminOrderDashboard.service');
 const {
   calculateRtoRefund,
+  calculateFullPaidAmountRtoRefund,
+  canOfferFullPaidAmountRtoRefund,
+  isCourierNoAttemptRto,
   classifyRtoReasonCategory,
   mapShiprocketRtoStage,
   isRtoWarehouseDeliveredForOrder,
@@ -133,6 +136,8 @@ async function applyRtoRefundEntryToOrder(order, refundEntity, adminUserId, calc
   const amountPaise = Number(refundEntity.amount);
   if (!Number.isFinite(amountPaise) || amountPaise <= 0) return;
   const amountInr = roundMoney2(amountPaise / 100);
+  const refundMode =
+    calc?.refundMode === 'full_paid_amount' ? 'full_paid_amount' : 'standard';
 
   const entry = {
     refundId: refundEntity.id,
@@ -151,7 +156,15 @@ async function applyRtoRefundEntryToOrder(order, refundEntity, adminUserId, calc
   const totalRefundedInr = roundMoney2(
     (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
   );
-  if (totalRefundedInr >= roundMoney2(order.totalAmount)) {
+  const paidCap = roundMoney2(Number(order.amountPaidInr) || Number(order.totalAmount) || 0);
+  if (refundMode === 'full_paid_amount') {
+    // Full-amount path refunds what was paid online (incl. partial paid).
+    if (totalRefundedInr + 0.005 >= paidCap) {
+      order.paymentStatus = 'refunded';
+    } else if (totalRefundedInr > 0) {
+      order.paymentStatus = 'partially_refunded';
+    }
+  } else if (totalRefundedInr >= roundMoney2(order.totalAmount)) {
     order.paymentStatus = 'refunded';
   } else if (totalRefundedInr > 0) {
     order.paymentStatus = 'partially_refunded';
@@ -165,6 +178,7 @@ async function applyRtoRefundEntryToOrder(order, refundEntity, adminUserId, calc
     refundInitiatedAt: ri.refundInitiatedAt || new Date(),
     rtoRefundId: entry.refundId,
     rtoRefundAmount: amountInr,
+    rtoRefundMode: refundMode,
     rtoDeductions: calc?.deductions || ri.rtoDeductions,
     rtoStatus:
       String(entry.status || '').toLowerCase() === 'failed' ? 'refund_failed' : ri.rtoStatus || 'pending',
@@ -181,9 +195,16 @@ async function applyRtoRefundEntryToOrder(order, refundEntity, adminUserId, calc
 
   appendRtoHistory(order, {
     action: 'refund_initiated',
-    note: `Razorpay refund ${entry.refundId} for ₹${amountInr}`,
+    note: `Razorpay refund ${entry.refundId} for ₹${amountInr}${
+      refundMode === 'full_paid_amount' ? ' (full paid amount, no deductions)' : ''
+    }`,
     performedBy: adminUserId,
-    metadata: { refundId: entry.refundId, amountInr, deductions: calc?.deductions }
+    metadata: {
+      refundId: entry.refundId,
+      amountInr,
+      refundMode,
+      deductions: calc?.deductions
+    }
   });
 
   await order.save();
@@ -281,6 +302,9 @@ function mapRtoOrderRow(order) {
   const base = mapOrderRow(o);
   const ri = o.returnInfo || {};
   const calc = calculateRtoRefund(o);
+  const fullAmountCalc = calculateFullPaidAmountRtoRefund(o);
+  const canFullAmountRefund = canOfferFullPaidAmountRtoRefund(o);
+  const courierNoAttempt = isCourierNoAttemptRto(o);
   const providerStatus = o.shipmentInfo?.providerStatus || null;
   const reasonCategory =
     o.returnInfo?.rtoReasonCategory || classifyRtoReasonCategory(providerStatus);
@@ -292,8 +316,8 @@ function mapRtoOrderRow(order) {
   const adminActionRequired =
     warehouseDelivered &&
     rtoStatus === 'pending' &&
-    paymentType.refundAllowed &&
-    calc.eligible;
+    !hasRtoRefundBeenInitiated(o) &&
+    ((paymentType.refundAllowed && calc.eligible) || canFullAmountRefund);
   const displayReason = resolveRtoDisplayReason(o);
 
   const customerName =
@@ -357,9 +381,11 @@ function mapRtoOrderRow(order) {
           : 'Unclassified',
     returnedAt: o.shipmentInfo?.deliveredAt || o.shipmentInfo?.lastSyncAt || o.updatedAt,
     refundCalculation: calc,
+    fullAmountRefundCalculation: fullAmountCalc,
     rtoDeductions: ri.rtoDeductions?.platformFee != null ? ri.rtoDeductions : calc.deductions,
     rtoRefundAmount: ri.rtoRefundAmount ?? null,
     rtoRefundId: ri.rtoRefundId || null,
+    rtoRefundMode: ri.rtoRefundMode || null,
     rtoRefundedAt: ri.rtoRefundedAt || null,
     rtoRejectedAt: ri.rtoRejectedAt || null,
     rtoRejectionNote: ri.rtoRejectionNote || null,
@@ -368,16 +394,24 @@ function mapRtoOrderRow(order) {
     refundTrackStatus: refundTrack,
     paymentType,
     warehouseDelivered,
+    courierNoAttempt,
+    /** Standard deduction refund — hidden when silent courier no-attempt full-amount path applies. */
     canRefund:
       calc.eligible &&
       warehouseDelivered &&
+      !canFullAmountRefund &&
       ['pending', null].includes(rtoStatus) &&
       !ri.rtoRejectedAt &&
       !hasRtoRefundBeenInitiated(o),
-    /** Deny refund only when a Razorpay refund was otherwise possible (eligible). */
+    /**
+     * No-attempt courier RTO: refund amountPaidInr with zero deductions
+     * (full_paid + partial_paid online).
+     */
+    canFullAmountRefund,
+    fullAmountRefundInr: canFullAmountRefund ? fullAmountCalc.maxRefundableInr : 0,
+    /** Deny when a Razorpay refund is otherwise possible (standard or full-amount). */
     canReject:
-      calc.eligible &&
-      paymentType.refundAllowed &&
+      ((calc.eligible && paymentType.refundAllowed) || canFullAmountRefund) &&
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
       !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
@@ -385,8 +419,9 @@ function mapRtoOrderRow(order) {
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
       !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
-    refundBlockedReason:
-      calc.eligible && !warehouseDelivered
+    refundBlockedReason: canFullAmountRefund
+      ? null
+      : calc.eligible && !warehouseDelivered
         ? 'Waiting for Shiprocket RTO Delivered to warehouse'
         : !calc.eligible
           ? paymentType.key === 'partial_paid'
@@ -617,13 +652,19 @@ exports.getRtoOrders = async (req, res) => {
 
 /**
  * POST /api/admin/rto/refund
+ * Body: { orderId, rtoShippingOverride?, refundMode?: 'standard' | 'full_paid_amount' }
  */
 exports.processRtoRefund = async (req, res) => {
   try {
-    const { orderId, rtoShippingOverride } = req.body || {};
+    const { orderId, rtoShippingOverride, refundMode: refundModeRaw } = req.body || {};
     if (!orderId) {
       throw createHttpError(400, 'ORDER_ID_REQUIRED', 'orderId is required');
     }
+
+    const refundMode =
+      String(refundModeRaw || 'standard').trim().toLowerCase() === 'full_paid_amount'
+        ? 'full_paid_amount'
+        : 'standard';
 
     const scopeMatch = req.adminScope?.orderMatch || {};
     const order = await findRtoOrderOrThrow(orderId, scopeMatch);
@@ -643,29 +684,6 @@ exports.processRtoRefund = async (req, res) => {
       throw createHttpError(400, 'RTO_REFUND_ALREADY_INITIATED', 'RTO refund already initiated for this order');
     }
 
-    try {
-      await syncRtoFreightChargeFromShiprocket(order, { persist: true });
-    } catch (_) {
-      /* non-blocking — calc still uses whatever is on the order */
-    }
-
-    const calc = calculateRtoRefund(order, { rtoShippingOverride });
-    if (!calc.eligible || calc.maxRefundableInr <= 0) {
-      throw createHttpError(
-        400,
-        'RTO_REFUND_NOT_ELIGIBLE',
-        calc.reason === 'cod_no_refund'
-          ? 'COD orders are not eligible for refund. Close the case instead.'
-          : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
-            ? 'Partial payment orders are not eligible for refund. Close the case instead.'
-            : calc.reason === 'order_below_min_value'
-              ? `Order ₹${roundMoney2(Number(calc.minGateAmount) || Number(calc.orderTotal) || 0)} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
-              : calc.reason === 'refund_below_min_threshold'
-                ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
-                : 'This order is not eligible for RTO refund.'
-      );
-    }
-
     if (!isRtoWarehouseDeliveredForOrder(order)) {
       throw createHttpError(
         403,
@@ -675,31 +693,117 @@ exports.processRtoRefund = async (req, res) => {
     }
     persistRtoTrackingInsights(order);
 
+    let calc;
+    if (refundMode === 'full_paid_amount') {
+      calc = calculateFullPaidAmountRtoRefund(order);
+      if (!calc.eligible || calc.maxRefundableInr <= 0) {
+        throw createHttpError(
+          400,
+          'RTO_FULL_AMOUNT_NOT_ELIGIBLE',
+          calc.reason === 'cod_no_refund'
+            ? 'COD orders are not eligible for refund. Close the case instead.'
+            : calc.reason === 'delivery_attempt_or_customer_fault'
+              ? 'Tracking shows a delivery attempt or customer fault — use the standard refund path instead.'
+              : calc.reason === 'already_fully_refunded'
+                ? 'This order has already been fully refunded for the amount paid.'
+                : calc.reason === 'no_online_amount_paid'
+                  ? 'No online amount paid to refund.'
+                  : 'This order is not eligible for a full paid-amount refund.'
+        );
+      }
+      if (!canOfferFullPaidAmountRtoRefund(order)) {
+        throw createHttpError(
+          400,
+          'RTO_FULL_AMOUNT_NOT_ELIGIBLE',
+          'Full paid-amount refund is not available for this order right now.'
+        );
+      }
+    } else {
+      try {
+        await syncRtoFreightChargeFromShiprocket(order, { persist: true });
+      } catch (_) {
+        /* non-blocking — calc still uses whatever is on the order */
+      }
+
+      // Silent courier no-attempt RTOs must use full_paid_amount, not deducted standard.
+      if (canOfferFullPaidAmountRtoRefund(order)) {
+        throw createHttpError(
+          400,
+          'USE_FULL_PAID_AMOUNT_REFUND',
+          'No delivery attempt found on tracking — use “Refund full amount” for this order.'
+        );
+      }
+
+      calc = calculateRtoRefund(order, { rtoShippingOverride });
+      if (!calc.eligible || calc.maxRefundableInr <= 0) {
+        throw createHttpError(
+          400,
+          'RTO_REFUND_NOT_ELIGIBLE',
+          calc.reason === 'cod_no_refund'
+            ? 'COD orders are not eligible for refund. Close the case instead.'
+            : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
+              ? 'Partial payment orders are not eligible for refund. Close the case instead.'
+              : calc.reason === 'order_below_min_value'
+                ? `Order ₹${roundMoney2(Number(calc.minGateAmount) || Number(calc.orderTotal) || 0)} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
+                : calc.reason === 'refund_below_min_threshold'
+                  ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
+                  : 'This order is not eligible for RTO refund.'
+        );
+      }
+      calc = { ...calc, refundMode: 'standard' };
+    }
+
     if (!order.paymentInfo?.razorpayPaymentId) {
       throw createHttpError(400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment on this order');
     }
 
     const refundInr = calc.maxRefundableInr;
     const paise = Math.round(refundInr * 100);
-    const refund = await razorpay.payments.refund(order.paymentInfo.razorpayPaymentId, {
-      amount: paise,
-      speed: 'normal',
-      notes: {
+    if (!Number.isFinite(paise) || paise < 100) {
+      throw createHttpError(400, 'RTO_REFUND_AMOUNT_INVALID', 'Refund amount must be at least ₹1');
+    }
+
+    const refundReason =
+      refundMode === 'full_paid_amount' ? 'rto_refund_full_paid_amount' : 'rto_refund';
+
+    let refund;
+    try {
+      refund = await razorpay.payments.refund(order.paymentInfo.razorpayPaymentId, {
+        amount: paise,
+        speed: 'normal',
+        notes: {
+          orderId: order.orderId,
+          reason: refundReason,
+          refundMode
+        }
+      });
+    } catch (rzErr) {
+      logger.error('[admin-rto] Razorpay refund failed', {
         orderId: order.orderId,
-        reason: 'rto_refund'
-      }
-    });
+        refundMode,
+        message: rzErr?.message || String(rzErr)
+      });
+      throw createHttpError(
+        502,
+        'RAZORPAY_REFUND_FAILED',
+        rzErr?.error?.description || rzErr?.message || 'Razorpay refund failed'
+      );
+    }
 
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
       rtoStatus: 'pending',
       rtoDeductions: calc.deductions,
       rtoRefundAmount: refundInr,
       rtoRefundId: refund.id,
+      rtoRefundMode: refundMode,
       refundInitiatedAt: new Date(),
       rtoRefundError: null
     });
 
-    await applyRtoRefundEntryToOrder(order, refund, req.user?.id || req.user?._id, calc);
+    await applyRtoRefundEntryToOrder(order, refund, req.user?.id || req.user?._id, {
+      ...calc,
+      refundMode
+    });
 
     try {
       await notifyRefundInitiated(order, refundInr);
@@ -712,15 +816,22 @@ exports.processRtoRefund = async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'RTO refund initiated successfully',
+      message:
+        refundMode === 'full_paid_amount'
+          ? 'Full paid-amount RTO refund initiated successfully'
+          : 'RTO refund initiated successfully',
       data: {
         orderId: order.orderId,
+        refundMode,
         refund: {
           id: order.returnInfo?.rtoRefundId,
           amountInr: order.returnInfo?.rtoRefundAmount,
           status: deriveRefundTrackStatus(order)
         },
-        calculation: calculateRtoRefund(order)
+        calculation:
+          refundMode === 'full_paid_amount'
+            ? calculateFullPaidAmountRtoRefund(order)
+            : calculateRtoRefund(order)
       }
     });
   } catch (err) {
@@ -924,6 +1035,15 @@ exports.bulkRtoAction = async (req, res) => {
               success: false,
               code: 'RTO_WAREHOUSE_PENDING',
               message: 'RTO not yet delivered to warehouse'
+            });
+            continue;
+          }
+          if (canOfferFullPaidAmountRtoRefund(order)) {
+            results.push({
+              orderId,
+              success: false,
+              code: 'USE_FULL_PAID_AMOUNT_REFUND',
+              message: 'No delivery attempt — use “Refund full amount” on this order (bulk standard refund skipped)'
             });
             continue;
           }

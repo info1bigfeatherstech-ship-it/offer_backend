@@ -179,7 +179,19 @@ const orderSchema = new mongoose.Schema(
       addressScoreSyncedAt: { type: Date, default: null },
       /** Shiprocket RTO reverse freight (₹), when known from billing/shipment APIs */
       rtoFreightCharge: { type: Number, default: null },
-      rtoFreightSyncedAt: { type: Date, default: null }
+      rtoFreightSyncedAt: { type: Date, default: null },
+      /**
+       * COD / collectable amount sent to Shipmozo or Shiprocket at push time.
+       * Once set, customer UI + collectable labels must use this (not live balanceDue).
+       * 0 means prepaid / nothing to collect at door.
+       */
+      courierCollectableInr: { type: Number, default: null },
+      /** Delivery ₹ frozen at courier push — customer UI / label; admin may still update live deliveryCharges */
+      courierDeliveryInr: { type: Number, default: null },
+      /** totalAmount frozen at push for customer-facing totals alignment */
+      courierFacingTotalInr: { type: Number, default: null },
+      codLockedAt: { type: Date, default: null },
+      codLockSource: { type: String, default: null }
     },
 
     /** Cached shipment ops view (list/detail actions + provider state classification) */
@@ -247,6 +259,12 @@ const orderSchema = new mongoose.Schema(
       },
       rtoRefundAmount: { type: Number, default: null },
       rtoRefundId: { type: String, default: null },
+      /** standard = deductions; full_paid_amount = refund amountPaidInr (no-attempt courier RTO) */
+      rtoRefundMode: {
+        type: String,
+        enum: ['standard', 'full_paid_amount', null],
+        default: null
+      },
       rtoRefundedAt: { type: Date, default: null },
       rtoResolvedAt: { type: Date, default: null },
       rtoResolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
