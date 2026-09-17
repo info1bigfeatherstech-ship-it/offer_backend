@@ -110,12 +110,51 @@ function paymentAndCollectable(order) {
   const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
   if (balanceDue > unpaidInr + 0.005) balanceDue = unpaidInr;
   const useCodAtDoor = payMethod === 'cod' || (balanceViaCod && balanceDue > 0.005);
-  const collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
+
+  // After courier push, collectable on label must match locked COD (Shipmozo Manual Amount).
+  let collectable = 0;
+  let collectableLocked = false;
+  let shippingCharges = roundMoney2(Number(order?.deliveryCharges) || 0);
+  let orderTotalDisplay = totalInr;
+  try {
+    const {
+      hasCourierCollectableLock,
+      getCustomerFacingCollectableInr,
+      getCustomerFacingDeliveryInr,
+      getCustomerFacingOrderTotalInr
+    } = require('./courierCollectableLock.service');
+    if (hasCourierCollectableLock(order)) {
+      collectable = getCustomerFacingCollectableInr(order);
+      collectableLocked = true;
+      shippingCharges = getCustomerFacingDeliveryInr(order);
+      orderTotalDisplay = getCustomerFacingOrderTotalInr(order);
+    } else {
+      collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
+    }
+  } catch (_) {
+    collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
+  }
+
+  const paymentMode =
+    collectableLocked
+      ? collectable > 0.005
+        ? 'COD'
+        : 'PREPAID'
+      : useCodAtDoor
+        ? 'COD'
+        : 'PREPAID';
+
   return {
-    paymentMode: useCodAtDoor ? 'COD' : 'PREPAID',
+    paymentMode,
     collectable,
-    orderTotal: totalInr,
-    shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0)
+    collectableLocked,
+    /** Internal settlement due (may differ after Ship Now freight settle). */
+    internalBalanceDueInr: balanceDue,
+    orderTotal: orderTotalDisplay,
+    /** Live admin total (post Ship Now) when locked. */
+    internalOrderTotalInr: totalInr,
+    shippingCharges,
+    internalShippingChargesInr: roundMoney2(Number(order?.deliveryCharges) || 0)
   };
 }
 
@@ -315,6 +354,8 @@ async function buildLabelViewModel(order, settingsPatch) {
     shipToPhone: customerPhone(addr),
     paymentMode: pay.paymentMode,
     collectable: pay.collectable,
+    collectableLocked: Boolean(pay.collectableLocked),
+    internalBalanceDueInr: pay.internalBalanceDueInr,
     orderTotal: pay.orderTotal,
     shippingCharges: pay.shippingCharges,
     dimensionText: pack.dimensionText,

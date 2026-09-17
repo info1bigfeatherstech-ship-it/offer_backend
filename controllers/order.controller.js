@@ -38,6 +38,10 @@ const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service'
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
+    resolveLockAmountFromShipmentResult,
+    buildCourierLockShipmentPayloadFields
+} = require('../services/courierCollectableLock.service');
+const {
     buildShippingWeightSnapshotFromCheckoutLines,
     buildShippingWeightSnapshotFromOrderItems,
     enrichShippingWeightSnapshotDims
@@ -663,6 +667,70 @@ async function upsertShipmentInfo({
         nextShipmentInfo.fulfillmentArtifactAwb = nextAwb || null;
     }
 
+    // Preserve existing COD / customer-facing money lock on every upsert.
+    if (
+        prevSi.courierCollectableInr != null &&
+        Number.isFinite(Number(prevSi.courierCollectableInr))
+    ) {
+        nextShipmentInfo.courierCollectableInr = Number(prevSi.courierCollectableInr);
+        if (prevSi.codLockedAt) nextShipmentInfo.codLockedAt = prevSi.codLockedAt;
+        if (prevSi.codLockSource) nextShipmentInfo.codLockSource = prevSi.codLockSource;
+    }
+    if (
+        prevSi.courierDeliveryInr != null &&
+        Number.isFinite(Number(prevSi.courierDeliveryInr))
+    ) {
+        nextShipmentInfo.courierDeliveryInr = Number(prevSi.courierDeliveryInr);
+    }
+    if (
+        prevSi.courierFacingTotalInr != null &&
+        Number.isFinite(Number(prevSi.courierFacingTotalInr))
+    ) {
+        nextShipmentInfo.courierFacingTotalInr = Number(prevSi.courierFacingTotalInr);
+    }
+
+    // First-time lock from createShipment payload (do not overwrite existing).
+    if (
+        Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierCollectableInr') &&
+        !(
+            nextShipmentInfo.courierCollectableInr != null &&
+            Number.isFinite(Number(nextShipmentInfo.courierCollectableInr))
+        )
+    ) {
+        const lockAmt = Number(shipmentPayload.courierCollectableInr);
+        if (Number.isFinite(lockAmt) && lockAmt >= 0) {
+            nextShipmentInfo.courierCollectableInr = roundMoney2(lockAmt);
+            nextShipmentInfo.codLockedAt = new Date();
+            nextShipmentInfo.codLockSource = String(
+                shipmentPayload.codLockSource || trigger || 'courier_push'
+            ).slice(0, 64);
+        }
+    }
+    if (
+        Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierDeliveryInr') &&
+        !(
+            nextShipmentInfo.courierDeliveryInr != null &&
+            Number.isFinite(Number(nextShipmentInfo.courierDeliveryInr))
+        )
+    ) {
+        const d = Number(shipmentPayload.courierDeliveryInr);
+        if (Number.isFinite(d) && d >= 0) {
+            nextShipmentInfo.courierDeliveryInr = roundMoney2(d);
+        }
+    }
+    if (
+        Object.prototype.hasOwnProperty.call(shipmentPayload, 'courierFacingTotalInr') &&
+        !(
+            nextShipmentInfo.courierFacingTotalInr != null &&
+            Number.isFinite(Number(nextShipmentInfo.courierFacingTotalInr))
+        )
+    ) {
+        const t = Number(shipmentPayload.courierFacingTotalInr);
+        if (Number.isFinite(t) && t >= 0) {
+            nextShipmentInfo.courierFacingTotalInr = roundMoney2(t);
+        }
+    }
+
     order.shipmentInfo = nextShipmentInfo;
     order.markModified('shipmentInfo');
     await order.save();
@@ -752,12 +820,16 @@ async function ensureShipmentForOrder({ order, trigger }) {
             };
         }
 
+        const lockAmount = resolveLockAmountFromShipmentResult(order, result);
+        const lockFields = buildCourierLockShipmentPayloadFields(order, result, 'shipmozo_push');
         await upsertShipmentInfo({
             order,
             shipmentPayload: {
                 ...result,
                 provider: SHIPPING_PROVIDERS.SHIPMOZO,
-                providerStatus: result.providerStatus || 'PUSHED'
+                providerStatus: result.providerStatus || 'PUSHED',
+                ...lockFields,
+                courierCollectableInr: lockAmount
             },
             trigger,
             allowOrderStatusUpdate: false
@@ -844,7 +916,12 @@ async function ensureShipmentForOrder({ order, trigger }) {
             ...result,
             provider: SHIPPING_PROVIDERS.SHIPROCKET,
             // Do NOT force a "shipped-like" status here; let Shiprocket/tracking drive state.
-            providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null)
+            providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null),
+            ...buildCourierLockShipmentPayloadFields(
+                order,
+                result,
+                result?.mock ? 'shiprocket_mock_push' : 'shiprocket_push'
+            )
         },
         trigger,
         // Advance orderStatus from carrier only when AWB exists (shipment_id alone = still "invoiced").
@@ -3083,7 +3160,7 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo items removedItemsArchive returnInfo refundHistory addressSnapshot storefront'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();

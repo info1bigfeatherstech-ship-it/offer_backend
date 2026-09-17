@@ -709,11 +709,18 @@ class ShiprocketService {
    */
   async createShipment(order) {
     if (!this.enabled) {
+      const liveCod = roundMoney2(Math.max(0, Number(order?.balanceDueInr) || 0));
+      const method = String(order?.paymentInfo?.method || '').toLowerCase();
+      const collect =
+        method === 'cod'
+          ? roundMoney2(Number(order?.totalAmount) || 0)
+          : liveCod;
       return {
         success: true,
         mock: true,
         trackingNumber: `MOCK-${order.orderId}`,
-        courier: 'Mock Courier'
+        courier: 'Mock Courier',
+        codCollectInr: collect
       };
     }
 
@@ -799,6 +806,16 @@ class ShiprocketService {
         providerStatus: data.status || null,
         raw: data,
         adhocPayloadDebug,
+        codCollectInr: roundMoney2(
+          Math.max(
+            0,
+            Number(
+              payload.cod_amount != null && payload.cod_amount !== ''
+                ? payload.cod_amount
+                : 0
+            ) || 0
+          )
+        ),
         mock: false
       };
     } catch (err) {

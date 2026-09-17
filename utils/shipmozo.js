@@ -790,6 +790,7 @@ class ShipmozoService {
     }
 
     const refId = String(res.data?.reference_id || res.data?.order_id || order.orderId);
+    const codCollectInr = roundMoney2(Math.max(0, Number(parts.codAmount) || 0));
     return {
       success: true,
       mock: false,
@@ -801,6 +802,7 @@ class ShipmozoService {
       trackingNumber: null,
       courier: null,
       providerStatus: 'PUSHED',
+      codCollectInr,
       raw: res.raw
     };
   }

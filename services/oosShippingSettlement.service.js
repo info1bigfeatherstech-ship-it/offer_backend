@@ -748,9 +748,26 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
     const noteMsg =
       math.refundInr > 0.005
         ? `Your order was updated after courier assignment. A refund of ₹${math.refundInr.toFixed(2)} has been processed.`
-        : math.balanceDueInr > 0.005
-          ? `Your order was updated after courier assignment. Balance due is now ₹${math.balanceDueInr.toFixed(2)}.`
-          : `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+        : (() => {
+            try {
+              const {
+                hasCourierCollectableLock,
+                getLockedCourierCollectableInr
+              } = require('./courierCollectableLock.service');
+              if (hasCourierCollectableLock(order)) {
+                const locked = getLockedCourierCollectableInr(order);
+                // Do not tell the customer a new COD — courier collectable was locked at push.
+                return locked > 0.005
+                  ? `Your order shipping was updated after courier assignment. Amount to pay the courier remains ₹${locked.toFixed(2)}.`
+                  : `Your order shipping was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+              }
+            } catch (_) {
+              /* fall through */
+            }
+            return math.balanceDueInr > 0.005
+              ? `Your order was updated after courier assignment. Balance due is now ₹${math.balanceDueInr.toFixed(2)}.`
+              : `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+          })();
 
     try {
       const noteOrder = await Order.findById(order._id);
