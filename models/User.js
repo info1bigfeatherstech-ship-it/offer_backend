@@ -192,6 +192,7 @@ const userSchema = new mongoose.Schema(
         "order_manager",
         "marketing_manager",
         "inventory_manager",
+        "packing_viewer",
         "wholesaler"
       ],
       default: "user"

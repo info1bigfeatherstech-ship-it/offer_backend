@@ -59,7 +59,17 @@ router.get('/items/:orderId/invoice', verifyToken, requireWholesaleUserForWholes
  * missing header → ecomm default, or single allowedStorefronts entry (wholesale-only staff).
  * Does not break live ecomm admin if x-storefront is omitted on these paths.
  */
-const adminOrderStaff = [verifyToken, authorizeRoles('admin', 'order_manager'), requireAdminStorefrontScope];
+const adminOrderStaff = [
+  verifyToken,
+  authorizeRoles('admin', 'order_manager'),
+  requireAdminStorefrontScope
+];
+/** Read-only packing queue + shipping label download. */
+const adminOrderPackingRead = [
+  verifyToken,
+  authorizeRoles('admin', 'order_manager', 'packing_viewer'),
+  requireAdminStorefrontScope
+];
 const adminOrderRefund = [verifyToken, authorizeRoles('admin'), requireAdminStorefrontScope];
 
 router.post('/admin/items/:orderId/refund', ...adminOrderRefund, refundOrderPayment);
@@ -193,13 +203,13 @@ router.post(
 
 router.post(
   '/admin/items/:orderId/fulfillment/shipping-label',
-  ...adminOrderStaff,
+  ...adminOrderPackingRead,
   adminFulfillment.adminFulfillmentShippingLabel
 );
 
 router.get(
   '/admin/items/:orderId/fulfillment/shipping-label-file',
-  ...adminOrderStaff,
+  ...adminOrderPackingRead,
   adminFulfillment.adminFulfillmentShippingLabelFile
 );
 

@@ -2961,6 +2961,26 @@ exports.getOrder = async (req, res) => {
             return buildUnauthorizedOrderResponse(res);
         }
 
+        try {
+            const {
+                isPackingViewerRequest,
+                isPackingViewerDetailVisibleOrder
+            } = require('../utils/adminOrderRoles');
+            if (isPackingViewerRequest(req) && !isPackingViewerDetailVisibleOrder(order)) {
+                return respondOrderError(
+                    res,
+                    403,
+                    'PACKING_VIEWER_ORDER_NOT_VISIBLE',
+                    'Packing viewer can only open Confirmed, Ready to Ship, or Processing orders (before courier pickup).'
+                );
+            }
+        } catch (packErr) {
+            logger.warn('[getOrder] packing viewer gate skipped', {
+                orderId,
+                message: packErr?.message || String(packErr)
+            });
+        }
+
         // Self-heal historical split state: paid/partially_paid but orderStatus still payment_failed.
         if (
             isMoneyCapturedPaymentStatus(order.paymentStatus) &&

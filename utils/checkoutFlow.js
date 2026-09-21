@@ -199,10 +199,14 @@ const sendCheckoutFlowError = (res, error, fallbackMessage, fallbackCode = null)
   return res.status(statusCode).json(payload);
 };
 
-const isOrderStaffRequest = (req) => {
-  const role = String(req?.user?.role || req?.userRole || req?.userType || '').trim().toLowerCase();
-  return role === 'admin' || role === 'order_manager';
-};
+const {
+  isOrderReadStaffRequest,
+  isOrderWriteStaffRequest,
+  isPackingViewerRequest
+} = require('./adminOrderRoles');
+
+/** Admin / order_manager / packing_viewer — may view orders in admin scope. */
+const isOrderStaffRequest = (req) => isOrderReadStaffRequest(req);
 
 const buildRequestLogContext = (req, extras = {}) => ({
   requestId: req?.id || null,
@@ -228,6 +232,8 @@ module.exports = {
   createQuoteStaleError,
   sendCheckoutFlowError,
   isOrderStaffRequest,
+  isOrderWriteStaffRequest,
+  isPackingViewerRequest,
   buildRequestLogContext,
   resolveAdvancePaymentSelectionWithPolicy
 };

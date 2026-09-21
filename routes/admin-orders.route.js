@@ -7,13 +7,23 @@ const { verifyToken } = require('../middlewares/auth.middleware');
 const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
 const { requireStrictAdminStorefrontScope } = require('../middlewares/admin-storefront-scope.middleware');
 const adminOrdersController = require('../controllers/admin-orders.controller');
+const {
+  ORDER_READ_ROLES,
+  ORDER_WRITE_ROLES
+} = require('../utils/adminOrderRoles');
 
 router.use(verifyToken);
-router.use(authorizeRoles('admin', 'order_manager'));
+router.use(authorizeRoles(...ORDER_READ_ROLES));
 router.use(requireStrictAdminStorefrontScope);
 
 router.get('/summary', adminOrdersController.getDashboardSummary);
-router.post('/auto-sync-statuses', adminOrdersController.autoSyncOrderStatuses);
 router.get('/', adminOrdersController.getOrdersList);
+
+/** Side-effecting sync — packing_viewer cannot run this. */
+router.post(
+  '/auto-sync-statuses',
+  authorizeRoles(...ORDER_WRITE_ROLES),
+  adminOrdersController.autoSyncOrderStatuses
+);
 
 module.exports = router;

@@ -210,6 +210,26 @@ async function loadStaffOrder(req, res, orderId) {
     jsonError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
     return null;
   }
+  try {
+    const {
+      isPackingViewerRequest,
+      isPackingViewerDetailVisibleOrder
+    } = require('../utils/adminOrderRoles');
+    if (isPackingViewerRequest(req) && !isPackingViewerDetailVisibleOrder(order)) {
+      jsonError(
+        res,
+        403,
+        'PACKING_VIEWER_ORDER_NOT_VISIBLE',
+        'Packing viewer can only access Confirmed, Ready to Ship, or Processing orders (before courier pickup).'
+      );
+      return null;
+    }
+  } catch (packErr) {
+    logger.warn('[loadStaffOrder] packing viewer gate skipped', {
+      orderId: id,
+      message: packErr?.message || String(packErr)
+    });
+  }
   return order;
 }
 
