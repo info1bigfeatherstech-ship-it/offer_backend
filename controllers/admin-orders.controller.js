@@ -1,5 +1,5 @@
 /**
- * Admin / order_manager — read-only dashboard & order list for operations UI.
+ * Admin / order_manager / packing_viewer — dashboard & order list for operations UI.
  */
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
@@ -13,6 +13,12 @@ const {
   mapOrderRow
 } = require('../services/adminOrderDashboard.service');
 const { autoSyncStaleOrdersInRange } = require('../services/adminOrderAutoSync.service');
+const {
+  isPackingViewerRequest,
+  buildPackingViewerOrderMatch,
+  resolvePackingViewerBucket,
+  PACKING_VIEWER_BUCKETS
+} = require('../utils/adminOrderRoles');
 
 function sendError(res, err, fallbackMessage) {
   const status = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
@@ -26,6 +32,39 @@ function sendError(res, err, fallbackMessage) {
     code,
     message: message || fallbackMessage
   });
+}
+
+function withPackingViewerScope(req, scopeMatch) {
+  if (!isPackingViewerRequest(req)) return scopeMatch || {};
+  const packing = buildPackingViewerOrderMatch();
+  if (!scopeMatch || !Object.keys(scopeMatch).length) return packing;
+  return { $and: [scopeMatch, packing] };
+}
+
+function redactSummaryForPackingViewer(summary) {
+  const counts = summary?.countsByBucket || {};
+  const packingCounts = {
+    all:
+      (counts.bill_sent || 0) +
+      (counts.ready_to_ship || 0) +
+      (counts.ready_to_pick || 0),
+    new: 0,
+    bill_sent: counts.bill_sent || 0,
+    ready_to_ship: counts.ready_to_ship || 0,
+    ready_to_pick: counts.ready_to_pick || 0,
+    in_transit: 0,
+    completed: 0,
+    rto: 0,
+    pickup_exception: 0,
+    others: 0
+  };
+  return {
+    ...summary,
+    totalOrders: packingCounts.all,
+    totalPendingOrders: packingCounts.all,
+    totalCompletedOrders: 0,
+    countsByBucket: packingCounts
+  };
 }
 
 /**
@@ -50,8 +89,11 @@ exports.getDashboardSummary = async (req, res) => {
       rangePreset
     });
 
-    const scopeMatch = req.adminScope?.orderMatch || {};
-    const summary = await aggregateSummary(range.from, range.to, scopeMatch);
+    const scopeMatch = withPackingViewerScope(req, req.adminScope?.orderMatch || {});
+    let summary = await aggregateSummary(range.from, range.to, scopeMatch);
+    if (isPackingViewerRequest(req)) {
+      summary = redactSummaryForPackingViewer(summary);
+    }
 
     return res.json({
       success: true,
@@ -62,6 +104,8 @@ exports.getDashboardSummary = async (req, res) => {
           preset: range.presetLabel
         },
         scope: req.adminScope?.storefront || 'ecomm',
+        packingViewer: isPackingViewerRequest(req),
+        allowedBuckets: isPackingViewerRequest(req) ? [...PACKING_VIEWER_BUCKETS] : null,
         totals: {
           totalOrders: summary.totalOrders,
           /** Gross merchandise value (excludes cancelled & payment_failed). */
@@ -117,11 +161,45 @@ exports.getOrdersList = async (req, res) => {
     const sortOrder = String(req.query.sortOrder || 'desc').toLowerCase() === 'asc' ? 1 : -1;
     const sort = { [sortBy]: sortOrder };
 
-    const scopeMatch = req.adminScope?.orderMatch || {};
+    const scopeMatch = withPackingViewerScope(req, req.adminScope?.orderMatch || {});
     const dateScopeMatch = buildScopedDateMatch(range.from, range.to, scopeMatch);
     const search = await buildSearchFilter(searchRaw);
-    /** Global search: skip status bucket so order ID / phone matches any tab (incl. cancelled). */
-    const bucket = search ? {} : buildBucketMatch(req.query.bucket);
+
+    const packingViewer = isPackingViewerRequest(req);
+    let bucket = {};
+    if (search) {
+      bucket = {};
+    } else if (packingViewer) {
+      const resolved = resolvePackingViewerBucket(req.query.bucket);
+      if (resolved.empty) {
+        return res.json({
+          success: true,
+          data: {
+            dateRange: {
+              from: range.from ? range.from.toISOString() : null,
+              to: range.to ? range.to.toISOString() : null,
+              preset: range.presetLabel
+            },
+            scope: req.adminScope?.storefront || 'ecomm',
+            packingViewer: true,
+            allowedBuckets: [...PACKING_VIEWER_BUCKETS],
+            orders: [],
+            pagination: {
+              page,
+              limit,
+              total: 0,
+              totalPages: 0,
+              hasNextPage: false,
+              hasPrevPage: page > 1
+            }
+          }
+        });
+      }
+      bucket = resolved.bucket ? buildBucketMatch(resolved.bucket) : {};
+    } else {
+      bucket = buildBucketMatch(req.query.bucket);
+    }
+
     const filter = mergeFilters(dateScopeMatch, search, bucket);
 
     const [orders, total] = await Promise.all([
@@ -208,6 +286,8 @@ exports.getOrdersList = async (req, res) => {
           preset: range.presetLabel
         },
         scope: req.adminScope?.storefront || 'ecomm',
+        packingViewer: packingViewer,
+        allowedBuckets: packingViewer ? [...PACKING_VIEWER_BUCKETS] : null,
         orders: rows,
         pagination: {
           page,

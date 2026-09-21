@@ -241,7 +241,7 @@ const exportUsersExcel = async (req, res) => {
     const users = await User.find(
       mergeAnd(scopedUserQueryFromReq(req), {
         role: {
-          $nin: ['admin', 'product_manager', 'order_manager', 'marketing_manager', 'inventory_manager']
+          $nin: ['admin', 'product_manager', 'order_manager', 'marketing_manager', 'inventory_manager', 'packing_viewer']
         }
       })
     )
