@@ -138,11 +138,60 @@ function testFullNameShipmozoCap() {
   assert.strictEqual(sanitizeCourierConsigneeName('Davichand Sharma'), 'Davichand Sharma');
 }
 
+function baseAddr(overrides = {}) {
+  return {
+    fullName: 'Test User',
+    phone: '9876543210',
+    houseNumber: '42B',
+    building: 'Sunrise',
+    floor: '4',
+    addressLine1: 'MG Road near metro station',
+    addressLine2: 'Wing A',
+    area: 'Andheri East',
+    landmark: 'Near City Mall',
+    city: 'Mumbai',
+    state: 'Maharashtra',
+    postalCode: '400069',
+    country: 'India',
+    ...overrides
+  };
+}
+
+function testFullNamePersonRules() {
+  const { validatePersonFullName, MAX_FULL_NAME_WORDS } = require('../utils/addressValidation');
+  assert.strictEqual(MAX_FULL_NAME_WORDS, 3);
+
+  assert.strictEqual(validatePersonFullName('Ravi').ok, true);
+  assert.strictEqual(validatePersonFullName('Ravi Kumar').ok, true);
+  assert.strictEqual(validatePersonFullName('Ravi Kumar Sharma').ok, true);
+
+  const four = validatePersonFullName('Ravi Kumar Sharma Ji');
+  assert.strictEqual(four.ok, false);
+  assert.strictEqual(four.code, 'FULL_NAME_TOO_MANY_WORDS');
+
+  const digits = validatePersonFullName('Ravi123');
+  assert.strictEqual(digits.ok, false);
+  assert.strictEqual(digits.code, 'FULL_NAME_INVALID_CHARS');
+
+  const special = validatePersonFullName('Ravi@Kumar');
+  assert.strictEqual(special.ok, false);
+  assert.strictEqual(special.code, 'FULL_NAME_INVALID_CHARS');
+
+  const saveBad = validatePhysicalAddressForSave(baseAddr({ fullName: 'Ravi Kumar Sharma Extra' }));
+  assert.strictEqual(saveBad.ok, false);
+  assert.ok(saveBad.errors.some((e) => e.code === 'FULL_NAME_TOO_MANY_WORDS'));
+
+  const saveOk = validatePhysicalAddressForSave(baseAddr({ fullName: '  Ravi   Kumar  ' }));
+  assert.strictEqual(saveOk.ok, true, saveOk.message);
+  assert.strictEqual(saveOk.data.fullName, 'Ravi Kumar');
+}
+
 function run() {
   testComposeMatchesShiprocketShape();
   testRejectLongAddressOnSave();
   testAcceptReasonableAddress();
   testFullNameShipmozoCap();
+  testFullNamePersonRules();
   console.log('All address validation tests passed.');
 }
 

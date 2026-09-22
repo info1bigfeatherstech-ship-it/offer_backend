@@ -25,10 +25,59 @@ const MAX_COURIER_COMBINED_STREET_CHARS = 190;
  */
 const MAX_FULL_NAME_LEN = 50;
 const MAX_COURIER_CONSIGNEE_NAME_LEN = 50;
+/** First / optional middle / optional last — English letters only. */
+const MAX_FULL_NAME_WORDS = 3;
+const PERSON_NAME_WORD_RE = /^[A-Za-z]+$/;
 
 function trimStr(value) {
   if (value == null) return '';
   return String(value).trim();
+}
+
+/**
+ * Person full name for address forms:
+ * 1–3 words, English letters only (no digits / special chars).
+ * @param {unknown} raw
+ * @returns {{ ok: true, normalized: string } | { ok: false, code: string, message: string }}
+ */
+function validatePersonFullName(raw) {
+  const collapsed = trimStr(raw).replace(/\s+/g, ' ');
+  if (!collapsed) {
+    return { ok: false, code: 'REQUIRED', message: 'Full name is required.' };
+  }
+  if (collapsed.length < 2) {
+    return {
+      ok: false,
+      code: 'FULL_NAME_TOO_SHORT',
+      message: 'Full name must be at least 2 characters.'
+    };
+  }
+  if (collapsed.length > MAX_FULL_NAME_LEN) {
+    return {
+      ok: false,
+      code: 'FULL_NAME_TOO_LONG',
+      message: `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`
+    };
+  }
+  const words = collapsed.split(' ').filter(Boolean);
+  if (words.length > MAX_FULL_NAME_WORDS) {
+    return {
+      ok: false,
+      code: 'FULL_NAME_TOO_MANY_WORDS',
+      message: `Enter at most ${MAX_FULL_NAME_WORDS} words (first, middle, last name).`
+    };
+  }
+  for (const w of words) {
+    if (!PERSON_NAME_WORD_RE.test(w)) {
+      return {
+        ok: false,
+        code: 'FULL_NAME_INVALID_CHARS',
+        message:
+          'Name can only use English letters (A–Z). No numbers or special characters.'
+      };
+    }
+  }
+  return { ok: true, normalized: collapsed };
 }
 
 /**
@@ -153,7 +202,7 @@ function validateStreetLines(line1Raw, line2Raw) {
 function validatePhysicalAddressForSave(body) {
   const errors = [];
 
-  const fullName = trimStr(body.fullName);
+  const fullNameRaw = trimStr(body.fullName);
   const phoneRaw = trimStr(body.phone);
   const phoneDigits = phoneRaw.replace(/\D/g, '');
   const houseNumber = trimStr(body.houseNumber);
@@ -166,20 +215,20 @@ function validatePhysicalAddressForSave(body) {
   const postalCode = trimStr(body.postalCode);
   const country = trimStr(body.country) || 'India';
 
-  if (!fullName) {
+  let fullName = fullNameRaw;
+  if (!fullNameRaw) {
     errors.push({ field: 'fullName', code: 'REQUIRED', message: 'Full name is required.' });
-  } else if (fullName.length > MAX_FULL_NAME_LEN) {
-    errors.push({
-      field: 'fullName',
-      code: 'FULL_NAME_TOO_LONG',
-      message: `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`
-    });
-  } else if (fullName.length < 2) {
-    errors.push({
-      field: 'fullName',
-      code: 'FULL_NAME_TOO_SHORT',
-      message: 'Full name must be at least 2 characters.'
-    });
+  } else {
+    const nameCheck = validatePersonFullName(fullNameRaw);
+    if (!nameCheck.ok) {
+      errors.push({
+        field: 'fullName',
+        code: nameCheck.code,
+        message: nameCheck.message
+      });
+    } else {
+      fullName = nameCheck.normalized;
+    }
   }
   if (!phoneRaw) {
     errors.push({ field: 'phone', code: 'REQUIRED', message: 'Phone number is required.' });
@@ -297,10 +346,12 @@ module.exports = {
   MIN_COMBINED_STREET_CHARS,
   MAX_COURIER_COMBINED_STREET_CHARS,
   MAX_FULL_NAME_LEN,
+  MAX_FULL_NAME_WORDS,
   MAX_COURIER_CONSIGNEE_NAME_LEN,
   buildCourierStreetLines,
   validateCourierComposedStreet,
   validateStreetLines,
+  validatePersonFullName,
   validatePhysicalAddressForSave,
   shouldRunFullAddressValidation,
   sanitizeCourierConsigneeName,
