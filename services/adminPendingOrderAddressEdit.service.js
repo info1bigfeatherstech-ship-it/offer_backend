@@ -16,7 +16,7 @@ const Address = require('../models/Address');
 const logger = require('../utils/logger');
 const {
   validatePhysicalAddressForSave,
-  MAX_FULL_NAME_LEN
+  validatePersonFullName
 } = require('../utils/addressValidation');
 const { computeLocalAddressQuality } = require('./addressIntelligence.service');
 const {
@@ -66,45 +66,13 @@ function isNameOnlyAddressPatch(patch) {
 }
 
 function normalizeRecipientFullName(raw) {
-  const fullName = raw == null ? '' : String(raw).trim();
-  if (!fullName) {
-    throw createEditError(400, 'ADDRESS_VALIDATION_FAILED', 'Full name is required.', {
-      errors: [{ field: 'fullName', code: 'REQUIRED', message: 'Full name is required.' }]
+  const check = validatePersonFullName(raw);
+  if (!check.ok) {
+    throw createEditError(400, 'ADDRESS_VALIDATION_FAILED', check.message, {
+      errors: [{ field: 'fullName', code: check.code, message: check.message }]
     });
   }
-  if (fullName.length < 2) {
-    throw createEditError(
-      400,
-      'ADDRESS_VALIDATION_FAILED',
-      'Full name must be at least 2 characters.',
-      {
-        errors: [
-          {
-            field: 'fullName',
-            code: 'FULL_NAME_TOO_SHORT',
-            message: 'Full name must be at least 2 characters.'
-          }
-        ]
-      }
-    );
-  }
-  if (fullName.length > MAX_FULL_NAME_LEN) {
-    throw createEditError(
-      400,
-      'ADDRESS_VALIDATION_FAILED',
-      `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`,
-      {
-        errors: [
-          {
-            field: 'fullName',
-            code: 'FULL_NAME_TOO_LONG',
-            message: `Full name is too long (max ${MAX_FULL_NAME_LEN} characters). Enter only the recipient's name — put house, street, landmark, and phone in their own fields.`
-          }
-        ]
-      }
-    );
-  }
-  return fullName;
+  return check.normalized;
 }
 
 function buildMergedAddressCandidate(snapshot, patch) {
