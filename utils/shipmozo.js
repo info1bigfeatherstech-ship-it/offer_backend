@@ -206,12 +206,31 @@ class ShipmozoService {
 
   /**
    * Pincode serviceability between Shipmozo warehouse pin and delivery pin.
+   * @param {string} deliveryPincode
+   * @param {string} [storefrontOrOpts] storefront string OR opts object
+   * @param {object} [maybeOpts] when called as (pin, storefront, opts)
    */
-  async checkPincodeServiceability(deliveryPincode, storefront = 'ecomm') {
+  async checkPincodeServiceability(deliveryPincode, storefrontOrOpts = 'ecomm', maybeOpts) {
+    let storefront = 'ecomm';
+    let opts = {};
+    if (storefrontOrOpts && typeof storefrontOrOpts === 'object') {
+      opts = storefrontOrOpts;
+      storefront = opts.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+    } else {
+      storefront = storefrontOrOpts === 'wholesale' ? 'wholesale' : 'ecomm';
+      opts = maybeOpts && typeof maybeOpts === 'object' ? maybeOpts : {};
+    }
+
     const cfg = await this.getConfig(storefront);
-    const pickup = String(cfg.shipmozo?.pickupPincode || '')
+    const pickupOverride = String(opts.pickupPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
+    const pickup =
+      pickupOverride.length === 6
+        ? pickupOverride
+        : String(cfg.shipmozo?.pickupPincode || '')
+            .replace(/\D/g, '')
+            .slice(0, 6);
     const delivery = String(deliveryPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
@@ -274,12 +293,19 @@ class ShipmozoService {
     widthCm,
     heightCm,
     orderId = '',
-    storefront = 'ecomm'
+    storefront = 'ecomm',
+    pickupPincode
   } = {}) {
     const cfg = await this.getConfig(storefront);
-    const pickup = String(cfg.shipmozo?.pickupPincode || '')
+    const pickupOverride = String(pickupPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
+    const pickup =
+      pickupOverride.length === 6
+        ? pickupOverride
+        : String(cfg.shipmozo?.pickupPincode || '')
+            .replace(/\D/g, '')
+            .slice(0, 6);
     const delivery = String(deliveryPincode || '')
       .replace(/\D/g, '')
       .slice(0, 6);
@@ -477,7 +503,10 @@ class ShipmozoService {
       message: null
     };
     try {
-      svcProbe = await this.checkPincodeServiceability(pincode, storefront);
+      svcProbe = await this.checkPincodeServiceability(pincode, {
+        storefront,
+        pickupPincode: opts.pickupPincode
+      });
     } catch (svcErr) {
       logger.warn('[Shipmozo] pincode-serviceability probe failed (continuing with rates)', {
         pincode,
@@ -495,7 +524,8 @@ class ShipmozoService {
         lengthCm,
         widthCm,
         heightCm,
-        storefront
+        storefront,
+        pickupPincode: opts.pickupPincode
       });
 
       if (!rates.ok) {

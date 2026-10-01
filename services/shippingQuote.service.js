@@ -81,7 +81,8 @@ function sanitizeCustomerFacingDeliveryResult(result, provider) {
 
 /**
  * @param {string} deliveryPincode
- * @param {object} opts — weightKg, lengthCm, widthCm, heightCm, codAmount, orderAmount
+ * @param {object} opts — weightKg, lengthCm, widthCm, heightCm, codAmount, orderAmount,
+ *   pickupPincode (optional override; else provider/env default), storefront
  */
 async function checkDeliveryAvailabilityForActiveProvider(deliveryPincode, opts = {}) {
   let provider = SHIPPING_PROVIDERS.SHIPROCKET;

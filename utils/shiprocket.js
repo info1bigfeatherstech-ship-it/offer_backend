@@ -305,7 +305,15 @@ class ShiprocketService {
       return this.mockQuote(pincode, weight);
     }
 
-    const pickup = String(process.env.STORE_PINCODE || process.env.PICKUP_PINCODE || '560001').replace(/\D/g, '').slice(0, 6);
+    const pickupFromOpts = String(opts.pickupPincode || '')
+      .replace(/\D/g, '')
+      .slice(0, 6);
+    const pickup =
+      pickupFromOpts.length === 6
+        ? pickupFromOpts
+        : String(process.env.STORE_PINCODE || process.env.PICKUP_PINCODE || '560001')
+            .replace(/\D/g, '')
+            .slice(0, 6);
 
     try {
       const data = await this.requestWithAuth({

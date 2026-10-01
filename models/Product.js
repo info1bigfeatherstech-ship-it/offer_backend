@@ -67,6 +67,15 @@ const variantSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    /**
+     * Dropship channel (optional / additive).
+     * Existing live products without this field behave as dropship=false.
+     * Price is validated in the dropshipper admin module when enabling.
+     */
+    dropship: {
+      type: Boolean,
+      default: false
+    },
     price: {
       base: { type: Number, required: true, min: 0 },
       sale: { type: Number, default: null },
@@ -79,6 +88,12 @@ const variantSchema = new mongoose.Schema(
         type: Number,
         default: null,
         required: false
+      },
+      /** Optional; required only when dropship is enabled via dropshipper APIs. */
+      dropshipBase: {
+        type: Number,
+        min: 0,
+        default: undefined
       }
     },
     minimumOrderQuantity: {
@@ -113,7 +128,9 @@ const variantSchema = new mongoose.Schema(
       type: new mongoose.Schema(
         {
           ecomm: { type: String, enum: ['draft', 'active', 'archived'] },
-          wholesale: { type: String, enum: ['draft', 'active', 'archived'] }
+          wholesale: { type: String, enum: ['draft', 'active', 'archived'] },
+          /** Optional third channel; unset/missing = not dropship-listed. */
+          dropship: { type: String, enum: ['draft', 'active', 'archived'] }
         },
         { _id: false }
       ),
@@ -247,7 +264,9 @@ const productSchema = new mongoose.Schema(
       type: new mongoose.Schema(
         {
           ecomm: { type: String, enum: ['draft', 'active', 'archived'] },
-          wholesale: { type: String, enum: ['draft', 'active', 'archived'] }
+          wholesale: { type: String, enum: ['draft', 'active', 'archived'] },
+          /** Optional; default draft — does not affect ecomm/wholesale. */
+          dropship: { type: String, enum: ['draft', 'active', 'archived'] }
         },
         { _id: false }
       ),
@@ -375,6 +394,8 @@ productSchema.index({ name: 'text', title: 'text', description: 'text' });
 productSchema.index({ category: 1, status: 1 });
 productSchema.index({ category: 1, 'channelStatus.ecomm': 1, status: 1 });
 productSchema.index({ category: 1, 'channelStatus.wholesale': 1, status: 1 });
+productSchema.index({ category: 1, 'channelStatus.dropship': 1, status: 1 });
+productSchema.index({ 'variants.dropship': 1, 'variants.price.dropshipBase': 1 });
 productSchema.index({ isFeatured: 1 });
 productSchema.index({ 'variants.sku': 1 }, { unique: true, sparse: true });
 productSchema.index({ createdAt: -1 });
