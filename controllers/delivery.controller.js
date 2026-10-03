@@ -16,6 +16,9 @@ const logger = require('../utils/logger');
 const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 
+const MAX_CLIENT_CART_ITEMS = 50;
+const MAX_LINE_QTY = 999;
+
 function uniqueProductIds(cartItems) {
   const ids = [];
   const seen = new Set();
@@ -28,6 +31,37 @@ function uniqueProductIds(cartItems) {
     ids.push(id);
   }
   return ids;
+}
+
+/**
+ * Sanitize guest/client-provided cart lines for weight/dims only.
+ * Never trusts price or other fields from the client.
+ */
+function sanitizeClientCartItems(rawItems) {
+  if (!Array.isArray(rawItems) || !rawItems.length) return [];
+
+  const out = [];
+  for (const it of rawItems.slice(0, MAX_CLIENT_CART_ITEMS)) {
+    const productId = it?.productId?._id || it?.productId;
+    if (!productId || !mongoose.isValidObjectId(productId)) continue;
+
+    let variantId = it?.variantId?._id || it?.variantId || null;
+    if (variantId != null && !mongoose.isValidObjectId(variantId)) {
+      variantId = null;
+    }
+
+    const quantity = Math.min(
+      MAX_LINE_QTY,
+      Math.max(1, Math.floor(Number(it?.quantity) || 1))
+    );
+
+    out.push({
+      productId: String(productId),
+      variantId: variantId != null ? String(variantId) : null,
+      quantity
+    });
+  }
+  return out;
 }
 
 function findVariantOnProduct(product, variantId) {
@@ -77,7 +111,7 @@ async function calculateCartWeightKg(cartItems) {
 // ========== PRODUCTION VERSION ==========
 exports.checkDeliveryAvailability = async (req, res) => {
   try {
-    const { pincode, cartId } = req.body || {};
+    const { pincode, cartId, items: clientItems } = req.body || {};
     const userId = req.userId;
 
     if (!pincode || !/^\d{6}$/.test(pincode)) {
@@ -90,14 +124,26 @@ exports.checkDeliveryAvailability = async (req, res) => {
     let totalWeight = 1;
     let dims = { lengthCm: 1, widthCm: 1, heightCm: 1 };
 
-    const cartDoc = cartId
-      ? await Cart.findById(cartId)
-      : userId
-        ? await findCartForStorefront(userId, normalizeCustomerStorefront(req.storefront))
-        : null;
+    // Prefer server cart (logged-in / cartId). Guests fall back to sanitized items[].
+    let cartItems = null;
+    if (cartId && mongoose.isValidObjectId(cartId)) {
+      const cartDoc = await Cart.findById(cartId).select('items').lean();
+      if (cartDoc?.items?.length) cartItems = cartDoc.items;
+    } else if (userId) {
+      const cartDoc = await findCartForStorefront(
+        userId,
+        normalizeCustomerStorefront(req.storefront)
+      );
+      if (cartDoc?.items?.length) cartItems = cartDoc.items;
+    }
 
-    if (cartDoc?.items?.length) {
-      const lines = await buildShippingLinesFromCartItems(cartDoc.items);
+    if (!cartItems?.length) {
+      const sanitized = sanitizeClientCartItems(clientItems);
+      if (sanitized.length) cartItems = sanitized;
+    }
+
+    if (cartItems?.length) {
+      const lines = await buildShippingLinesFromCartItems(cartItems);
       if (lines.length) {
         totalWeight = lines.reduce((sum, line) => {
           const w = unitWeightKgFromResolvedShipping(
