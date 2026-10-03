@@ -21,11 +21,15 @@ function normalizeLifecycle(value, fallback) {
  */
 function deriveProductChannelStatusFromLegacy(status, body) {
   const fb = normalizeLifecycle(status, 'draft');
-  const out = { ecomm: fb, wholesale: fb };
+  // Dropship always defaults to draft — never inherit ecomm/wholesale lifecycle.
+  const out = { ecomm: fb, wholesale: fb, dropship: 'draft' };
   if (body && typeof body === 'object') {
     if (body.ecomm != null) out.ecomm = normalizeLifecycle(body.ecomm, fb);
     if (body.wholesale != null) {
       out.wholesale = normalizeLifecycle(body.wholesale, fb);
+    }
+    if (body.dropship != null) {
+      out.dropship = normalizeLifecycle(body.dropship, 'draft');
     }
   }
   return out;
@@ -38,12 +42,22 @@ function deriveProductChannelStatusFromLegacy(status, body) {
 function deriveVariantChannelVisibilityFromLegacy(isActive, body, options = {}) {
   const fb = isActive ? 'active' : 'draft';
   const isWholesaleEligible = options.isWholesaleEligible !== false;
-  const out = { ecomm: fb, wholesale: isWholesaleEligible ? fb : 'draft' };
+  const isDropshipEligible = options.isDropshipEligible === true;
+  // Dropship defaults to draft unless explicitly eligible + requested.
+  const out = {
+    ecomm: fb,
+    wholesale: isWholesaleEligible ? fb : 'draft',
+    dropship: 'draft'
+  };
   if (body && typeof body === 'object') {
     if (body.ecomm != null) out.ecomm = normalizeLifecycle(body.ecomm, fb);
     if (body.wholesale != null) {
       const requested = normalizeLifecycle(body.wholesale, fb);
       out.wholesale = isWholesaleEligible ? requested : 'draft';
+    }
+    if (body.dropship != null) {
+      const requested = normalizeLifecycle(body.dropship, 'draft');
+      out.dropship = isDropshipEligible ? requested : 'draft';
     }
   }
   return out;
@@ -56,6 +70,15 @@ function storefrontKey(storefront) {
 function hasWholesalePricingConfig(variant) {
   const wholesaleBase = Number(variant?.price?.wholesaleBase);
   return Boolean(variant?.wholesale === true && Number.isFinite(wholesaleBase) && wholesaleBase > 0);
+}
+
+/**
+ * True when variant is dropship-priced (flag + dropshipBase > 0).
+ * Does not imply catalog-visible; visibility is separate.
+ */
+function hasDropshipPricingConfig(variant) {
+  const dropshipBase = Number(variant?.price?.dropshipBase);
+  return Boolean(variant?.dropship === true && Number.isFinite(dropshipBase) && dropshipBase > 0);
 }
 
 /**
@@ -313,7 +336,13 @@ function mergeProductChannelStatus(doc, parsed) {
       ? parsed.wholesale
       : cur.wholesale != null
         ? cur.wholesale
-        : fb
+        : fb,
+    // Preserve dropship; never inherit from ecomm legacy status.
+    dropship: isValidLifecycle(parsed.dropship)
+      ? parsed.dropship
+      : cur.dropship != null
+        ? cur.dropship
+        : 'draft'
   };
 }
 
@@ -325,8 +354,9 @@ function mergeProductChannelStatus(doc, parsed) {
 function mergeVariantChannelVisibility(variant, parsed) {
   const fb = variant.isActive === false ? 'draft' : 'active';
   const wholesaleEligible = hasWholesalePricingConfig(variant);
+  const dropshipEligible = hasDropshipPricingConfig(variant);
   const cur = variant.channelVisibility || {};
-  return {
+  const out = {
     ecomm: isValidLifecycle(parsed.ecomm)
       ? parsed.ecomm
       : cur.ecomm != null
@@ -338,6 +368,15 @@ function mergeVariantChannelVisibility(variant, parsed) {
         ? cur.wholesale
         : (wholesaleEligible ? fb : 'draft')
   };
+
+  // Preserve existing dropship unless explicitly updated; gate active on pricing.
+  if (isValidLifecycle(parsed.dropship)) {
+    out.dropship = dropshipEligible ? parsed.dropship : 'draft';
+  } else if (cur.dropship != null) {
+    out.dropship = cur.dropship;
+  }
+
+  return out;
 }
 
 /**
@@ -382,7 +421,19 @@ function deriveProductChannelStatusFromVariants(variants) {
   // wholesale derive fallback and avoids accidental wholesale archived side-effects.
   const wholesale = hasActiveWholesale ? 'active' : hasDraftWholesale ? 'draft' : 'draft';
 
-  return { ecomm, wholesale };
+  // Dropship: pricing gate + explicit visibility (never inherit from isActive alone).
+  const hasActiveDropship = list.some((v) => {
+    if (!hasDropshipPricingConfig(v)) return false;
+    return v?.channelVisibility?.dropship === 'active';
+  });
+  const hasDraftDropship = list.some((v) => {
+    if (!hasDropshipPricingConfig(v)) return false;
+    const state = v?.channelVisibility?.dropship || 'draft';
+    return state === 'draft';
+  });
+  const dropship = hasActiveDropship ? 'active' : hasDraftDropship ? 'draft' : 'draft';
+
+  return { ecomm, wholesale, dropship };
 }
 
 /**
@@ -442,6 +493,7 @@ module.exports = {
   isProductListedOnStorefront,
   isVariantListedOnStorefront,
   hasWholesalePricingConfig,
+  hasDropshipPricingConfig,
   hasWholesalePricingEligibleVariant,
   hasActiveWholesaleVariantForCatalog,
   getVariantAvailability,

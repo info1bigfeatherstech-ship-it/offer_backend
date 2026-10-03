@@ -46,6 +46,7 @@ const { mongoSanitizeMiddleware } = require('./utils/mongoSanitize');
 // Routes (ACTIVE ONLY)
 const authRoutes = require('./routes/auth.route');
 const adminProductsRoutes = require('./routes/admin-products.route');
+const { adminDropshipProductRoutes, dropshipperRoutes } = require('./dropshipper');
 const categoriesRoutes = require('./routes/categories.route');
 const productsRoutes = require('./routes/products.route');
 const wishlistRoutes = require('./routes/wishlist.route');
@@ -727,6 +728,8 @@ app.get('/api', (req, res) => {
       wishlist: '/api/wishlist',
       addresses: '/api/addresses',
       adminProducts: '/api/admin/products',
+      adminDropshipper: '/api/admin/dropshipper',
+      dropshipper: '/api/dropshipper',
       adminAnalytics: '/api/admin/analytics',
       adminSeoAnalytics: '/api/admin/seo-analytics',
       adminOrders: '/api/admin/orders',
@@ -746,6 +749,8 @@ app.get('/api', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin/products', adminProductsRoutes);
+app.use('/api/admin/dropshipper', adminDropshipProductRoutes);
+app.use('/api/dropshipper', dropshipperRoutes);
 app.use('/api/categories', categoriesRoutes);
 app.use('/api/products', productsRoutes);
 app.use('/api/wishlist', wishlistRoutes);
