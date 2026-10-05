@@ -2,23 +2,27 @@
  * Channel-specific public order IDs.
  * OWB-WH-* — wholesale storefront + wholesaler account
  * OWB-ECOMM-* — ecommerce storefront or non-wholesaler checkout
+ * OWB-DS-* — dropship channel orders
  *
  * Suffix is exactly 6 random digits (000000–999999).
- * The digit suffix must be unique across BOTH prefixes (no shared 6-digit
- * sequence between ecomm and wholesale panels).
+ * The digit suffix must be unique across ALL prefixes (no shared 6-digit
+ * sequence between ecomm, wholesale, and dropship panels).
  */
 
 const crypto = require('crypto');
 
 const PREFIX_WHOLESALE = 'OWB-WH-';
 const PREFIX_ECOMM = 'OWB-ECOMM-';
+const PREFIX_DROPSHIP = 'OWB-DS-';
 const ORDER_ID_DIGIT_LEN = 6;
 const ORDER_ID_DIGIT_MOD = 10 ** ORDER_ID_DIGIT_LEN;
 const DEFAULT_ALLOCATE_ATTEMPTS = 32;
 
 function normalizeStorefront(value) {
   const s = String(value || 'ecomm').toLowerCase().trim();
-  return s === 'wholesale' ? 'wholesale' : 'ecomm';
+  if (s === 'wholesale') return 'wholesale';
+  if (s === 'dropship') return 'dropship';
+  return 'ecomm';
 }
 
 function normalizeOrderUserType(value) {
@@ -27,10 +31,13 @@ function normalizeOrderUserType(value) {
 
 /**
  * @param {{ storefront?: string, userType?: string }} input
- * @returns {typeof PREFIX_WHOLESALE | typeof PREFIX_ECOMM}
+ * @returns {typeof PREFIX_WHOLESALE | typeof PREFIX_ECOMM | typeof PREFIX_DROPSHIP}
  */
 function resolveOrderIdPrefix({ storefront, userType } = {}) {
   const sf = normalizeStorefront(storefront);
+  if (sf === 'dropship') {
+    return PREFIX_DROPSHIP;
+  }
   const ut = normalizeOrderUserType(userType);
   if (sf === 'wholesale' && ut === 'wholesaler') {
     return PREFIX_WHOLESALE;
@@ -48,13 +55,13 @@ function randomOrderIdDigits() {
 }
 
 /**
- * Both channel IDs that would share the same 6-digit suffix.
+ * All channel IDs that would share the same 6-digit suffix.
  * @param {string} digits
- * @returns {[string, string]}
+ * @returns {string[]}
  */
 function orderIdsForDigitSuffix(digits) {
   const d = String(digits || '').padStart(ORDER_ID_DIGIT_LEN, '0').slice(-ORDER_ID_DIGIT_LEN);
-  return [`${PREFIX_ECOMM}${d}`, `${PREFIX_WHOLESALE}${d}`];
+  return [`${PREFIX_ECOMM}${d}`, `${PREFIX_WHOLESALE}${d}`, `${PREFIX_DROPSHIP}${d}`];
 }
 
 /**
@@ -103,6 +110,7 @@ async function allocateUniqueOrderId({
 module.exports = {
   PREFIX_WHOLESALE,
   PREFIX_ECOMM,
+  PREFIX_DROPSHIP,
   ORDER_ID_DIGIT_LEN,
   DEFAULT_ALLOCATE_ATTEMPTS,
   normalizeStorefront,

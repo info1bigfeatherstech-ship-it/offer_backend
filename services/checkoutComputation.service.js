@@ -48,6 +48,12 @@ const getStorefrontSpecificPrice = (variant, storefront) => {
       moq: variant.minimumOrderQuantity || 1
     };
   }
+  // Dropship payable is dropshipBase only (never ecomm sale/base).
+  if (storefront === 'dropship') {
+    const dropshipBase = Number(variant.price?.dropshipBase);
+    const payable = Number.isFinite(dropshipBase) && dropshipBase > 0 ? dropshipBase : 0;
+    return { base: payable, sale: payable, moq: 1 };
+  }
   const base = variant.price?.base || 0;
   let sale = variant.price?.sale || null;
   const isSaleValid =

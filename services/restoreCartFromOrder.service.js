@@ -26,6 +26,11 @@ function toObjectId(v) {
 async function mergeOrderLineItemsIntoUserCart(userId, orderItems, session = null, storefront = 'ecomm') {
   if (!userId || !Array.isArray(orderItems) || orderItems.length === 0) return;
 
+  // Dropship never uses customer carts — do not pollute ecomm/wholesale carts.
+  if (String(storefront || '').toLowerCase().trim() === 'dropship') {
+    return;
+  }
+
   const sf = normalizeCustomerStorefront(storefront);
   let cart = await findOrCreateCartForStorefront(userId, sf, { session });
 

@@ -52,7 +52,18 @@ const orderSchema = new mongoose.Schema(
     userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
 
     /** Checkout channel at order place (for ID prefix + admin scope) */
-    storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
+    storefront: { type: String, enum: ['ecomm', 'wholesale', 'dropship'], default: 'ecomm' },
+
+    /**
+     * Dropship-only metadata (ignored for ecomm/wholesale).
+     * ref = dropshipper-facing tag/code; placedByUserId = staff/dropshipper who created the order.
+     */
+    dropshipMeta: {
+      ref: { type: String, trim: true, default: null, index: true },
+      placedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      customerPhone: { type: String, default: null },
+      customerName: { type: String, default: null }
+    },
 
     /**
      * Frozen at place-order from active shipping partner setting.
