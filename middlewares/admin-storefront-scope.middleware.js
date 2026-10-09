@@ -6,17 +6,38 @@
 const { STOREFRONT_HEADER_ALIASES } = require('../constants/storefrontHeaders');
 const { buildOrderMatchForStorefront } = require('../utils/adminOrderScope');
 
-const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
+const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale', 'dropship']);
+
+function readExplicitStorefrontHeader(req) {
+  for (const key of STOREFRONT_HEADER_ALIASES) {
+    const val = req.get(key);
+    if (val != null && String(val).trim() !== '') return String(val).toLowerCase().trim();
+  }
+  return null;
+}
+
+function normalizeRequestedStorefront(raw) {
+  const v = String(raw || '').toLowerCase().trim();
+  if (v === 'wholesale' || v === 'wholesaler' || v === 'b2b') return 'wholesale';
+  if (v === 'dropship' || v === 'dropshipping' || v === 'ds') return 'dropship';
+  if (v === 'ecomm' || v === 'retail' || v === 'shop' || v === 'store' || v === 'b2c') return 'ecomm';
+  return null;
+}
 
 function normalizeAllowedStorefronts(raw) {
-  if (!Array.isArray(raw) || raw.length === 0) return ['ecomm'];
+  if (!Array.isArray(raw) || raw.length === 0) return ['ecomm', 'dropship'];
   const deduped = [];
   for (const v of raw) {
     const key = String(v || '').toLowerCase().trim();
     if (!VALID_STOREFRONTS.has(key)) continue;
     if (!deduped.includes(key)) deduped.push(key);
   }
-  return deduped.length ? deduped : ['ecomm'];
+  // Dropship ops reuse ecomm warehouse/admin staff — grant at runtime without
+  // requiring User.allowedStorefronts enum migration (still ecomm|wholesale only).
+  if (deduped.includes('ecomm') && !deduped.includes('dropship')) {
+    deduped.push('dropship');
+  }
+  return deduped.length ? deduped : ['ecomm', 'dropship'];
 }
 
 function _enforceAdminStorefrontScope(req, res, next, options = {}) {
@@ -33,11 +54,18 @@ function _enforceAdminStorefrontScope(req, res, next, options = {}) {
       message: 'x-storefront header is required for this admin operation.'
     });
   }
-  // If frontend did not send storefront and user is single-scope, infer that scope.
-  // This prevents wholesale admins from accidentally falling back to ecomm default.
-  const requestedStorefront = hasExplicitHeader
-    ? (req.storefront === 'wholesale' ? 'wholesale' : 'ecomm')
-    : (allowedStorefronts.length === 1 ? allowedStorefronts[0] : 'ecomm');
+  // Prefer raw header so dropship works even if customer resolveStorefront
+  // stays ecomm|wholesale-only (does not change public storefront resolution).
+  let requestedStorefront = 'ecomm';
+  if (hasExplicitHeader) {
+    const fromHeader = normalizeRequestedStorefront(readExplicitStorefrontHeader(req));
+    requestedStorefront =
+      fromHeader || (req.storefront === 'wholesale' ? 'wholesale' : 'ecomm');
+  } else {
+    // Ignore runtime-granted dropship when inferring default from single scope.
+    const inferable = allowedStorefronts.filter((s) => s !== 'dropship');
+    requestedStorefront = inferable.length === 1 ? inferable[0] : 'ecomm';
+  }
 
   if (!allowedStorefronts.includes(requestedStorefront)) {
     return res.status(403).json({
@@ -51,13 +79,18 @@ function _enforceAdminStorefrontScope(req, res, next, options = {}) {
     storefront: requestedStorefront,
     explicitStorefront: hasExplicitHeader ? requestedStorefront : null,
     allowedStorefronts,
-    /** Orders: userType + storefront (ecomm includes legacy missing storefront). */
+    /** Orders: scoped by order.storefront (ecomm includes legacy missing storefront). */
     orderMatch: buildOrderMatchForStorefront(requestedStorefront),
     userMatch:
       requestedStorefront === 'wholesale'
         ? {
             $or: [{ accountScope: 'wholesale' }, { userType: 'wholesaler' }, { role: 'wholesaler' }]
           }
+        : requestedStorefront === 'dropship'
+          ? {
+              // Dropship orders are placed by staff today; user panel filter is unused for DS.
+              _id: { $exists: true }
+            }
         : {
             $and: [
               {

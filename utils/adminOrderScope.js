@@ -11,19 +11,23 @@
  */
 
 /**
- * @param {'ecomm'|'wholesale'|string} storefront
+ * @param {'ecomm'|'wholesale'|'dropship'|string} storefront
  * @returns {import('mongoose').FilterQuery<any>}
  */
 function buildOrderMatchForStorefront(storefront) {
-  const sf = String(storefront || 'ecomm').toLowerCase().trim() === 'wholesale' ? 'wholesale' : 'ecomm';
+  const raw = String(storefront || 'ecomm').toLowerCase().trim();
+  const sf = raw === 'wholesale' ? 'wholesale' : raw === 'dropship' ? 'dropship' : 'ecomm';
 
   if (sf === 'wholesale') {
     return { storefront: 'wholesale' };
   }
 
+  if (sf === 'dropship') {
+    return { storefront: 'dropship' };
+  }
+
   // Ecomm + legacy docs without storefront field (pre-multi-storefront).
-  // Do not require userType=normal — wholesaler accounts shopping ecomm create
-  // storefront=ecomm orders that must remain visible in the ecomm admin panel.
+  // Explicitly excludes wholesale + dropship so those never leak into ecomm admin.
   return {
     $or: [{ storefront: 'ecomm' }, { storefront: { $exists: false } }, { storefront: null }]
   };
@@ -43,11 +47,13 @@ function getAdminOrderMatch(req) {
 
 /**
  * @param {import('express').Request|null|undefined} req
- * @returns {'ecomm'|'wholesale'}
+ * @returns {'ecomm'|'wholesale'|'dropship'}
  */
 function getAdminStorefrontLabel(req) {
-  const sf = req?.adminScope?.storefront || req?.storefront || 'ecomm';
-  return String(sf).toLowerCase() === 'wholesale' ? 'wholesale' : 'ecomm';
+  const sf = String(req?.adminScope?.storefront || req?.storefront || 'ecomm').toLowerCase().trim();
+  if (sf === 'wholesale') return 'wholesale';
+  if (sf === 'dropship') return 'dropship';
+  return 'ecomm';
 }
 
 /**
@@ -94,7 +100,11 @@ function orderMatchesAdminScope(order, reqOrStorefront) {
     return orderSf === 'wholesale';
   }
 
-  // ecomm (incl. legacy missing storefront) — any userType shopping that storefront
+  if (storefront === 'dropship') {
+    return orderSf === 'dropship';
+  }
+
+  // ecomm (incl. legacy missing storefront) — never include dropship/wholesale
   return orderSf === null || orderSf === 'ecomm';
 }
 

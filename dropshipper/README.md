@@ -4,7 +4,9 @@ Isolated backend for dropshipping. Does **not** change ecomm/wholesale cart, che
 
 - Phase 1: admin product dropship visibility & pricing  
 - Phase 2: serviceability (warehouse → customer)  
-- Later: login / subscription / create order  
+- Phase 3: dropshipper catalog  
+- Phase 4: create order + Razorpay (online only) + admin dropship order list  
+- Later: login / subscription  
 
 ---
 
@@ -23,11 +25,6 @@ Isolated backend for dropshipping. Does **not** change ecomm/wholesale cart, che
 | POST | `/products/bulk-enable` | `{ items: [{ productCode, slug?, dropshipBase? }] }` |
 | POST | `/products/bulk-set-price` | `{ items: [{ productCode, dropshipBase, slug?, enable? }] }` |
 
-**Rules**
-- Enable needs `dropshipBase > 0` (or pass it in the same request).
-- Bulk enable: missing price → **skip + report**, batch continues.
-- Existing create/bulk product APIs unchanged; manage dropship via these routes only.
-
 ---
 
 ## Phase 2 — Serviceability
@@ -38,96 +35,115 @@ Isolated backend for dropshipping. Does **not** change ecomm/wholesale cart, che
 
 ### `POST /api/dropshipper/serviceability/check`
 
-**Request body**
+See earlier docs — use `paymentMode: "prepaid"` before placing (COD not used for dropship checkout).
+
+---
+
+## Phase 3 — Catalog
+
+| Method | Path | Notes |
+|--------|------|--------|
+| GET | `/catalog/products?page&limit&q&categoryId&inStockOnly&sort` | Only dropship-listed variants |
+| GET | `/catalog/products/:slug` | Detail; dropship variants only |
+| GET | `/catalog/variants/:productCode` | Single variant detail |
+| GET | `/catalog/variants/:productCode/download-pack` | JSON pack for FE download |
+
+**Payable field:** `dropshipPrice` only (from `price.dropshipBase`).
+
+---
+
+## Phase 4 — Create order + Razorpay (online only)
+
+**Base:** `/api/dropshipper`  
+**Auth:** same temporary staff JWT as catalog  
+
+Orders are saved with `storefront: "dropship"` and public ids `OWB-DS-######`.  
+They **never** appear in the default ecomm/wholesale admin order lists.  
+Fulfillment reuse: send admin header `x-storefront: dropship` on existing admin order APIs (ecomm staff with ecomm scope are auto-granted dropship scope at runtime).
+
+### `POST /api/dropshipper/orders/quote`
+
+Preview pricing + optional shipping (when pincodes provided).
 
 ```json
 {
+  "items": [{ "productCode": "SKU1", "quantity": 1 }],
   "customerPincode": "110001",
   "warehousePincode": "560001",
-  "weightKg": 0.5,
-  "lengthCm": 10,
-  "widthCm": 10,
-  "heightCm": 5,
-  "paymentMode": "both",
-  "orderAmount": 999,
-  "storefront": "ecomm"
+  "package": { "weightKg": 0.5, "lengthCm": 10, "widthCm": 10, "heightCm": 5 }
 }
 ```
 
-| Field | Required | Notes |
-|-------|----------|--------|
-| `customerPincode` | yes | 6-digit (aliases: `deliveryPincode`, `pincode`) |
-| `warehousePincode` | yes | 6-digit pickup (alias: `pickupPincode`) |
-| `weightKg` | yes | kg, min 0.05 (alias: `weight`) |
-| `lengthCm` | yes | aliases: `length`, `l` |
-| `widthCm` | yes | breadth — aliases: `breadthCm`, `breadth`, `width`, `b` |
-| `heightCm` | yes | aliases: `height`, `h` |
-| `paymentMode` | no | `prepaid` \| `cod` \| `both` (default `both`) |
-| `orderAmount` | no | COD declared value; recommended when checking COD |
-| `storefront` | no | `ecomm` \| `wholesale` — which provider settings to use (default `ecomm`) |
+### `POST /api/dropshipper/orders`
 
-**Success response (shape)**
+Creates order, reserves stock, starts Razorpay. **COD rejected.**
 
 ```json
 {
-  "success": true,
-  "message": "Delivery available for this route",
-  "customerPincode": "110001",
+  "items": [{ "productCode": "SKU1", "quantity": 1 }],
   "warehousePincode": "560001",
+  "dropshipRef": "IG-POST-42",
   "package": { "weightKg": 0.5, "lengthCm": 10, "widthCm": 10, "heightCm": 5 },
-  "paymentMode": "both",
-  "orderAmount": 999,
-  "storefront": "ecomm",
-  "isDeliverable": true,
-  "estimatedDays": "3–5",
-  "deliveryCharges": 80,
-  "shippingProvider": "shiprocket",
-  "quotes": {
-    "prepaid": {
-      "isDeliverable": true,
-      "deliveryCharges": 80,
-      "freightInr": 80,
-      "codFeeInr": 0,
-      "estimatedDays": "3–5",
-      "courierName": "…",
-      "courierCompanyId": "…",
-      "codAvailable": false,
-      "message": "Delivery available",
-      "code": null,
-      "mock": false,
-      "shippingProvider": "shiprocket"
-    },
-    "cod": {
-      "isDeliverable": true,
-      "deliveryCharges": 95,
-      "freightInr": 80,
-      "codFeeInr": 15,
-      "estimatedDays": "3–5",
-      "courierName": "…",
-      "codAvailable": true,
-      "message": "Delivery available",
-      "shippingProvider": "shiprocket"
-    }
+  "customer": {
+    "fullName": "Rahul Kumar",
+    "phone": "9876543210",
+    "houseNumber": "12A",
+    "area": "Connaught Place",
+    "addressLine1": "Near Metro",
+    "city": "New Delhi",
+    "state": "Delhi",
+    "postalCode": "110001"
   }
 }
 ```
 
-**Frontend usage**
-1. Form: customer pin + warehouse pin + weight + L/B/H + optional order amount.
-2. Call with `paymentMode: "both"`.
-3. Show prepaid vs COD charges from `quotes.prepaid` / `quotes.cod`.
-4. Let user select prepaid or COD; use that quote’s `deliveryCharges` + `estimatedDays`.
-5. If `isDeliverable === false` (or selected quote), show `message` / not serviceable.
+**Success (201)** includes `order` + `razorpay: { keyId, orderId, amount, currency }` for Checkout.js.  
+If Razorpay env is missing / API fails: order is still created (`razorpayError: true`) — retry payment later.
 
-**Validation errors:** `400` + `code: INVALID_PINCODE | VALIDATION_ERROR`
+### `POST /api/dropshipper/orders/verify-payment`
+
+Same body as ecomm verify:
+
+```json
+{
+  "orderId": "OWB-DS-123456",
+  "razorpay_order_id": "order_…",
+  "razorpay_payment_id": "pay_…",
+  "razorpay_signature": "…"
+}
+```
+
+Delegates to core payment verify (signature + amount + inventory commit). Existing Razorpay webhook also works for `OWB-DS-*` orders.
+
+### List / detail (dropshipper)
+
+| Method | Path |
+|--------|------|
+| GET | `/orders?page&limit&ref` |
+| GET | `/orders/:orderId` |
+
+### Admin dropship orders (filter hook)
+
+**Base:** `/api/admin/dropshipper`  
+**Auth:** `admin` | `order_manager` | `product_manager` | `inventory_manager`
+
+| Method | Path | Query |
+|--------|------|--------|
+| GET | `/orders` | `page`, `limit`, `ref` / `dropshipRef`, `q`, `paymentStatus`, `orderStatus` |
+| GET | `/orders/:orderId` | — |
 
 ---
+
+## Safety guarantees
+
+- Payable price = `dropshipBase` only (never ecomm/wholesale sale).  
+- Payment method = online only.  
+- Ecomm admin order match still excludes `storefront: dropship`.  
+- Unpaid hold expiry does **not** merge dropship lines into ecomm/wholesale carts.  
+- Inventory reserve uses shared warehouse (`ecomm` inventory channel).  
 
 ## Out of scope (later)
 
 - Dropshipper register / login / subscription fee  
-- Dropshipper product catalog (public list of dropship-active products)  
-- Create order + Razorpay  
-- Admin dropshipper-orders filter  
 
-Ecomm `/api/delivery/*` routes are unchanged.
+Ecomm `/api/delivery/*` and ecomm/wholesale catalogs / checkout are unchanged.
