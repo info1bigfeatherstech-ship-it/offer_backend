@@ -75,6 +75,14 @@ function buildAutoSyncCandidateFilter(opts) {
     $and: [
       base,
       { orderStatus: { $in: [...ACTIVE_FORWARD_SYNC_STATUSES] } },
+      // Never resurrect courier state on warehouse self-pickup orders
+      {
+        $or: [
+          { fulfillmentMode: { $exists: false } },
+          { fulfillmentMode: null },
+          { fulfillmentMode: 'courier' },
+        ],
+      },
       {
         $or: [
           {

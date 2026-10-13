@@ -76,6 +76,26 @@ const orderSchema = new mongoose.Schema(
       default: 'shiprocket',
       index: true
     },
+
+    /**
+     * How the order was fulfilled.
+     * null/courier = normal Shiprocket/Shipmozo path (legacy default).
+     * self_pickup = customer collected from warehouse (orderStatus → delivered).
+     */
+    fulfillmentMode: {
+      type: String,
+      enum: ['courier', 'self_pickup', null],
+      default: null,
+      index: true
+    },
+
+    /** Set when fulfillmentMode is self_pickup */
+    selfPickup: {
+      completedAt: { type: Date, default: null },
+      completedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      note: { type: String, default: null },
+      providerCancelled: { type: Boolean, default: false }
+    },
     
     orderStatus: {
       type: String,

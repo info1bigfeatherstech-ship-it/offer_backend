@@ -914,24 +914,26 @@ class ShipmozoService {
     };
   }
 
-  async cancelOrder({ orderId, awbNumber }) {
+  async cancelOrder({ orderId, awbNumber } = {}) {
     const oid = String(orderId || '').trim();
     const awb = String(awbNumber || '').trim();
-    if (!oid || !awb) {
+    if (!oid) {
       return {
         success: false,
         code: 'CANCEL_PARAMS_REQUIRED',
-        message: 'order_id and awb_number are required'
+        message: 'order_id is required to cancel on Shipmozo'
       };
+    }
+
+    const data = { order_id: oid };
+    if (awb) {
+      data.awb_number = /^\d+$/.test(awb) ? Number(awb) : awb;
     }
 
     const res = await this.request({
       method: 'post',
       path: '/cancel-order',
-      data: {
-        order_id: oid,
-        awb_number: /^\d+$/.test(awb) ? Number(awb) : awb
-      },
+      data,
       timeout: 30000
     });
 
@@ -945,6 +947,123 @@ class ShipmozoService {
     }
 
     return { success: true, raw: res.raw, message: res.message };
+  }
+
+  /**
+   * Try cancel across marketplace / reference / channel order ids.
+   * Hydrates AWB from get-order-detail when local AWB is missing.
+   * Used by self-pickup (and safe for New Order / Pickup Pending without AWB).
+   * @param {object} order
+   */
+  async cancelOrderForShipment(order) {
+    const si = order?.shipmentInfo || {};
+    const candidateIds = [];
+    const addId = (v) => {
+      const s = String(v || '').trim();
+      if (s && !candidateIds.includes(s)) candidateIds.push(s);
+    };
+    addId(si.shipmozoOrderId);
+    addId(si.shipmentId);
+    addId(si.shipmozoReferenceId);
+    addId(order?.orderId);
+
+    if (!candidateIds.length) {
+      return {
+        success: false,
+        code: 'SHIPMOZO_ORDER_ID_MISSING',
+        message: 'No Shipmozo order id stored; cannot cancel remotely.',
+        attempts: []
+      };
+    }
+
+    const pickAwbFromDetail = (node, depth = 0) => {
+      if (!node || depth > 5) return null;
+      if (typeof node === 'string' || typeof node === 'number') return null;
+      if (Array.isArray(node)) {
+        for (const item of node) {
+          const found = pickAwbFromDetail(item, depth + 1);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (typeof node !== 'object') return null;
+      for (const key of [
+        'awb_number',
+        'awbNumber',
+        'awb',
+        'awb_no',
+        'tracking_number',
+        'trackingNumber',
+        'lr_number'
+      ]) {
+        const v = node[key];
+        if (v != null && String(v).trim()) return String(v).trim();
+      }
+      for (const val of Object.values(node)) {
+        if (val && typeof val === 'object') {
+          const found = pickAwbFromDetail(val, depth + 1);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    let awb = String(si.awbCode || si.trackingNumber || '').trim() || null;
+
+    if (!awb) {
+      for (const detailId of candidateIds) {
+        try {
+          const detail = await this.getOrderDetail(detailId);
+          if (!detail.success) continue;
+          const found = pickAwbFromDetail(detail.data) || pickAwbFromDetail(detail.raw);
+          if (found) {
+            awb = found;
+            break;
+          }
+        } catch (err) {
+          logger.warn('[Shipmozo] getOrderDetail before cancel failed', {
+            orderId: order?.orderId || null,
+            detailId,
+            message: err?.message || String(err)
+          });
+        }
+      }
+    }
+
+    const attempts = [];
+    for (const oid of candidateIds) {
+      const cancel = await this.cancelOrder({ orderId: oid, awbNumber: awb });
+      attempts.push({
+        orderId: oid,
+        awb: awb || null,
+        success: Boolean(cancel.success),
+        code: cancel.code || null,
+        message: cancel.message || null
+      });
+      if (cancel.success) {
+        return {
+          success: true,
+          message: cancel.message || 'Cancelled on Shipmozo',
+          raw: cancel.raw || null,
+          orderIdUsed: oid,
+          awbUsed: awb || null,
+          attempts
+        };
+      }
+    }
+
+    const last = attempts[attempts.length - 1] || {};
+    return {
+      success: false,
+      code: last.code || 'CANCEL_FAILED',
+      message:
+        last.message ||
+        'Could not cancel shipment on Shipmozo. Cancel on Shipmozo panel, then retry.',
+      raw: null,
+      orderIdUsed: null,
+      awbUsed: awb || null,
+      attempts
+    };
   }
 
   async getTrackingByAwb(awbCode) {

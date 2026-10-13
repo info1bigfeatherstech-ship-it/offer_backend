@@ -16,13 +16,29 @@ const {
   areFulfillmentArtifactsValid,
 } = require('./computeOpsState');
 const { CLASSIFICATION, normalizeProviderSignals } = require('./normalizeProviderSignals');
-const { isRtoProviderStatus } = require('./shiprocketStatusMap');
+const { isRtoProviderStatus, isProviderStatusInTransit } = require('./shiprocketStatusMap');
 const { isUnpaidTerminalOrder } = require('../../utils/orderPaymentState');
 const {
   resolveOrderShippingProvider,
   SHIPPING_PROVIDERS,
 } = require('../../constants/shippingProviders');
 const { isShipmozoPanelBooked } = require('../shipmozoPanelSync.service');
+
+const SELF_PICKUP_ALLOWED_STATUSES = Object.freeze([
+  'pending',
+  'confirmed',
+  'processing',
+  'pickup_exception',
+]);
+
+const SELF_PICKUP_BLOCKED_OPS = Object.freeze([
+  OPS_STATES.IN_TRANSIT,
+  OPS_STATES.OUT_FOR_DELIVERY,
+  OPS_STATES.DELIVERED,
+  OPS_STATES.RTO,
+  OPS_STATES.CANCELLED,
+  OPS_STATES.PAYMENT_FAILED,
+]);
 
 /**
  * @param {string} orderStatus
@@ -91,6 +107,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     refreshTracking: false,
     retryPickup: false,
     cancelShipment: false,
+    selfPickup: false,
     openShiprocketSupport: false,
     openShiprocket: false,
     track: false,
@@ -311,6 +328,36 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
       break;
   }
 
+  // Self pickup: warehouse handover before courier has the parcel.
+  // ecomm + wholesale only — never dropshipper storefront orders.
+  // Kept out of PRIMARY_ACTION_ORDER so Accept / Ship now stay primary.
+  const storefront = String(o.storefront || 'ecomm').toLowerCase().trim();
+  const selfPickupStorefrontOk = storefront === 'ecomm' || storefront === 'wholesale';
+
+  if (storefront === 'dropship') {
+    caps.selfPickup = false;
+    blockReasons.selfPickup = 'Self pickup is not available for dropshipper orders.';
+  } else if (
+    selfPickupStorefrontOk &&
+    SELF_PICKUP_ALLOWED_STATUSES.includes(st) &&
+    !SELF_PICKUP_BLOCKED_OPS.includes(opsState) &&
+    !inTransit &&
+    !terminal &&
+    String(o.fulfillmentMode || '').toLowerCase() !== 'self_pickup' &&
+    !isProviderStatusInTransit(si.providerStatus)
+  ) {
+    caps.selfPickup = true;
+  } else if (
+    selfPickupStorefrontOk &&
+    SELF_PICKUP_ALLOWED_STATUSES.includes(st) &&
+    isProviderStatusInTransit(si.providerStatus)
+  ) {
+    blockReasons.selfPickup =
+      'Courier already picked up or is in transit — self pickup is not allowed.';
+  } else if (String(o.fulfillmentMode || '').toLowerCase() === 'self_pickup') {
+    blockReasons.selfPickup = 'Already marked as self pickup.';
+  }
+
   if (terminal && opsState !== OPS_STATES.DELIVERED) {
     caps.shipNow = false;
     caps.schedulePickup = false;
@@ -319,6 +366,17 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.downloadLabel = false;
     caps.cancelShipment = false;
     caps.retryPickup = false;
+    caps.selfPickup = false;
+  }
+
+  // Delivered (incl. self pickup) — no further courier mutations
+  if (st === 'delivered' || String(o.fulfillmentMode || '').toLowerCase() === 'self_pickup') {
+    caps.shipNow = false;
+    caps.schedulePickup = false;
+    caps.generateManifest = false;
+    caps.cancelShipment = false;
+    caps.retryPickup = false;
+    caps.selfPickup = false;
   }
 
   const manifestDownloaded = Boolean(si.manifestDownloaded);

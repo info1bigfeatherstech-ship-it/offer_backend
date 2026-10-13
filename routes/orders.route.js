@@ -232,6 +232,12 @@ router.post(
 );
 
 router.post(
+  '/admin/items/:orderId/fulfillment/self-pickup',
+  ...adminOrderStaff,
+  adminFulfillment.adminFulfillmentSelfPickup
+);
+
+router.post(
   '/admin/items/:orderId/fulfillment/retry-pickup',
   ...adminOrderStaff,
   adminFulfillment.adminFulfillmentRetryPickup

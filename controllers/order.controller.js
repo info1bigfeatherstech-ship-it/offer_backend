@@ -3499,6 +3499,27 @@ function buildDefaultOrderTimeline(order) {
     const placed = { status: 'Order Placed', completed: true, timestamp: order.createdAt };
     const payment = buildPaymentTimelineStep(order);
 
+    // Warehouse self-pickup — never show courier Shipped / Out for Delivery steps.
+    const isSelfPickup =
+        String(order.fulfillmentMode || '').toLowerCase() === 'self_pickup' ||
+        String(order.shipmentInfo?.providerStatus || '').toUpperCase() === 'SELF_PICKUP';
+    if (isSelfPickup) {
+        const collectedAt =
+            order.selfPickup?.completedAt ||
+            order.shipmentInfo?.deliveredAt ||
+            order.updatedAt ||
+            null;
+        return [
+            placed,
+            payment,
+            {
+                status: 'Self pickup — collected from warehouse',
+                completed: true,
+                timestamp: collectedAt
+            }
+        ];
+    }
+
     const timeline = {
         pending: [placed, { ...payment, completed: payment.completed }],
         confirmed: [
@@ -3693,6 +3714,42 @@ exports.trackOrder = async (req, res) => {
         let liveTracking = null;
         let trackingSource = 'internal';
         const provider = resolveOrderShippingProvider(orderDoc);
+        const isSelfPickupOrder =
+            String(orderDoc.fulfillmentMode || '').toLowerCase() === 'self_pickup' ||
+            String(orderDoc.shipmentInfo?.providerStatus || '').toUpperCase() === 'SELF_PICKUP';
+
+        // Self pickup: do not call Shiprocket/Shipmozo — booking was cancelled (or never existed).
+        if (isSelfPickupOrder) {
+            const fallbackTimeline = buildDefaultOrderTimeline(orderDoc);
+            const tracking = {
+                orderId: orderDoc.orderId,
+                currentStatus: orderDoc.orderStatus,
+                trackingNumber: null,
+                courier: null,
+                estimatedDelivery: null,
+                providerStatus: orderDoc.shipmentInfo?.providerStatus || 'SELF_PICKUP',
+                lastSyncedAt: orderDoc.shipmentInfo?.lastSyncAt || null,
+                source: 'self_pickup',
+                shippingProvider: provider,
+                fulfillmentMode: 'self_pickup',
+                timeline: fallbackTimeline
+            };
+            if (isOrderStaffRequest(req)) {
+                const { buildShipmentOpsView } = require('../services/shipmentOps');
+                tracking.shipmentOps = buildShipmentOpsView(orderDoc, { source: 'track_order_self_pickup' });
+            } else {
+                const { buildCustomerTrackingExtras } = require('../utils/customerTrackingDisplay');
+                const customerExtras = buildCustomerTrackingExtras({
+                    orderDoc,
+                    liveEvents: [],
+                    hasAwb: false
+                });
+                tracking.simpleTimeline = fallbackTimeline;
+                tracking.courierTimeline = customerExtras.courierTimeline;
+                tracking.statusSummary = customerExtras.statusSummary;
+            }
+            return res.json({ success: true, tracking });
+        }
 
         // ——— Shipmozo: panel hydrate + track reconcile (Shiprocket parity) ———
         if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {

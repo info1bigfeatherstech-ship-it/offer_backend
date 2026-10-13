@@ -24,6 +24,11 @@ const {
   buildPickupExceptionExclusionForNonExceptionBucket,
   isPickupExceptionAdminBucketOrder
 } = require('../constants/pickupExceptionOrderQuery');
+const {
+  buildSelfPickupBucketMatch,
+  buildSelfPickupExclusionForNonSelfPickupBucket,
+  isSelfPickupOrder
+} = require('../constants/selfPickupOrderQuery');
 const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/orderFulfillmentPaymentGate');
 const { buildListRowFulfillmentUi } = require('../utils/adminOrderListFulfillmentUi');
 const { resolveOrderShippingProvider } = require('../constants/shippingProviders');
@@ -236,6 +241,9 @@ function buildBucketMatch(bucket) {
   if (b === 'pickup_exception') {
     return buildPickupExceptionBucketMatch();
   }
+  if (b === 'self_pickup') {
+    return buildSelfPickupBucketMatch();
+  }
   if (b === 'in_transit') {
     const ndrProviderMatch = { $regex: NDR_UNDELIVERED_PROVIDER_STATUS_REGEX, $options: 'i' };
     return andFilters(
@@ -246,21 +254,24 @@ function buildBucketMatch(bucket) {
         ]
       },
       buildRtoExclusionForNonRtoBucket(b),
-      buildPickupExceptionExclusionForNonExceptionBucket(b)
+      buildPickupExceptionExclusionForNonExceptionBucket(b),
+      buildSelfPickupExclusionForNonSelfPickupBucket(b)
     );
   }
   if (b === 'ready_to_pick') {
     return andFilters(
       processingTabMongoMatch(),
       buildRtoExclusionForNonRtoBucket(b),
-      buildPickupExceptionExclusionForNonExceptionBucket(b)
+      buildPickupExceptionExclusionForNonExceptionBucket(b),
+      buildSelfPickupExclusionForNonSelfPickupBucket(b)
     );
   }
   if (b === 'ready_to_ship') {
     return andFilters(
       readyToShipTabMongoMatch(),
       buildRtoExclusionForNonRtoBucket(b),
-      buildPickupExceptionExclusionForNonExceptionBucket(b)
+      buildPickupExceptionExclusionForNonExceptionBucket(b),
+      buildSelfPickupExclusionForNonSelfPickupBucket(b)
     );
   }
   const statuses = BUCKET_TO_ORDER_STATUSES[/** @type {keyof typeof BUCKET_TO_ORDER_STATUSES} */ (b)];
@@ -274,7 +285,9 @@ function buildBucketMatch(bucket) {
   return andFilters(
     statusMatch,
     buildRtoExclusionForNonRtoBucket(b),
-    buildPickupExceptionExclusionForNonExceptionBucket(b)
+    buildPickupExceptionExclusionForNonExceptionBucket(b),
+    // Keep self-pickup out of Delivered / Confirmed / etc. — they have their own tab
+    b === 'self_pickup' ? null : buildSelfPickupExclusionForNonSelfPickupBucket(b)
   );
 }
 
@@ -356,19 +369,23 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
   const pickupExceptionExclude = buildPickupExceptionExclusionForNonExceptionBucket('ready_to_ship');
   const confirmedPickupExceptionExclude =
     buildPickupExceptionExclusionForNonExceptionBucket('bill_sent');
+  const selfPickupExclude = buildSelfPickupExclusionForNonSelfPickupBucket('completed');
 
   const [
     rtoCount,
     pickupExceptionCount,
+    selfPickupCount,
     legacyRtoInCancelled,
     legacyRtoInDelivered,
     falseDeliveredNdrCount,
     readyToPickCount,
     readyToShipCount,
-    confirmedWithoutPickupExceptionCount
+    confirmedWithoutPickupExceptionCount,
+    deliveredCourierOnlyCount
   ] = await Promise.all([
     Order.countDocuments({ $and: [baseMatch, buildRtoBucketMatch()] }),
     Order.countDocuments({ $and: [baseMatch, buildPickupExceptionBucketMatch()] }),
+    Order.countDocuments({ $and: [baseMatch, buildSelfPickupBucketMatch()] }),
     Order.countDocuments({
       $and: [baseMatch, { orderStatus: 'cancelled', 'shipmentInfo.providerStatus': rtoProviderMatch }]
     }),
@@ -379,13 +396,21 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
       $and: [baseMatch, { orderStatus: 'delivered', 'shipmentInfo.providerStatus': ndrProviderMatch }]
     }),
     Order.countDocuments(
-      andFilters(baseMatch, processingTabMongoMatch(), pickupExceptionExclude)
+      andFilters(baseMatch, processingTabMongoMatch(), pickupExceptionExclude, selfPickupExclude)
     ),
     Order.countDocuments(
-      andFilters(baseMatch, readyToShipTabMongoMatch(), pickupExceptionExclude)
+      andFilters(baseMatch, readyToShipTabMongoMatch(), pickupExceptionExclude, selfPickupExclude)
     ),
     Order.countDocuments(
-      andFilters(baseMatch, { orderStatus: 'confirmed' }, confirmedPickupExceptionExclude)
+      andFilters(
+        baseMatch,
+        { orderStatus: 'confirmed' },
+        confirmedPickupExceptionExclude,
+        selfPickupExclude
+      )
+    ),
+    Order.countDocuments(
+      andFilters(baseMatch, { orderStatus: 'delivered' }, selfPickupExclude)
     )
   ]);
 
@@ -398,10 +423,11 @@ async function aggregateSummary(from, to, scopeMatch = {}) {
     in_transit:
       (byStatus.shipped || 0) + (byStatus.out_for_delivery || 0) + falseDeliveredNdrCount,
     completed:
-      Math.max(0, (byStatus.delivered || 0) - legacyRtoInDelivered - falseDeliveredNdrCount) +
+      Math.max(0, deliveredCourierOnlyCount - legacyRtoInDelivered - falseDeliveredNdrCount) +
       (byStatus.return_requested || 0),
     rto: rtoCount,
     pickup_exception: pickupExceptionCount,
+    self_pickup: selfPickupCount,
     others:
       Math.max(0, (byStatus.cancelled || 0) - legacyRtoInCancelled) + (byStatus.payment_failed || 0)
   };
@@ -501,6 +527,8 @@ function mapOrderRow(order) {
     ...rowBase
   });
 
+  const resolvedBucketKey = isSelfPickupOrder(o) ? 'self_pickup' : bucketKey;
+
   return {
     orderId: o.orderId,
     orderIdDisplay: `#${String(o.orderId).replace(/^#/, '')}`,
@@ -511,8 +539,21 @@ function mapOrderRow(order) {
     currency: 'INR',
     orderStatus: o.orderStatus,
     shippingProvider: resolveOrderShippingProvider(o),
-    fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey, o),
-    fulfillmentBucket: bucketKey,
+    fulfillmentMode: o.fulfillmentMode || null,
+    selfPickup: o.selfPickup
+      ? {
+          completedAt: o.selfPickup.completedAt || null,
+          note: o.selfPickup.note || null,
+          providerCancelled: Boolean(o.selfPickup.providerCancelled)
+        }
+      : null,
+    fulfillmentLabel: fulfillmentLabelForAdminListRow(
+      o.orderStatus,
+      si.providerStatus,
+      resolvedBucketKey,
+      o
+    ),
+    fulfillmentBucket: resolvedBucketKey,
     itemCount,
     paymentStatus: o.paymentStatus,
     paymentLabel: paymentLabelForUi(o.paymentStatus),
