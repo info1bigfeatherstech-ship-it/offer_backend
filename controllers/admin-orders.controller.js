@@ -17,7 +17,8 @@ const {
   isPackingViewerRequest,
   buildPackingViewerOrderMatch,
   resolvePackingViewerBucket,
-  PACKING_VIEWER_BUCKETS
+  PACKING_VIEWER_BUCKETS,
+  shouldHideOrdersRevenueRequest
 } = require('../utils/adminOrderRoles');
 
 function sendError(res, err, fallbackMessage) {
@@ -56,6 +57,7 @@ function redactSummaryForPackingViewer(summary) {
     completed: 0,
     rto: 0,
     pickup_exception: 0,
+    self_pickup: 0,
     others: 0
   };
   return {
@@ -63,6 +65,8 @@ function redactSummaryForPackingViewer(summary) {
     totalOrders: packingCounts.all,
     totalPendingOrders: packingCounts.all,
     totalCompletedOrders: 0,
+    // Packing viewer never needs GMV — strip even if caller forgets hideRevenue.
+    totalRevenueInr: null,
     countsByBucket: packingCounts
   };
 }
@@ -95,6 +99,9 @@ exports.getDashboardSummary = async (req, res) => {
       summary = redactSummaryForPackingViewer(summary);
     }
 
+    const hideRevenue = shouldHideOrdersRevenueRequest(req);
+    const totalRevenueInr = hideRevenue ? null : summary.totalRevenueInr;
+
     return res.json({
       success: true,
       data: {
@@ -108,8 +115,8 @@ exports.getDashboardSummary = async (req, res) => {
         allowedBuckets: isPackingViewerRequest(req) ? [...PACKING_VIEWER_BUCKETS] : null,
         totals: {
           totalOrders: summary.totalOrders,
-          /** Gross merchandise value (excludes cancelled & payment_failed). */
-          totalRevenueInr: summary.totalRevenueInr,
+          /** Gross merchandise value (excludes cancelled & payment_failed). Admin only. */
+          totalRevenueInr,
           totalPendingOrders: summary.totalPendingOrders,
           totalCompletedOrders: summary.totalCompletedOrders
         },

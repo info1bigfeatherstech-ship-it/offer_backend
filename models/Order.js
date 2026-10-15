@@ -281,6 +281,9 @@ const orderSchema = new mongoose.Schema(
       },
       userLastRead: { type: Date, default: null },
       adminLastRead: { type: Date, default: null },
+      /** When set, return-support chat is locked for both customer and admin (history remains readable). */
+      chatClosedAt: { type: Date, default: null },
+      chatClosedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
 
       /** RTO management (admin RTO tab — does not affect product-return flow) */
       rtoStatus: {

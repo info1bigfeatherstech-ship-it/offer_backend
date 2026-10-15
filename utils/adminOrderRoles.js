@@ -55,6 +55,18 @@ function isPackingViewerRequest(req) {
 }
 
 /**
+ * Orders dashboard "Total revenue" — admin only.
+ * order_manager / packing_viewer must not receive the real GMV figure.
+ */
+function canViewOrdersRevenue(role) {
+  return String(role || '').trim().toLowerCase() === 'admin';
+}
+
+function shouldHideOrdersRevenueRequest(req) {
+  return !canViewOrdersRevenue(resolveRequestRole(req));
+}
+
+/**
  * Confirmed OR any processing (Ready to Ship + Processing / scheduled / labeled).
  * Shipped / in-transit / delivered / RTO excluded (courier already picked up or beyond).
  */
@@ -113,6 +125,8 @@ module.exports = {
   isOrderReadStaffRequest,
   isOrderWriteStaffRequest,
   isPackingViewerRequest,
+  canViewOrdersRevenue,
+  shouldHideOrdersRevenueRequest,
   isPackingViewerListVisibleOrder,
   isPackingViewerDetailVisibleOrder,
   buildPackingViewerOrderMatch,

@@ -26,7 +26,8 @@ const {
   adminDecideReturnRequest,
   adminInitiateReturnRefund,
   sendReturnChatMessage,
-  getReturnChat
+  getReturnChat,
+  closeReturnChatSession
 } = require('../controllers/order.controller');
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
 const adminPendingOrderEdit = require('../controllers/admin-pending-order-edit.controller');
@@ -87,6 +88,8 @@ router.post('/admin/returns/requests/:orderId/refund', ...adminOrderStaff, admin
 router.post('/admin/returns/requests/:orderId/chat', ...adminOrderStaff, sendReturnChatMessage);
 
 router.get('/admin/returns/requests/:orderId/chat', ...adminOrderStaff, getReturnChat);
+
+router.post('/admin/returns/requests/:orderId/chat/close', ...adminOrderStaff, closeReturnChatSession);
 
 router.post(
   '/admin/returns/requests/:orderId/reverse-pickup/retry',

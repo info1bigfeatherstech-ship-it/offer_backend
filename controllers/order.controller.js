@@ -3150,6 +3150,10 @@ exports.getOrder = async (req, res) => {
 
         if (transformedOrder.returnInfo) {
             transformedOrder.returnInfo.windowDays = RETURN_REQUEST_WINDOW_DAYS;
+            // Chat stays open until admin closes it (independent of return-request raise window).
+            transformedOrder.returnInfo.isChatActive = Boolean(
+                transformedOrder.returnInfo.requestedAt && !transformedOrder.returnInfo.chatClosedAt
+            );
         }
 
         const payload = {
@@ -4053,6 +4057,9 @@ exports.getAdminReturnRequest = async (req, res) => {
         }
         if (order.returnInfo) {
             order.returnInfo.windowDays = RETURN_REQUEST_WINDOW_DAYS;
+            order.returnInfo.isChatActive = Boolean(
+                order.returnInfo.requestedAt && !order.returnInfo.chatClosedAt
+            );
         }
         return res.json({
             success: true,
@@ -4311,6 +4318,11 @@ exports.refundOrderPayment = async (req, res) => {
 };
 
 // ========== RETURN CHAT SUPPORT ==========
+/** Return-request raise window (delivery + N days) is separate; chat stays open until admin closes it. */
+function isReturnChatSessionActive(order) {
+    return Boolean(order?.returnInfo?.requestedAt) && !order?.returnInfo?.chatClosedAt;
+}
+
 exports.sendReturnChatMessage = async (req, res) => {
     try {
         const { orderId } = req.params;
@@ -4339,13 +4351,13 @@ exports.sendReturnChatMessage = async (req, res) => {
             );
         }
 
-        const requestedAt = order.returnInfo?.requestedAt;
-        const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
-        const deadlineAt = new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000);
-        const isExpired = new Date() > deadlineAt;
-
-        if (isExpired) {
-            return respondOrderError(res, 403, 'CHAT_WINDOW_EXPIRED', `Support chat window of ${windowDays} days has expired`);
+        if (!isReturnChatSessionActive(order)) {
+            return respondOrderError(
+                res,
+                403,
+                'CHAT_SESSION_CLOSED',
+                'This support chat session is closed. New messages cannot be sent.'
+            );
         }
 
         const sender = isAdmin ? 'admin' : 'user';
@@ -4374,8 +4386,8 @@ exports.sendReturnChatMessage = async (req, res) => {
             chat: order.returnInfo.chat,
             userLastRead: order.returnInfo.userLastRead,
             adminLastRead: order.returnInfo.adminLastRead,
-            chatWindowDeadline: deadlineAt.toISOString(),
-            isChatActive: !isExpired
+            chatClosedAt: order.returnInfo.chatClosedAt || null,
+            isChatActive: true
         });
     } catch (error) {
         logger.error('sendReturnChatMessage failed', { message: error.message, stack: error.stack });
@@ -4416,22 +4428,83 @@ exports.getReturnChat = async (req, res) => {
             await order.save();
         }
 
-        const requestedAt = order.returnInfo?.requestedAt;
-        const windowDays = Number(RETURN_REQUEST_WINDOW_DAYS) || 2;
-        const deadlineAt = requestedAt ? new Date(new Date(requestedAt).getTime() + windowDays * 24 * 60 * 60 * 1000) : null;
-        const isExpired = deadlineAt ? (new Date() > deadlineAt) : true;
+        const isChatActive = isReturnChatSessionActive(order);
 
         return res.json({
             success: true,
             chat: order.returnInfo?.chat || [],
             userLastRead: order.returnInfo?.userLastRead,
             adminLastRead: order.returnInfo?.adminLastRead,
-            chatWindowDeadline: deadlineAt ? deadlineAt.toISOString() : null,
-            isChatActive: requestedAt ? !isExpired : false
+            chatClosedAt: order.returnInfo?.chatClosedAt || null,
+            isChatActive
         });
     } catch (error) {
         logger.error('getReturnChat failed', { message: error.message, stack: error.stack });
         return respondOrderError(res, 500, 'GET_CHAT_FAILED', 'Could not fetch chat history');
+    }
+};
+
+/**
+ * Admin-only: permanently lock return-support chat for this order (both sides).
+ * Idempotent if already closed. Does not affect return-request raise window.
+ */
+exports.closeReturnChatSession = async (req, res) => {
+    try {
+        const isAdmin = req.userRole === 'admin' || req.userRole === 'order_manager';
+        if (!isAdmin) {
+            return respondOrderError(res, 403, 'FORBIDDEN', 'Only admin staff can close chat sessions');
+        }
+
+        const { orderId } = req.params;
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
+
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        if (!isCustomerProductReturnRequest(order)) {
+            return respondOrderError(
+                res,
+                400,
+                'RETURN_NOT_REQUESTED',
+                'Chat is only available for customer product return requests'
+            );
+        }
+
+        if (!order.returnInfo) {
+            return respondOrderError(res, 400, 'RETURN_INFO_MISSING', 'Return info not found on this order');
+        }
+
+        if (order.returnInfo.chatClosedAt) {
+            return res.json({
+                success: true,
+                alreadyClosed: true,
+                chatClosedAt: order.returnInfo.chatClosedAt,
+                chat: order.returnInfo.chat || [],
+                isChatActive: false
+            });
+        }
+
+        order.returnInfo.chatClosedAt = new Date();
+        order.returnInfo.chatClosedBy = req.userId || null;
+        order.markModified('returnInfo');
+        await order.save();
+
+        logger.info('Return chat session closed by admin', {
+            orderId: order.orderId,
+            closedBy: req.userId || null
+        });
+
+        return res.json({
+            success: true,
+            alreadyClosed: false,
+            chatClosedAt: order.returnInfo.chatClosedAt,
+            chat: order.returnInfo.chat || [],
+            isChatActive: false
+        });
+    } catch (error) {
+        logger.error('closeReturnChatSession failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'CLOSE_CHAT_FAILED', 'Could not close chat session');
     }
 };
 
