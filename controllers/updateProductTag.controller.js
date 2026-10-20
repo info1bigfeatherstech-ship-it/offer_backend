@@ -4,12 +4,19 @@ const ProductTag = require("../models/ProductTag");
 async function updateProductTagController(req, res) {
   try {
     const { slugs, flagType, value } = req.body;
-    console.log(`Received request to update flag '${flagType}' to '${value}' for products: ${slugs.join(", ")}`);
+    console.log(`Received request to update flag '${flagType}' to '${value}' for products: ${Array.isArray(slugs) ? slugs.join(", ") : slugs}`);
 
     if (!Array.isArray(slugs) || slugs.length === 0) {
       return res.status(400).json({
         success: false,
         message: "Slugs are required",
+      });
+    }
+
+    if (slugs.length > 200) {
+      return res.status(400).json({
+        success: false,
+        message: "Too many products in one request",
       });
     }
 
@@ -41,7 +48,9 @@ async function updateProductTagController(req, res) {
 
         let updatedTags = existing?.tags || [];
 
-        if (value) {
+        const enabled = value === true || value === "true" || value === 1 || value === "1";
+
+        if (enabled) {
           // ✅ ADD flag
           if (!updatedTags.includes(flagType)) {
             updatedTags.push(flagType);
@@ -60,6 +69,14 @@ async function updateProductTagController(req, res) {
         return updatedDoc;
       })
     );
+
+    try {
+      const cacheService = require("../services/cache.service");
+      const cacheConfig = require("../config/cache.config");
+      await cacheService.forget(`${cacheConfig.prefixes.PRODUCT}:*`);
+    } catch (cacheErr) {
+      console.warn("[updateProductTag] cache invalidation skipped", cacheErr?.message);
+    }
 
     return res.status(200).json({
       success: true,

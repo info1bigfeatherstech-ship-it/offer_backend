@@ -6484,11 +6484,24 @@ const bulkHardDelete = async (req, res) => {
   }
 };
 
+const ADMIN_PRODUCT_TAG_FLAGS = ["on-sale", "today-arrival"];
+
+const countAdminTaggedProducts = async (tag) => {
+  const docs = await ProductTag.find({ tags: tag }).select("product").lean();
+  const ids = docs.map((d) => d.product).filter(Boolean);
+  if (ids.length === 0) return 0;
+  return Product.countDocuments({
+    _id: { $in: ids },
+    status: { $ne: "archived" },
+  });
+};
+
 const getAllProductsAdmin = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = "" } = req.query;
+    let { page = 1, limit = 20, search = "", tags = "" } = req.query;
 
     page = Number(page);
+    if (!Number.isFinite(page) || page < 1) page = 1;
     limit = Math.min(100, Math.max(1, Number(limit)));
 
     const skip = (page - 1) * limit;
@@ -6505,15 +6518,58 @@ const getAllProductsAdmin = async (req, res) => {
         }
       : {};
 
-    const [products, totalProducts] = await Promise.all([
-      Product.find(searchFilter)
+    const requestedTag = String(tags || "").trim().replace(/_/g, "-");
+    const tagFilter = ADMIN_PRODUCT_TAG_FLAGS.includes(requestedTag) ? requestedTag : null;
+    const includeTagCounts =
+      req.query.includeTagCounts === "true" ||
+      req.query.includeTagCounts === "1";
+
+    const productFilter = { ...searchFilter };
+
+    if (tagFilter) {
+      const taggedDocs = await ProductTag.find({ tags: tagFilter })
+        .select("product")
+        .lean();
+      const taggedProductIds = taggedDocs.map((item) => item.product).filter(Boolean);
+
+      if (taggedProductIds.length === 0) {
+        let onSaleCount = 0;
+        let todayArrivalCount = 0;
+        if (includeTagCounts) {
+          [onSaleCount, todayArrivalCount] = await Promise.all([
+            countAdminTaggedProducts("on-sale"),
+            countAdminTaggedProducts("today-arrival"),
+          ]);
+        }
+        return res.status(200).json({
+          success: true,
+          totalProducts: 0,
+          totalPages: 0,
+          currentPage: page,
+          products: [],
+          ...(includeTagCounts ? { onSaleCount, todayArrivalCount } : {}),
+        });
+      }
+
+      productFilter._id = { $in: taggedProductIds };
+    }
+
+    const tagCountPromises = includeTagCounts
+      ? [
+          countAdminTaggedProducts("on-sale"),
+          countAdminTaggedProducts("today-arrival"),
+        ]
+      : [];
+
+    const [products, totalProducts, ...tagCounts] = await Promise.all([
+      Product.find(productFilter)
         .populate("category", "name slug status")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .lean({ virtuals: true }),
-
-      Product.countDocuments(searchFilter),
+      Product.countDocuments(productFilter),
+      ...tagCountPromises,
     ]);
 
     // get ids
@@ -6558,9 +6614,15 @@ const getAllProductsAdmin = async (req, res) => {
     return res.status(200).json({
       success: true,
       totalProducts,
-      totalPages: Math.ceil(totalProducts / limit),
+      totalPages: Math.ceil(totalProducts / limit) || 0,
       currentPage: page,
       products: finalProducts, // <- THIS
+      ...(includeTagCounts
+        ? {
+            onSaleCount: tagCounts[0] || 0,
+            todayArrivalCount: tagCounts[1] || 0,
+          }
+        : {}),
     });
   } catch (error) {
     console.error("Get all products error:", error);
