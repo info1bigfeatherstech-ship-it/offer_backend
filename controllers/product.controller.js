@@ -1240,12 +1240,48 @@ const createProduct = async (req, res) => {
       // Wholesale flag
       const wholesale = !!v.wholesale;
 
-      // Price object
+      const saleRaw = v.price?.sale != null ? Number(v.price.sale) : null;
+      if (saleRaw != null && !Number.isFinite(saleRaw)) {
+        return res.status(400).json({
+          success: false,
+          message: `Sale price must be a valid number for variant ${i}`
+        });
+      }
+
+      let wholesaleBase;
+      let wholesaleSale;
+      if (wholesale) {
+        const parsedWholesaleBase = parsePositiveNumber(
+          v.price?.wholesaleBase ?? v.wholesaleBase
+        );
+        if (parsedWholesaleBase == null) {
+          return res.status(400).json({
+            success: false,
+            message: `wholesaleBase is required and must be greater than 0 for variant ${i}`
+          });
+        }
+        wholesaleBase = parsedWholesaleBase;
+
+        const rawWholesaleSale = v.price?.wholesaleSale ?? v.wholesaleSale;
+        if (rawWholesaleSale != null && rawWholesaleSale !== "") {
+          const parsedWholesaleSale = Number(rawWholesaleSale);
+          if (!Number.isFinite(parsedWholesaleSale) || parsedWholesaleSale < 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Wholesale sale price must be a valid number for variant ${i}`
+            });
+          }
+          wholesaleSale = parsedWholesaleSale;
+        } else {
+          wholesaleSale = null;
+        }
+      }
+
       const priceObj = {
         base: Number(v.price?.base) || 0,
-        sale: v.price?.sale != null ? Number(v.price.sale) : null,
-        wholesaleBase: wholesale ? Number(v.price?.wholesaleBase) : undefined,
-        wholesaleSale: wholesale ? (v.price?.wholesaleSale != null ? Number(v.price.wholesaleSale) : null) : undefined
+        sale: saleRaw,
+        wholesaleBase: wholesale ? wholesaleBase : undefined,
+        wholesaleSale: wholesale ? wholesaleSale : undefined
       };
 
       if (priceObj.sale != null && priceObj.sale >= priceObj.base) {
@@ -1265,13 +1301,13 @@ const createProduct = async (req, res) => {
       // MOQ logic
       let moq = 1;
       if (wholesale) {
-        if (!v.minimumOrderQuantity || v.minimumOrderQuantity < 1) {
+        moq = Number(v.minimumOrderQuantity);
+        if (!Number.isFinite(moq) || moq < 1) {
           return res.status(400).json({
             success: false,
             message: `Minimum order quantity is required and must be at least 1 for wholesale variant ${i}`
           });
         }
-        moq = Number(v.minimumOrderQuantity);
       }
 
       const inventoryObj = {
