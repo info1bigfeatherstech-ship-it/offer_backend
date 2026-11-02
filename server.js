@@ -58,6 +58,10 @@ const adminOrdersRoutes = require('./routes/admin-orders.route');
 const adminRtoRoutes = require('./routes/admin-rto.route');
 const adminOosInquiryRoutes = require('./routes/admin-out-of-stock-inquiry.route');
 const oosInquiryPublicRoutes = require('./routes/out-of-stock-inquiry.public.route');
+const adminGiftEnquiryRoutes = require('./routes/admin-corporate-gift-enquiry.route');
+const giftEnquiryPublicRoutes = require('./routes/corporate-gift-enquiry.public.route');
+const sameDayPublicRoutes = require('./sameDayDelivery/routes/sameDayDelivery.public.route');
+const sameDayAdminRoutes = require('./sameDayDelivery/routes/sameDayDelivery.admin.route');
 const userNotificationRoutes = require('./routes/user-notification.route');
 const staffRoutes = require('./routes/staff.route');
 const orderRoutes = require('./routes/orders.route');
@@ -525,6 +529,10 @@ app.use('/api/wholesaler/activate/send-otp', limiters.sensitive);
 app.use('/api/wholesaler/activate/verify', limiters.sensitive);
 app.use('/api/wholesaler/owner-review', limiters.sensitive);
 app.use('/api/oos-inquiries', limiters.sensitive);
+app.use('/api/gift-enquiries', limiters.sensitive);
+app.use('/api/same-day-delivery/quote', limiters.checkoutQuote);
+app.use('/api/same-day-delivery/confirm', limiters.checkoutConfirm);
+app.use('/api/same-day-delivery', limiters.write);
 
 // Orders: dedicated bucket (the `sensitive` cap blocked normal My Orders flow).
 app.use('/api/orders', limiters.orders);
@@ -733,6 +741,10 @@ app.get('/api', (req, res) => {
       adminAnalytics: '/api/admin/analytics',
       adminSeoAnalytics: '/api/admin/seo-analytics',
       adminOrders: '/api/admin/orders',
+      giftEnquiries: '/api/gift-enquiries',
+      adminGiftEnquiries: '/api/admin/gift-enquiries',
+      sameDayDelivery: '/api/same-day-delivery',
+      adminSameDayDelivery: '/api/admin/same-day-delivery',
       publicRazorpayKey: '/api/public/razorpay-key',
       orders: '/api/orders',
       checkout: '/api/checkout',
@@ -761,6 +773,8 @@ app.use('/api/admin/seo-analytics', seoAnalyticsRoutes);
 app.use('/api/admin/orders', adminOrdersRoutes);
 app.use('/api/admin/rto', adminRtoRoutes);
 app.use('/api/admin/oos-inquiries', adminOosInquiryRoutes);
+app.use('/api/admin/gift-enquiries', adminGiftEnquiryRoutes);
+app.use('/api/admin/same-day-delivery', sameDayAdminRoutes);
 app.use('/api/admin/staff', staffRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/checkout', checkoutRoutes);
@@ -777,6 +791,8 @@ app.use('/api/product-reviews', limiters.write, productReviewUserRoutes);
 app.use('/api/admin/product-reviews', limiters.admin, adminProductReviewRoutes);
 app.use('/api/wholesaler', wholesalerRoutes);
 app.use('/api/oos-inquiries', oosInquiryPublicRoutes);
+app.use('/api/gift-enquiries', giftEnquiryPublicRoutes);
+app.use('/api/same-day-delivery', sameDayPublicRoutes);
 
 // ============================================================================
 // Error Handling Middleware
@@ -816,7 +832,9 @@ app.use((err, req, res, next) => {
   if (err.name === 'MulterError' && err.code === 'LIMIT_FILE_SIZE') {
     message = String(req.path || '').includes('/categories')
       ? 'Image file is too large. Maximum size is 20 MB for category images.'
-      : (err.message || 'Uploaded file is too large.');
+      : String(req.path || '').includes('/gift-enquiries')
+        ? 'Each file must be 20 MB or smaller.'
+        : (err.message || 'Uploaded file is too large.');
   }
 
   res.status(statusCode).json({

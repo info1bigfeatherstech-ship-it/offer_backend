@@ -102,6 +102,13 @@ function assertEditablePendingOrder(order) {
   if (!order) {
     throw createEditError(404, 'ORDER_NOT_FOUND', 'Order not found');
   }
+  if (String(order.fulfillmentMode || '').toLowerCase() === 'same_day') {
+    throw createEditError(
+      400,
+      'SAME_DAY_USE_SDD_EDIT',
+      'Same-day orders must be edited from the Same Day Delivery tab.'
+    );
+  }
   const status = String(order.orderStatus || '').toLowerCase();
   if (status !== 'pending') {
     throw createEditError(

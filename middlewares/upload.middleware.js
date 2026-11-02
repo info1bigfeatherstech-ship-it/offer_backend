@@ -1,6 +1,14 @@
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');  // ✅ ADD THIS - Required for file system operations
+const {
+  MAX_GIFT_FILE_BYTES,
+  MAX_REFERENCE_PHOTOS,
+  MAX_LOGOS,
+  MAX_BUSINESS_CARDS,
+  IMAGE_MIME_TYPES,
+  LOGO_MIME_TYPES,
+} = require('../utils/corporateGiftEnquiryValidation');
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 /** Category banner + card uploads (admin / product_manager). */
@@ -235,6 +243,116 @@ const labelLogoUpload = multer({
 
 const uploadLabelLogoFile = labelLogoUpload.single('logo');
 
+// ===============================
+// CORPORATE GIFT ENQUIRY (logos + reference photos)
+// ===============================
+const giftEnquiryFileFilter = (req, file, cb) => {
+  const field = String(file.fieldname || '');
+  const mime = String(file.mimetype || '').toLowerCase();
+  const reject = (code, message) => {
+    const err = new Error(message);
+    err.statusCode = 400;
+    err.code = code;
+    err.field = field;
+    cb(err);
+  };
+
+  if (field === 'referencePhotos') {
+    if (IMAGE_MIME_TYPES.includes(mime)) {
+      cb(null, true);
+      return;
+    }
+    reject(
+      'INVALID_FILE_TYPE',
+      'Reference photos must be image files (JPG, JPEG, PNG, WEBP). PDF is not allowed.'
+    );
+    return;
+  }
+
+  if (field === 'logos') {
+    if (LOGO_MIME_TYPES.includes(mime)) {
+      cb(null, true);
+      return;
+    }
+    reject(
+      'INVALID_FILE_TYPE',
+      'Logo files must be images (JPG, JPEG, PNG, WEBP) or PDF. CDR/AI are not accepted.'
+    );
+    return;
+  }
+
+  if (field === 'businessCard') {
+    if (LOGO_MIME_TYPES.includes(mime)) {
+      cb(null, true);
+      return;
+    }
+    reject(
+      'INVALID_FILE_TYPE',
+      'Business card must be an image (JPG, JPEG, PNG, WEBP) or PDF.'
+    );
+    return;
+  }
+
+  reject(
+    'TOO_MANY_FILES',
+    `Unexpected file field "${field}". Use referencePhotos, logos, or businessCard.`
+  );
+};
+
+const giftEnquiryUpload = multer({
+  storage: multer.memoryStorage(),
+  fileFilter: giftEnquiryFileFilter,
+  limits: {
+    files: MAX_REFERENCE_PHOTOS + MAX_LOGOS + MAX_BUSINESS_CARDS,
+    fileSize: MAX_GIFT_FILE_BYTES,
+  },
+});
+
+const giftEnquiryFields = giftEnquiryUpload.fields([
+  { name: 'referencePhotos', maxCount: MAX_REFERENCE_PHOTOS },
+  { name: 'logos', maxCount: MAX_LOGOS },
+  { name: 'businessCard', maxCount: MAX_BUSINESS_CARDS },
+]);
+
+/**
+ * Multer wrapper so gift-enquiry upload failures return stable API codes
+ * instead of a generic 500 / MulterError.
+ */
+function uploadGiftEnquiryFiles(req, res, next) {
+  giftEnquiryFields(req, res, (err) => {
+    if (!err) return next();
+
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        code: 'FILE_TOO_LARGE',
+        message: 'Each file must be 20 MB or smaller.',
+      });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({
+        success: false,
+        code: 'TOO_MANY_FILES',
+        message:
+          'Too many files. Reference photos: max 6 images. Logos: max 3. Business card: max 1.',
+        field: err.field || undefined,
+      });
+    }
+    if (err.statusCode && err.code) {
+      return res.status(err.statusCode).json({
+        success: false,
+        code: err.code,
+        message: err.message,
+        ...(err.field ? { field: err.field } : {}),
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_FILE_TYPE',
+      message: err.message || 'Uploaded file is not allowed.',
+    });
+  });
+}
 
 module.exports = {
   uploadProductImages,
@@ -245,5 +363,6 @@ module.exports = {
   uploadWholesalerProofs,
   uploadReturnProofs,
   uploadReviewImages,
-  uploadLabelLogoFile
+  uploadLabelLogoFile,
+  uploadGiftEnquiryFiles,
 };

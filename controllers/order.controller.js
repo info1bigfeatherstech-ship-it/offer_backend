@@ -17,6 +17,13 @@ const {
     isShipmozoOrder
 } = require('../constants/shippingProviders');
 const logger = require('../utils/logger');
+const {
+    isSameDayQuote,
+    isSameDayOrder,
+    createSddHttpError
+} = require('../sameDayDelivery/utils/sameDayDeliveryMode');
+const { assertPincodeEligible } = require('../sameDayDelivery/services/sameDayDeliverySettings.service');
+const { SDD_DELIVERY_META } = require('../sameDayDelivery/services/sameDayCheckout.service');
 const { cloudinary } = require('../config/cloudinary.config');
 const {
     computeCheckoutTotals,
@@ -181,6 +188,15 @@ async function applySuccessfulOnlineCaptureSideEffects(order, trigger) {
             trigger,
             message: commitErr?.message || String(commitErr)
         });
+    }
+
+    if (
+        isSameDayOrder(order) &&
+        ['paid', 'partially_paid'].includes(String(order.paymentStatus || '').toLowerCase()) &&
+        String(order.orderStatus || '').toLowerCase() === 'pending'
+    ) {
+        order.orderStatus = 'confirmed';
+        dirty = true;
     }
 
     return { dirty, recovery: recovery.changed ? recovery : null };
@@ -764,6 +780,14 @@ async function markShipmentSyncFailure({ order, error, trigger }) {
 
 async function ensureShipmentForOrder({ order, trigger }) {
     if (!order) return { success: false, code: 'ORDER_REQUIRED', message: 'Order is required.' };
+
+    if (isSameDayOrder(order)) {
+        return {
+            success: false,
+            code: 'SAME_DAY_NO_COURIER',
+            message: 'Same-day orders are dispatched manually and do not create courier shipments.'
+        };
+    }
 
     if (!isLegacyAutoFulfillOnCheckout()) {
         const st = String(order.orderStatus || '').toLowerCase();
@@ -1363,6 +1387,25 @@ exports.createOrder = async (req, res) => {
             });
         }
 
+        const sameDayCheckout = isSameDayQuote(quote);
+        if (sameDayCheckout) {
+            if (storefront !== 'ecomm') {
+                throw createSddHttpError(
+                    400,
+                    'SAME_DAY_ECOMM_ONLY',
+                    'Same day delivery is only available on the ecomm store.'
+                );
+            }
+            await assertPincodeEligible(pin);
+            if (normalizedPaymentMethod !== 'online' || confirmedPaymentPlan !== 'full') {
+                throw createSddHttpError(
+                    400,
+                    'SAME_DAY_ONLINE_FULL_ONLY',
+                    'Same day delivery requires full online payment.'
+                );
+            }
+        }
+
         const isAdvanceBalanceCod = isAdvanceBalanceCodCheckout({
             paymentMethod: normalizedPaymentMethod,
             paymentPlan: confirmedPaymentPlan,
@@ -1392,7 +1435,9 @@ exports.createOrder = async (req, res) => {
             });
         }
 
-        const deliveryOverride = {
+        const deliveryOverride = sameDayCheckout
+            ? { charges: 0, meta: { ...SDD_DELIVERY_META } }
+            : {
             charges: Number(quote.deliveryCharges) || 0,
             meta: {
                 estimatedDays: quote.shippingMeta?.estimatedDays || null,
@@ -1643,7 +1688,24 @@ exports.createOrder = async (req, res) => {
                           ? Boolean(quoteShip.pickupsAutomaticallyScheduled)
                           : null
             },
-            shippingWeightSnapshot
+            shippingWeightSnapshot,
+            ...(sameDayCheckout
+                ? {
+                    fulfillmentMode: 'same_day',
+                    sameDay: { pincode: pin },
+                    deliveryCharges: 0,
+                    deliveryFreightInr: 0,
+                    deliveryCodFeeInr: 0,
+                    shippingSnapshot: {
+                        courierName: null,
+                        estimatedDays: null,
+                        courierCompanyId: null,
+                        shipmozoCourierId: null,
+                        provider: null,
+                        pickupsAutomaticallyScheduled: null
+                    }
+                }
+                : {})
         };
 
         // 9. Persist order under pre-allocated orderId.
@@ -2065,7 +2127,7 @@ exports.verifyPayment = async (req, res) => {
             (order.paymentStatus === 'paid' ||
                 (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
                     order.paymentStatus === 'partially_paid'));
-        if (shouldEnqueueShipmentAfterVerify) {
+        if (shouldEnqueueShipmentAfterVerify && !isSameDayOrder(order)) {
             ensureShipmentForOrder({
                 order,
                 trigger: 'payment_verified'
@@ -2211,7 +2273,7 @@ exports.razorpayWebhook = async (req, res) => {
                     (order.paymentStatus === 'paid' ||
                         (String(order.paymentInfo?.balanceCollectionMethod || '') === 'cod' &&
                             order.paymentStatus === 'partially_paid'));
-                if (shouldEnqueueShipmentAfterWebhook) {
+                if (shouldEnqueueShipmentAfterWebhook && !isSameDayOrder(order)) {
                     ensureShipmentForOrder({
                         order,
                         trigger: 'razorpay_webhook_payment_captured'
@@ -3502,6 +3564,36 @@ function buildPaymentTimelineStep(order) {
 function buildDefaultOrderTimeline(order) {
     const placed = { status: 'Order Placed', completed: true, timestamp: order.createdAt };
     const payment = buildPaymentTimelineStep(order);
+
+    if (isSameDayOrder(order)) {
+        const stSdd = String(order.orderStatus || '').toLowerCase();
+        if (stSdd === 'cancelled' || stSdd === 'payment_failed') {
+            return [
+                placed,
+                {
+                    status: stSdd === 'cancelled' ? 'Cancelled' : 'Payment failed',
+                    completed: true,
+                    timestamp: order.paymentInfo?.cancelledAt || order.updatedAt
+                }
+            ];
+        }
+        const paid = ['paid', 'partially_paid'].includes(String(order.paymentStatus || '').toLowerCase());
+        const shipped = stSdd === 'shipped';
+        return [
+            placed,
+            payment,
+            {
+                status: 'Confirmed — same day delivery',
+                completed: paid || stSdd === 'confirmed' || shipped,
+                timestamp: paid ? order.paymentInfo?.paidAt || order.updatedAt : null
+            },
+            {
+                status: 'Shipped',
+                completed: shipped,
+                timestamp: shipped ? order.sameDay?.shippedAt || order.updatedAt : null
+            }
+        ];
+    }
 
     // Warehouse self-pickup — never show courier Shipped / Out for Delivery steps.
     const isSelfPickup =

@@ -16,6 +16,17 @@ const checkoutQuoteSchema = new mongoose.Schema(
     taxes: { type: Number, required: true, min: 0, default: 0 },
     amountPayable: { type: Number, required: true, min: 0 },
 
+    /**
+     * standard (default / missing) = existing courier quote.
+     * same_day = no courier APIs; ecomm only.
+     */
+    deliveryMode: {
+      type: String,
+      enum: ['standard', 'same_day'],
+      default: 'standard',
+      index: true
+    },
+
     shippingMeta: {
       isDeliverable: { type: Boolean, default: false },
       estimatedDays: { type: String, default: null },

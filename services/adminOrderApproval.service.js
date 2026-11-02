@@ -128,6 +128,16 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
       return { orderId: id, success: false, skipped: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
     }
 
+    if (String(order.fulfillmentMode || '').toLowerCase() === 'same_day') {
+      return {
+        orderId: id,
+        success: false,
+        skipped: false,
+        code: 'SAME_DAY_NO_COURIER_ACCEPT',
+        message: 'Same-day orders are not accepted through courier fulfilment. Use the Same Day Delivery tab to ship or cancel.'
+      };
+    }
+
     const status = String(order.orderStatus || '').toLowerCase();
     if (status === 'confirmed') {
       return {

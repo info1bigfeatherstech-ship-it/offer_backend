@@ -88,6 +88,14 @@ function evaluateSelfPickupEligibility(order) {
     };
   }
 
+  if (String(order.fulfillmentMode || '').toLowerCase() === 'same_day') {
+    return {
+      ok: false,
+      code: 'SELF_PICKUP_SAME_DAY_FORBIDDEN',
+      message: 'Self pickup cannot be applied to same-day delivery orders.'
+    };
+  }
+
   if (String(order.fulfillmentMode || '').toLowerCase() === 'self_pickup') {
     return {
       ok: false,

@@ -1,6 +1,6 @@
 const sharp = require('sharp');
 const { cloudinary } = require('../config/cloudinary.config');
-const { uploadBufferToR2, deleteFromR2ByKey } = require('./r2Storage');
+const { uploadBufferToR2, deleteFromR2ByKey, isR2Configured } = require('./r2Storage');
 
 const DEFAULT_MAX_WIDTH = Math.min(
   4096,
@@ -182,6 +182,20 @@ function getDefaultMediaProvider() {
   return 'cloudinary';
 }
 
+function isCloudinaryConfigured() {
+  return Boolean(
+    String(process.env.CLOUDINARY_CLOUD_NAME || '').trim() &&
+      String(process.env.CLOUDINARY_API_KEY || '').trim() &&
+      String(process.env.CLOUDINARY_API_SECRET || '').trim()
+  );
+}
+
+function isDefaultMediaConfigured() {
+  const provider = getDefaultMediaProvider();
+  if (provider === 'r2') return isR2Configured();
+  return isCloudinaryConfigured();
+}
+
 function uploadImageToCloudinary(fileBuffer, folderPath = 'products', publicIdName = null) {
   return new Promise((resolve, reject) => {
     const opts = {
@@ -240,20 +254,66 @@ const uploadToCloudinary = async (fileBuffer, folderPath = 'products', publicIdN
   return uploadImageToCloudinary(fileBuffer, folderPath, publicIdName);
 };
 
+function uploadRawToCloudinary(fileBuffer, folderPath = 'documents', publicIdName = null) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      folder: folderPath,
+      resource_type: 'raw',
+      format: 'pdf',
+    };
+    if (publicIdName) {
+      opts.public_id = publicIdName;
+    }
+    const stream = cloudinary.uploader.upload_stream(opts, (error, result) => {
+      if (error) {
+        reject(new Error(`Cloudinary upload error: ${error.message}`));
+      } else {
+        resolve({
+          url: result.secure_url,
+          publicId: result.public_id,
+        });
+      }
+    });
+    stream.end(fileBuffer);
+  });
+}
 
+/**
+ * PDF / raw documents on the same default provider as product images.
+ * @returns {Promise<{url: String, publicId: String}>}
+ */
+const uploadRawToDefaultMedia = async (fileBuffer, folderPath = 'documents', publicIdName = null) => {
+  const provider = getDefaultMediaProvider();
+  if (provider === 'r2') {
+    const upload = await uploadBufferToR2({
+      buffer: fileBuffer,
+      folderPath,
+      publicIdName: publicIdName || `doc-${Date.now()}`,
+      contentType: 'application/pdf',
+      extension: 'pdf',
+    });
+    return {
+      url: upload.url,
+      publicId: `r2:${upload.key}`,
+    };
+  }
+  return uploadRawToCloudinary(fileBuffer, folderPath, publicIdName);
+};
 
 /**
  * Delete image from Cloudinary
  * @param {String} publicId - Cloudinary public ID
+ * @param {String} [resourceType] - Cloudinary resource_type for non-image (e.g. raw PDF)
  */
-const deleteFromCloudinary = async (publicId) => {
+const deleteFromCloudinary = async (publicId, resourceType) => {
   try {
     if (String(publicId || '').startsWith('r2:')) {
       const key = String(publicId).slice(3);
       await deleteFromR2ByKey(key);
       return;
     }
-    await cloudinary.uploader.destroy(publicId);
+    const opts = resourceType ? { resource_type: resourceType } : undefined;
+    await cloudinary.uploader.destroy(publicId, opts);
   } catch (error) {
     console.error('Failed to delete image from Cloudinary:', error.message);
   }
@@ -261,6 +321,9 @@ const deleteFromCloudinary = async (publicId) => {
 
 module.exports = {
   uploadToCloudinary,
+  uploadRawToDefaultMedia,
   deleteFromCloudinary,
-  optimizeProductImageBuffer
+  optimizeProductImageBuffer,
+  getDefaultMediaProvider,
+  isDefaultMediaConfigured,
 };

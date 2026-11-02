@@ -84,9 +84,18 @@ const orderSchema = new mongoose.Schema(
      */
     fulfillmentMode: {
       type: String,
-      enum: ['courier', 'self_pickup', null],
+      enum: ['courier', 'self_pickup', 'same_day', null],
       default: null,
       index: true
+    },
+
+    /** Set when fulfillmentMode is same_day (ecomm manual warehouse dispatch). */
+    sameDay: {
+      pincode: { type: String, default: null, trim: true },
+      shippedAt: { type: Date, default: null },
+      shippedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      cancelledAt: { type: Date, default: null },
+      cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
     },
 
     /** Set when fulfillmentMode is self_pickup */

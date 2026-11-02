@@ -379,6 +379,37 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.selfPickup = false;
   }
 
+  if (String(o.fulfillmentMode || '').toLowerCase() === 'same_day') {
+    const sddReason = 'Same-day orders are fulfilled from the Same Day Delivery tab — courier actions are disabled.';
+    caps.accept = false;
+    caps.reject = false;
+    caps.shipNow = false;
+    caps.schedulePickup = false;
+    caps.generateManifest = false;
+    caps.downloadManifest = false;
+    caps.downloadLabel = false;
+    caps.syncShiprocket = false;
+    caps.refreshTracking = false;
+    caps.retryPickup = false;
+    caps.cancelShipment = false;
+    caps.selfPickup = false;
+    caps.openShiprocketSupport = false;
+    caps.openShiprocket = false;
+    caps.track = false;
+    blockReasons.accept = sddReason;
+    blockReasons.reject = sddReason;
+    blockReasons.shipNow = sddReason;
+    blockReasons.schedulePickup = sddReason;
+    blockReasons.generateManifest = sddReason;
+    blockReasons.downloadManifest = sddReason;
+    blockReasons.downloadLabel = sddReason;
+    blockReasons.syncShiprocket = sddReason;
+    blockReasons.refreshTracking = sddReason;
+    blockReasons.retryPickup = sddReason;
+    blockReasons.cancelShipment = sddReason;
+    blockReasons.selfPickup = sddReason;
+  }
+
   const manifestDownloaded = Boolean(si.manifestDownloaded);
   const labelDownloaded = Boolean(si.labelDownloaded);
 
