@@ -22,8 +22,9 @@ router.use(verifyToken);
 router.use(authorizeRoles('admin', 'order_manager'));
 router.use(requireAdminStorefrontScope);
 
-router.get('/settings', authorizeRoles('admin'), getSettings);
-router.put('/settings', authorizeRoles('admin'), updateSettings);
+// Settings (on/off + pincodes): admin + order_manager — same scope as other SDD admin routes
+router.get('/settings', getSettings);
+router.put('/settings', updateSettings);
 
 router.get('/orders/summary', getOrdersSummary);
 router.get('/orders', listOrders);
