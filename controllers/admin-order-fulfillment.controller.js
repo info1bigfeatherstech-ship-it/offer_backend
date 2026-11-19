@@ -2590,14 +2590,28 @@ exports.adminFulfillmentReassignCourier = async (req, res) => {
       );
     }
 
+    // Soft pre-sync: Shiprocket orders/show can flake (stale numeric id / transient 5xx).
+    // If we already have local shipment_id + AWB, continue reassign — same as panel Reassign.
+    const hasLocalReassignBase = Boolean(
+      String(order.shipmentInfo?.shipmentId || '').trim() &&
+        (order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber)
+    );
     const preSync = await syncShipmentFromShiprocket(order, 'admin_reassign_courier_presync');
     if (!preSync.success) {
-      return jsonError(
-        res,
-        502,
-        preSync.code || 'SYNC_BEFORE_REASSIGN_FAILED',
-        preSync.message || 'Could not verify Shiprocket state before reassign.'
-      );
+      if (!hasLocalReassignBase) {
+        return jsonError(
+          res,
+          502,
+          preSync.code || 'SYNC_BEFORE_REASSIGN_FAILED',
+          preSync.message ||
+            'Could not verify Shiprocket state before reassign. Refresh with the custom order id, then retry.'
+        );
+      }
+      logger.warn('[reassign] pre-sync failed; continuing with local shipment_id + AWB', {
+        orderId: order.orderId,
+        code: preSync.code || null,
+        message: preSync.message || null
+      });
     }
 
     let working = await Order.findOne({ orderId: order.orderId });
@@ -2607,7 +2621,8 @@ exports.adminFulfillmentReassignCourier = async (req, res) => {
 
     const { computeOpsState: computeOps } = require('../services/shipmentOps/computeOpsState');
     const { OPS_STATES } = require('../services/shipmentOps/constants');
-    if (preSync.resetApplied || computeOps(working) === OPS_STATES.PROVIDER_RESET) {
+    // Only trust reset detection when pre-sync actually succeeded.
+    if (preSync.success && (preSync.resetApplied || computeOps(working) === OPS_STATES.PROVIDER_RESET)) {
       return jsonError(
         res,
         409,
@@ -2675,7 +2690,8 @@ exports.adminFulfillmentReassignCourier = async (req, res) => {
       allowOrderStatusUpdate: false
     });
 
-    await syncShipmentFromShiprocket(working, 'admin_reassign_courier_sync');
+    // Post-sync is best-effort — assign already succeeded on Shiprocket.
+    const postSync = await syncShipmentFromShiprocket(working, 'admin_reassign_courier_sync');
     const finalOrder = await Order.findOne({ orderId: working.orderId });
     if (finalOrder) {
       await evaluateAndPersistShipmentOps(finalOrder, { source: 'admin_reassign_courier' });
@@ -2683,14 +2699,20 @@ exports.adminFulfillmentReassignCourier = async (req, res) => {
     const fresh = (await Order.findOne({ orderId: working.orderId })) || finalOrder;
     const finalOps = fresh ? buildShipmentOpsView(fresh, { source: 'admin_reassign_courier' }) : null;
 
+    const syncNote =
+      postSync && postSync.success === false
+        ? ' Courier was reassigned; Refresh Shiprocket if status looks stale.'
+        : '';
+
     return res.json({
       success: true,
-      message: `Courier reassigned to ${result.courierName || result.courierId}. Customer bill unchanged.`,
+      message: `Courier reassigned to ${result.courierName || result.courierId}. Customer bill unchanged.${syncNote}`,
       courierId: result.courierId,
       courierName: result.courierName,
       order: fresh,
       shipmentOps: finalOps,
-      customerBillUnchanged: true
+      customerBillUnchanged: true,
+      syncWarning: postSync && postSync.success === false ? postSync.message || null : null
     });
   } catch (error) {
     logger.error('adminFulfillmentReassignCourier', { message: error.message, stack: error.stack });
