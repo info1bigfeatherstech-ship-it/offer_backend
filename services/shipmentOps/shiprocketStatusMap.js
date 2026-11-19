@@ -171,6 +171,19 @@ function detectForwardOrderReset(input) {
     };
   }
 
+  // Case 3: Shiprocket panel "NEW" with no AWB (after cancel / stopped at assignment) → re-ship.
+  if (/^new$/.test(label) && !hasAwb) {
+    return {
+      resetDetected: true,
+      reason:
+        input.statusMessage ||
+        (hadLocalForwardCycle
+          ? 'Order returned to New on Shiprocket — re-ship required'
+          : 'Order is NEW on Shiprocket — assign courier via Ship now'),
+      classification: CLASSIFICATION.PROVIDER_RESET
+    };
+  }
+
   if (
     /^new$/.test(label) &&
     (/auto\s*cancel|pickup\s*not\s*done|no pickup done/.test(combined) || hadLocalForwardCycle)

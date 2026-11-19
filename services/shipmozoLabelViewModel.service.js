@@ -1,10 +1,16 @@
 /**
- * Build a print view-model for custom Shipmozo 4×6 labels.
- * Shiprocket orders never call this module.
+ * Build a print view-model for custom branded 4×6 shipping labels.
+ * Provider-agnostic (Shipmozo + Shiprocket). Settings/warehouse resolved by storefront helpers.
  */
 
 const shippingProviderSettingsService = require('./shippingProviderSettings.service');
-const { sanitizeSettings, defaultSettings } = require('./shipmozoLabelSettings.service');
+const {
+  sanitizeSettings,
+  defaultSettings,
+  normalizeStorefront,
+  resolveLabelSettingsStorefrontForOrder,
+  resolveWarehouseStorefront
+} = require('./shipmozoLabelSettings.service');
 const ShipmozoService = require('../utils/shipmozo');
 const logger = require('../utils/logger');
 
@@ -314,13 +320,22 @@ function buildLineItems(order, productsCfg) {
  */
 async function buildLabelViewModel(order, settingsPatch) {
   const settings = sanitizeSettings(settingsPatch || defaultSettings());
-  const storefront = String(order?.storefront || '').toLowerCase() === 'wholesale' ? 'wholesale' : 'ecomm';
+  const storefront = resolveLabelSettingsStorefrontForOrder(order);
+  const warehouseSf = resolveWarehouseStorefront(storefront);
   const addr = order?.addressSnapshot || {};
   const pay = paymentAndCollectable(order);
   const pack = dimsAndWeight(order);
-  const pickup = await resolvePickupWarehouse(storefront, settings.pickup?.sellerName);
+  const pickup = await resolvePickupWarehouse(warehouseSf, settings.pickup?.sellerName);
   const { lines, totalQty, hiddenCount } = buildLineItems(order, settings.products);
   const awb = String(order?.shipmentInfo?.awbCode || order?.shipmentInfo?.trackingNumber || '').trim();
+  const shipmentId = String(
+    order?.shipmentInfo?.shipmozoOrderId ||
+      order?.shipmentInfo?.shiprocketOrderId ||
+      order?.shipmentInfo?.shipmozoReferenceId ||
+      order?.shipmentInfo?.shipmentId ||
+      awb ||
+      ''
+  ).trim();
   const courier = displayCourierName(order);
   const routingCode = String(
     order?.shipmentInfo?.routingCode || order?.shipmentInfo?.sortCode || ''
@@ -334,12 +349,7 @@ async function buildLabelViewModel(order, settingsPatch) {
   ).trim();
   const created = order?.createdAt || new Date();
   const orderId = String(order?.orderId || '').trim();
-  const shipmozoId = String(
-    order?.shipmentInfo?.shipmozoOrderId ||
-      order?.shipmentInfo?.shipmozoReferenceId ||
-      order?.shipmentInfo?.shipmentId ||
-      ''
-  ).trim();
+  const shipmozoId = shipmentId;
 
   return {
     settings,
@@ -348,6 +358,7 @@ async function buildLabelViewModel(order, settingsPatch) {
     courier,
     awb,
     shipmozoId,
+    shipmentId,
     orderId,
     shipToName: customerName(addr),
     shipToLines: addressLines(addr),
@@ -414,15 +425,19 @@ function buildSampleLineItems(settings) {
 
 function buildSampleViewModel(settingsPatch, storefront) {
   const settings = sanitizeSettings(settingsPatch || defaultSettings());
-  const sf = String(storefront || '').toLowerCase() === 'wholesale' ? 'wholesale' : 'ecomm';
+  const sf = normalizeStorefront(storefront);
+  const sampleOrderId =
+    sf === 'wholesale' ? 'OWB-WH-865438' : sf === 'dropship' ? 'OWB-DS-865438' : 'OWB-ECOMM-865438';
+  const sampleShipmentId = '86543821';
   return {
     settings,
     storefront: sf,
     labelSize: '4x6',
     courier: 'XpressBees 10Kg',
     awb: 'SM1234567890',
-    shipmozoId: '86543821',
-    orderId: sf === 'wholesale' ? 'OWB-WH-865438' : 'OWB-ECOMM-865438',
+    shipmozoId: sampleShipmentId,
+    shipmentId: sampleShipmentId,
+    orderId: sampleOrderId,
     shipToName: 'John Wick',
     shipToLines: ['221B Baker Street', 'Connaught Place', 'New Delhi, Delhi, 110001', 'India'],
     shipToPhone: '9999999999',

@@ -53,6 +53,8 @@ const ACTION_KEYS = Object.freeze({
   syncShiprocket: 'syncShiprocket',
   refreshTracking: 'refreshTracking',
   retryPickup: 'retryPickup',
+  /** Shiprocket pickup-exception recovery — assign/awb with status=reassign */
+  reassignCourier: 'reassignCourier',
   cancelShipment: 'cancelShipment',
   selfPickup: 'selfPickup',
   openShiprocketSupport: 'openShiprocketSupport',
@@ -73,6 +75,7 @@ const ACTION_LABELS = Object.freeze({
   [ACTION_KEYS.syncShiprocket]: 'Refresh Shiprocket',
   [ACTION_KEYS.refreshTracking]: 'Refresh tracking',
   [ACTION_KEYS.retryPickup]: 'Retry pickup',
+  [ACTION_KEYS.reassignCourier]: 'Reassign courier',
   [ACTION_KEYS.cancelShipment]: 'Cancel on Shiprocket',
   [ACTION_KEYS.selfPickup]: 'Self pickup',
   [ACTION_KEYS.openShiprocketSupport]: 'Open Shiprocket support',
@@ -84,6 +87,7 @@ const ACTION_LABELS = Object.freeze({
 /** Primary action preference order when multiple capabilities are enabled. */
 const PRIMARY_ACTION_ORDER = Object.freeze([
   ACTION_KEYS.accept,
+  ACTION_KEYS.reassignCourier,
   ACTION_KEYS.retryPickup,
   ACTION_KEYS.shipNow,
   ACTION_KEYS.schedulePickup,

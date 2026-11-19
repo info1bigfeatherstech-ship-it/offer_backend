@@ -246,6 +246,12 @@ router.post(
   adminFulfillment.adminFulfillmentRetryPickup
 );
 
+router.post(
+  '/admin/items/:orderId/fulfillment/reassign-courier',
+  ...adminOrderStaff,
+  adminFulfillment.adminFulfillmentReassignCourier
+);
+
 router.get(
   '/admin/items/:orderId/fulfillment/couriers',
   ...adminOrderStaff,

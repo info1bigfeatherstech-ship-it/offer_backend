@@ -1582,7 +1582,11 @@ class ShiprocketService {
    * POST /external/courier/assign/awb — panel "Ship Now" equivalent.
    * @see https://apidocs.shiprocket.in/
    */
-  async assignAwb({ shipmentId, courierId = null }) {
+  /**
+   * @param {{ shipmentId: string|number, courierId?: number|null, reassign?: boolean }} opts
+   * reassign: Shiprocket panel "Reassign Courier" — status "reassign" (once / 24h).
+   */
+  async assignAwb({ shipmentId, courierId = null, reassign = false }) {
     const sid = this.parseNumericShipmentId(shipmentId);
     if (!sid) {
       return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid shipment_id is required' };
@@ -1595,21 +1599,25 @@ class ShiprocketService {
         trackingNumber: `MOCK-AWB-${sid}`,
         courier: 'Mock Courier',
         labelUrl: null,
-        providerStatus: 'mock_assigned',
-        raw: { mock: true }
+        providerStatus: reassign ? 'mock_reassigned' : 'mock_assigned',
+        raw: { mock: true, reassign: Boolean(reassign) }
       };
     }
     if (courierId == null || !Number.isFinite(Number(courierId))) {
       return { success: false, code: 'COURIER_ID_REQUIRED', message: 'courier_id is required for assign AWB' };
     }
     try {
+      const body = {
+        shipment_id: sid,
+        courier_id: Number(courierId)
+      };
+      if (reassign) {
+        body.status = 'reassign';
+      }
       const data = await this.requestWithAuth({
         method: 'post',
         url: `${this.baseURL}/external/courier/assign/awb`,
-        data: {
-          shipment_id: sid,
-          courier_id: Number(courierId)
-        },
+        data: body,
         timeout: 30000
       });
       if (!data) {
@@ -1797,10 +1805,15 @@ class ShiprocketService {
     if (!this.enabled) {
       return { success: false, code: 'SHIPROCKET_DISABLED', message: 'Shiprocket is disabled' };
     }
-    const rawIds = [shiprocketOrderId, channelOrderId]
-      .map((x) => (x != null ? String(x).trim() : ''))
-      .filter(Boolean);
-    const ids = [...new Set(rawIds)];
+    // Prefer channel order id first — numeric Shiprocket order ids can go stale after
+    // cancel / NEW reset (panel search finds channel id, not the old numeric id).
+    const channel = channelOrderId != null ? String(channelOrderId).trim() : '';
+    const srId = shiprocketOrderId != null ? String(shiprocketOrderId).trim() : '';
+    const ids = [];
+    if (channel) ids.push(channel);
+    if (srId && srId !== channel) ids.push(srId);
+
+    let lastErr = null;
     for (const id of ids) {
       try {
         const data = await this.requestWithAuth({
@@ -1812,10 +1825,28 @@ class ShiprocketService {
         const root = ShiprocketService.normalizeForwardOrderRoot(data);
         const snapshot = ShiprocketService.extractForwardOrderSnapshot(root);
         if (!snapshot) continue;
-        if (snapshot.shiprocketOrderId || snapshot.shipmentId) {
-          return { success: true, snapshot, raw: root };
+        if (snapshot.shiprocketOrderId || snapshot.shipmentId || snapshot.providerStatus) {
+          const resolvedVia = id === channel ? 'channel_order_id' : 'shiprocket_order_id';
+          if (resolvedVia === 'channel_order_id' && srId && snapshot.shiprocketOrderId) {
+            const snapSr = String(snapshot.shiprocketOrderId).trim();
+            if (snapSr && snapSr !== srId) {
+              logger.info('[Shiprocket] forward lookup via channel id; refreshing stale shiprocketOrderId', {
+                channelOrderId: channel,
+                staleShiprocketOrderId: srId,
+                freshShiprocketOrderId: snapSr
+              });
+            }
+          }
+          return {
+            success: true,
+            snapshot,
+            raw: root,
+            resolvedVia,
+            lookupId: id
+          };
         }
       } catch (err) {
+        lastErr = err;
         logger.warn('[Shiprocket] fetchForwardOrderSnapshot show failed', {
           id,
           status: err.response?.status,
@@ -1827,7 +1858,8 @@ class ShiprocketService {
       success: false,
       code: 'FORWARD_ORDER_LOOKUP_FAILED',
       message:
-        'Could not load order details from Shiprocket. Confirm the order exists and retry after AWB assignment.'
+        'Could not load order details from Shiprocket. Confirm the channel order exists (custom order id), then Refresh. Stale Shiprocket numeric ids after cancel are ignored when the channel order is found.',
+      details: lastErr?.response?.data || null
     };
   }
 

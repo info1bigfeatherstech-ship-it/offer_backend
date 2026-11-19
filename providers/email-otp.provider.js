@@ -63,6 +63,11 @@ const TEMPLATES = {
     title: 'Wholesaler Activation',
     intro: 'Use the OTP below to activate your wholesaler account.'
   },
+  dropshipper_activation: {
+    subject: 'Dropshipper Account Activation OTP — OfferWaleBaba',
+    title: 'Dropshipper Activation',
+    intro: 'Use the OTP below to activate your dropshipper account and set a password.'
+  },
   generic: {
     subject: 'Your OTP — OfferWaleBaba',
     title: 'One-Time Password',
@@ -90,7 +95,7 @@ const renderText = (otp, tpl, minutes) =>
  * @param {Object} params
  * @param {string} params.to        Recipient email address
  * @param {string} params.otp       6-digit OTP code
- * @param {string} [params.purpose] One of: registration | password_reset | contact_change | wholesaler_activation | generic
+ * @param {string} [params.purpose] One of: registration | password_reset | contact_change | wholesaler_activation | dropshipper_activation | generic
  * @param {number} [params.minutes] OTP expiry in minutes (shown in email body).
  *                                  Caller (delivery layer) supplies this so
  *                                  this module has zero dependency on the

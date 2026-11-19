@@ -1,11 +1,66 @@
 const ShipmozoLabelSettings = require('../models/ShipmozoLabelSettings');
 const logger = require('../utils/logger');
 
-const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
+const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale', 'dropship']);
+
+const STOREFRONT_ALIASES = {
+  dropshipper: 'dropship',
+  ds: 'dropship',
+  wholesaler: 'wholesale',
+  b2b: 'wholesale'
+};
 
 function normalizeStorefront(value) {
-  const s = String(value || 'ecomm').toLowerCase().trim();
+  const raw = String(value || 'ecomm').toLowerCase().trim();
+  const s = STOREFRONT_ALIASES[raw] || raw;
   return VALID_STOREFRONTS.has(s) ? s : 'ecomm';
+}
+
+/**
+ * Which label-settings document applies to this order (never fall through dropship → ecomm).
+ * @param {{ storefront?: string }} order
+ * @returns {'ecomm'|'wholesale'|'dropship'}
+ */
+function resolveLabelSettingsStorefrontForOrder(order) {
+  return normalizeStorefront(order?.storefront);
+}
+
+/**
+ * Shipping-provider / warehouse config for pickup on the label.
+ * Dropship label layout is separate but pickup inherits ecomm provider settings.
+ * @param {'ecomm'|'wholesale'|'dropship'|string} labelSf
+ * @returns {'ecomm'|'wholesale'}
+ */
+function resolveWarehouseStorefront(labelSf) {
+  const sf = normalizeStorefront(labelSf);
+  if (sf === 'wholesale') return 'wholesale';
+  if (sf === 'dropship') return 'ecomm';
+  return 'ecomm';
+}
+
+function applyFrontendAliases(src) {
+  const out = { ...(src && typeof src === 'object' ? src : {}) };
+  if (src?.miscellaneous && typeof src.miscellaneous === 'object') {
+    const m = { ...src.miscellaneous };
+    if (m.showEwayBillNo != null && m.showEwayBill == null) m.showEwayBill = m.showEwayBillNo;
+    if (m.showPoweredByStore != null && m.showPoweredBy == null) m.showPoweredBy = m.showPoweredByStore;
+    out.misc = { ...(out.misc && typeof out.misc === 'object' ? out.misc : {}), ...m };
+  }
+  if (src?.logo && typeof src.logo === 'object') {
+    const logo = src.logo;
+    out.branding = {
+      ...(out.branding && typeof out.branding === 'object' ? out.branding : {}),
+      ...(logo.enabled != null ? { showLogo: logo.enabled } : {}),
+      ...(logo.url != null ? { logoUrl: logo.url } : {})
+    };
+  }
+  if (src?.products && typeof src.products === 'object' && src.products.maxItems != null) {
+    out.products = {
+      ...(out.products && typeof out.products === 'object' ? out.products : {}),
+      maxLineItems: src.products.maxItems
+    };
+  }
+  return out;
 }
 
 function asBool(v, fallback) {
@@ -142,7 +197,7 @@ function mergeBranding(defaults, incoming, preserveAssets) {
  */
 function sanitizeSettings(incoming) {
   const d = defaultSettings();
-  const src = incoming && typeof incoming === 'object' ? incoming : {};
+  const src = applyFrontendAliases(incoming && typeof incoming === 'object' ? incoming : {});
   try {
     return {
       labelSize: '4x6',
@@ -264,6 +319,8 @@ async function saveSettings(storefront, patch, updatedBy) {
 
 module.exports = {
   normalizeStorefront,
+  resolveLabelSettingsStorefrontForOrder,
+  resolveWarehouseStorefront,
   defaultSettings,
   sanitizeSettings,
   getPublicSettings,

@@ -116,7 +116,7 @@ function computeMetaBandHeight(vm, s) {
   const leftH = 4 + metas.length * lineH + 3;
   let rightH = 14;
   if (s.delivery?.showAwbBarcode) {
-    if (vm.shipmozoId) rightH += 9;
+    if (vm.shipmentId || vm.shipmozoId) rightH += 9;
     rightH += 36 + 2;
     if (vm.awb) rightH += 9;
   }
@@ -310,7 +310,7 @@ async function renderLabelPdf(vm) {
         size: [PAGE_W, PAGE_H],
         margin: 0,
         autoFirstPage: true,
-        info: { Title: `Shipmozo label ${vm.orderId || vm.awb || ''}`.trim() }
+        info: { Title: `Shipping label ${vm.orderId || vm.awb || ''}`.trim() }
       });
       doc.on('data', (c) => chunks.push(c));
       doc.on('end', () => {
@@ -383,12 +383,12 @@ async function renderLabelPdf(vm) {
         fontSize: layout.courierFont, bold: true, align: 'left', height: 9
       });
       rcy += 10;
-      const shipmozoId = String(vm.shipmozoId || '').trim();
+      const shipmentId = String(vm.shipmentId || vm.shipmozoId || '').trim();
       const awbId = String(vm.awb || '').trim();
       if (s.delivery?.showAwbBarcode) {
         const barH = layout.awbBarH;
-        if (shipmozoId) {
-          fitOneLine(doc, `Shipmozo ID: ${shipmozoId}`, barX, rcy, barW, {
+        if (shipmentId) {
+          fitOneLine(doc, `Shipment ID: ${shipmentId}`, barX, rcy, barW, {
             fontSize: layout.secondaryFont, bold: true, align: 'left', height: 8
           });
           rcy += 9;
@@ -734,7 +734,7 @@ async function renderLabelHtml(vm) {
       ${
         s.delivery?.showAwbBarcode
           ? `<div class="awb-block">
-              ${vm.shipmozoId ? `<div class="id-line">${escapeHtml(`Shipmozo ID: ${vm.shipmozoId}`)}</div>` : ''}
+              ${vm.shipmentId || vm.shipmozoId ? `<div class="id-line">${escapeHtml(`Shipment ID: ${vm.shipmentId || vm.shipmozoId}`)}</div>` : ''}
               ${awbBar}
               ${vm.awb ? `<div class="awb-line">${escapeHtml(`AWB: ${vm.awb}`)}</div>` : ''}
             </div>`

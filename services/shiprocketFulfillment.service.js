@@ -14,6 +14,7 @@ const logger = require('../utils/logger');
 const {
   isCourierInactive,
   pickCheapestActiveCourier,
+  filterPreferNonStressedCouriers,
   getCourierCompanyIdFromRow,
   getCourierNameFromRow,
   buildCourierSubstituteNote
@@ -176,12 +177,201 @@ function unavailablePayload({
       ? { courierId: quoted.courierId, courierName: quoted.courierName }
       : null,
     suggestedCourier: suggested,
-    availableCouriers: (available || []).slice(0, 15).map(mapCourierPublic),
+    availableCouriers: filterPreferNonStressedCouriers(available || [])
+      .slice(0, 15)
+      .map(mapCourierPublic),
     quotedFreightInr: freightCap,
     customerBillUnchanged: true,
     details: details || null,
     assignCode: assignCode || null
   };
+}
+
+/**
+ * Shiprocket panel "Reassign Courier" — only for already-AWB'd pickup-exception recoveries.
+ * Does not touch customer bill / checkout totals. Does not change Ship Now happy path.
+ *
+ * @param {import('mongoose').Document} order
+ * @param {object} opts
+ * @param {number|null} [opts.courierId]
+ * @param {boolean} [opts.confirmSuggested]
+ */
+async function runShiprocketReassignCourier(order, opts = {}) {
+  const { courierId = null, confirmSuggested = false } = opts;
+  try {
+    if (!order) {
+      return { success: false, code: 'ORDER_REQUIRED', message: 'Order is required.' };
+    }
+    const sid = String(order.shipmentInfo?.shipmentId || '').trim();
+    if (!sid) {
+      return {
+        success: false,
+        code: 'SHIPMENT_ID_MISSING',
+        message: 'No shipment_id on order. Refresh Shiprocket sync first.'
+      };
+    }
+    const hasAwb = Boolean(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber);
+    if (!hasAwb) {
+      return {
+        success: false,
+        code: 'AWB_REQUIRED',
+        message: 'Reassign needs an existing AWB. Use Ship now if courier is not booked yet.'
+      };
+    }
+
+    const currentId =
+      order.shipmentInfo?.assignedCourierId != null &&
+      Number.isFinite(Number(order.shipmentInfo.assignedCourierId))
+        ? Number(order.shipmentInfo.assignedCourierId)
+        : null;
+    const freightCap = quotedFreightInr(order);
+    const quoted = quotedCourierFromOrder(order);
+
+    const hasOverride =
+      courierId != null && Number.isFinite(Number(courierId)) && Number(courierId) > 0;
+
+    const rates = await loadLiveRatesSafe(order);
+    const available = rates.couriers || [];
+    const parts = rates.parts;
+    const codRequired = Boolean(parts?.useCodAtDoor);
+
+    const pickSuggested = () => {
+      const picked = pickCheapestActiveCourier(available, {
+        codRequired,
+        maxCharge: freightCap,
+        excludeCourierIds: [currentId, quoted.courierId].filter(Boolean),
+        preferNonStressed: true
+      });
+      return enrichSuggested(picked, freightCap);
+    };
+
+    let targetId = hasOverride ? Number(courierId) : null;
+    let suggested = pickSuggested();
+
+    if (!hasOverride) {
+      if (!confirmSuggested) {
+        return {
+          success: false,
+          code: 'REASSIGN_COURIER_CONFIRM',
+          message:
+            'Confirm a substitute courier to reassign on Shiprocket (customer bill unchanged). Prefer a non-stressed courier near checkout freight.',
+          suggestedCourier: suggested,
+          availableCouriers: filterPreferNonStressedCouriers(available).slice(0, 15).map(mapCourierPublic),
+          currentCourier: {
+            courierId: currentId,
+            courierName: order.shipmentInfo?.courier || null
+          },
+          quotedFreightInr: freightCap,
+          customerBillUnchanged: true
+        };
+      }
+      targetId = suggested?.courierId ?? null;
+      if (targetId == null) {
+        return {
+          success: false,
+          code: 'NO_ACTIVE_COURIER',
+          message:
+            'No alternate Shiprocket courier available for reassign. Use the Shiprocket panel or cancel and ship again.',
+          availableCouriers: filterPreferNonStressedCouriers(available).slice(0, 15).map(mapCourierPublic),
+          customerBillUnchanged: true
+        };
+      }
+    }
+
+    if (isCourierInactive({ id: targetId })) {
+      return {
+        success: false,
+        code: 'COURIER_INACTIVE',
+        message: 'Selected courier is inactive in our shipping policy. Pick another active courier.',
+        customerBillUnchanged: true
+      };
+    }
+
+    logger.info('[Shiprocket] Reassign courier', {
+      orderId: order.orderId,
+      shipmentId: sid,
+      targetId,
+      fromCourierId: currentId
+    });
+
+    const assign = await ShiprocketService.assignAwb({
+      shipmentId: sid,
+      courierId: Number(targetId),
+      reassign: true
+    });
+
+    if (!assign.success) {
+      if (isWalletAssignFailure(assign)) {
+        return {
+          success: false,
+          code: 'SHIPROCKET_WALLET_OR_BALANCE',
+          message: assign.message,
+          details: assign.details || assign.raw || null,
+          customerBillUnchanged: true
+        };
+      }
+      suggested = pickSuggested();
+      return {
+        success: false,
+        code: assign.code || 'REASSIGN_COURIER_FAILED',
+        message:
+          assign.message ||
+          'Shiprocket reassign failed. Try another courier, or cancel and ship again.',
+        details: assign.details || assign.raw || null,
+        suggestedCourier: suggested,
+        availableCouriers: filterPreferNonStressedCouriers(available).slice(0, 15).map(mapCourierPublic),
+        customerBillUnchanged: true
+      };
+    }
+
+    const effectiveAwb =
+      Boolean(assign.mock) ||
+      Boolean(String(assign.awbCode || '').trim()) ||
+      Boolean(String(assign.trackingNumber || '').trim()) ||
+      Number(assign.raw?.awb_assign_status) === 1;
+    if (!effectiveAwb) {
+      return {
+        success: false,
+        code: 'REASSIGN_NOT_COMPLETED',
+        message:
+          assign.message ||
+          'Shiprocket did not complete courier reassign. Try another courier or use the Shiprocket panel.',
+        details: assign.raw || null,
+        customerBillUnchanged: true
+      };
+    }
+
+    const assignedName = assign.courier || suggested?.courierName || String(targetId);
+    return {
+      success: true,
+      assign,
+      courierId: Number(targetId),
+      courierName: assignedName,
+      courierAssignNote: buildCourierSubstituteNote({
+        quotedId: currentId || quoted.courierId,
+        quotedName: order.shipmentInfo?.courier || quoted.courierName,
+        assignedId: Number(targetId),
+        assignedName,
+        reason: 'admin_confirm'
+      }),
+      courierSubstitutedFromId: currentId || quoted.courierId || null,
+      courierSubstitutedFromName: order.shipmentInfo?.courier || quoted.courierName || null,
+      customerBillUnchanged: true,
+      quotedFreightInr: freightCap
+    };
+  } catch (err) {
+    logger.error('[Shiprocket] runShiprocketReassignCourier unexpected error', {
+      orderId: order?.orderId,
+      message: err.message,
+      stack: err.stack
+    });
+    return {
+      success: false,
+      code: 'REASSIGN_INTERNAL_ERROR',
+      message: err.message || 'Unexpected error while reassigning Shiprocket courier.',
+      customerBillUnchanged: true
+    };
+  }
 }
 
 /**
@@ -237,11 +427,13 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
     const codRequired = () => Boolean(parts?.useCodAtDoor);
 
+    // Substitute ranking only — preferNonStressed never applies to checkout quotes.
     const suggestedFromRates = (excludeCourierIds = []) => {
       const picked = pickCheapestActiveCourier(available, {
         codRequired: codRequired(),
         maxCharge: freightCap,
-        excludeCourierIds
+        excludeCourierIds,
+        preferNonStressed: true
       });
       return enrichSuggested(picked, freightCap);
     };
@@ -569,6 +761,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
 module.exports = {
   runShiprocketAssignAwb,
+  runShiprocketReassignCourier,
   quotedCourierFromOrder,
   quotedFreightInr
 };

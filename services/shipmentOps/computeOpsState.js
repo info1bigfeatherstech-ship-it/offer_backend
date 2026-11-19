@@ -196,6 +196,13 @@ function computeOpsState(order) {
     return OPS_STATES.IN_TRANSIT;
   }
 
+  const awbEarly = hasAwb(si);
+
+  // Case 3: pickup-exception class without AWB cannot use Retry/Reassign — treat as reset → Ship now.
+  // (Stale timeline after cancel / NEW often left ops stuck on Pickup exception.)
+  if (effectiveClass === CLASSIFICATION.PICKUP_EXCEPTION && !awbEarly) {
+    return OPS_STATES.PROVIDER_RESET;
+  }
   if (effectiveClass === CLASSIFICATION.PICKUP_EXCEPTION) {
     return OPS_STATES.PICKUP_EXCEPTION;
   }
@@ -205,7 +212,7 @@ function computeOpsState(order) {
 
   if (orderStatus === 'pending') return OPS_STATES.AWAITING_APPROVAL;
 
-  const awb = hasAwb(si);
+  const awb = awbEarly;
   const artifactsValid = areFulfillmentArtifactsValid(si, effectiveClass);
 
   if (orderStatus === 'confirmed' && !awb) {

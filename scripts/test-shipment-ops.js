@@ -28,8 +28,9 @@ function testPickupExceptionState() {
   assert.strictEqual(view.courierOpsLine1, 'Pickup exception — action required');
   assert.strictEqual(view.actionCapabilities.generateManifest, false);
   assert.strictEqual(view.actionCapabilities.retryPickup, true);
+  assert.strictEqual(view.actionCapabilities.reassignCourier, true);
   assert.strictEqual(view.actionCapabilities.openShiprocketSupport, true);
-  assert.strictEqual(view.primaryAction, 'retryPickup');
+  assert.strictEqual(view.primaryAction, 'reassignCourier');
   assert.strictEqual(view.actionCapabilities.createTicket, undefined);
 }
 
@@ -95,6 +96,53 @@ function testProviderResetFromSnapshotWhenStillNew() {
     }
   };
   assert.strictEqual(computeOpsState(order), OPS_STATES.PROVIDER_RESET);
+}
+
+/** Case 3: NEW + no AWB + stale pickup-exception events → Ship now, not Retry. */
+function testCase3NewWithoutAwbIgnoresStalePickupException() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      shipmentId: '1734736041',
+      shiprocketOrderId: '1739109596',
+      awbCode: null,
+      trackingNumber: null,
+      courier: null,
+      providerStatus: 'NEW',
+      rawEvents: [
+        { status: 'Pickup Error', description: 'Stressed at Assignment' },
+        { status: 'NEW', description: 'Order returned to New' }
+      ]
+    }
+  };
+  // Live NEW ignores stale exception timeline → ready to ship (not stuck pickup exception).
+  assert.strictEqual(computeOpsState(order), OPS_STATES.READY_TO_SHIP);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.shipNow, true);
+  assert.strictEqual(view.actionCapabilities.retryPickup, false);
+  assert.strictEqual(view.actionCapabilities.reassignCourier, false);
+  assert.strictEqual(view.primaryAction, 'shipNow');
+}
+
+/** Case 3: pickup-exception label without AWB → PROVIDER_RESET (cannot retry). */
+function testCase3PickupExceptionWithoutAwbBecomesReset() {
+  const order = {
+    orderStatus: 'processing',
+    shipmentInfo: {
+      shipmentId: '1',
+      shiprocketOrderId: '2',
+      providerStatus: 'PICKUP ERROR',
+      rawEvents: [{ status: 'PICKUP ERROR' }]
+    }
+  };
+  assert.strictEqual(computeOpsState(order), OPS_STATES.PROVIDER_RESET);
+  const view = buildShipmentOpsView(order, {
+    fulfillmentPaymentGate: { ok: true, reason: 'paid' }
+  });
+  assert.strictEqual(view.actionCapabilities.shipNow, true);
+  assert.strictEqual(view.actionCapabilities.retryPickup, false);
 }
 
 function testProviderResetSnapshotIgnoredAfterReship() {
@@ -646,6 +694,8 @@ function run() {
   testPickupExceptionState();
   testProviderResetState();
   testProviderResetFromSnapshotWhenStillNew();
+  testCase3NewWithoutAwbIgnoresStalePickupException();
+  testCase3PickupExceptionWithoutAwbBecomesReset();
   testProviderResetSnapshotIgnoredAfterReship();
   testOutForPickupKeepsLabelAndManifestDownloads();
   testAutoCancelMessageClassification();

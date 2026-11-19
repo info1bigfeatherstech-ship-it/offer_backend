@@ -39,8 +39,12 @@ async function assertDropshipPaymentAccess(orderId, userId) {
     order.dropshipMeta?.placedByUserId != null
       ? String(order.dropshipMeta.placedByUserId)
       : null;
+  const dropshipperId =
+    order.dropshipMeta?.dropshipperId != null
+      ? String(order.dropshipMeta.dropshipperId)
+      : null;
 
-  if (!requester || (requester !== owner && requester !== placedBy)) {
+  if (!requester || (requester !== owner && requester !== placedBy && requester !== dropshipperId)) {
     return { ok: false, statusCode: 403, code: 'ORDER_ACCESS_DENIED', message: 'Unauthorized' };
   }
 

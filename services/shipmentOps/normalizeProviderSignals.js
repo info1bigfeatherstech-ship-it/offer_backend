@@ -46,16 +46,24 @@ function collectSignalTexts(input) {
   push(input?.providerStatus);
 
   const events = Array.isArray(input?.rawEvents) ? input.rawEvents : [];
+  const providerNorm = normalizeText(input?.providerStatus);
+  // Live NEW / cancelled cycle: do not let stale pickup-exception timeline keep the order stuck.
+  if (/^new$/.test(providerNorm)) {
+    return texts;
+  }
   const providerForward = input?.providerStatus
-    ? classifySignalTexts([normalizeText(input.providerStatus)])
+    ? classifySignalTexts([providerNorm])
     : CLASSIFICATION.UNKNOWN;
   for (const event of events) {
     const statusText = event?.status || event?.description;
     if (
       (providerForward === CLASSIFICATION.PICKUP_SCHEDULED ||
         providerForward === CLASSIFICATION.AWB_ASSIGNED ||
-        providerForward === CLASSIFICATION.MANIFEST) &&
-      /pickupcancelled|pickup cancelled|auto cancel|shipment reset on shiprocket/.test(normalizeText(statusText))
+        providerForward === CLASSIFICATION.MANIFEST ||
+        providerForward === CLASSIFICATION.PROVIDER_RESET) &&
+      /pickupcancelled|pickup cancelled|auto cancel|shipment reset on shiprocket|pickup\s*exception|pickup\s*error|pickup\s*failed/.test(
+        normalizeText(statusText)
+      )
     ) {
       continue;
     }
@@ -158,8 +166,10 @@ function normalizeProviderSignals(input) {
   if (
     fromProvider === CLASSIFICATION.AWB_ASSIGNED ||
     fromProvider === CLASSIFICATION.PICKUP_SCHEDULED ||
-    fromProvider === CLASSIFICATION.MANIFEST
+    fromProvider === CLASSIFICATION.MANIFEST ||
+    fromProvider === CLASSIFICATION.PROVIDER_RESET
   ) {
+    // Live provider status wins over stale timeline (esp. NEW after cancel).
     classification = fromProvider;
   }
 

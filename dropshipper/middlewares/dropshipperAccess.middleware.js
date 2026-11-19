@@ -1,39 +1,62 @@
 'use strict';
 
 /**
- * Temporary access gate for dropshipper APIs until dropshipper auth/subscription lands.
- * Production-safe: never open anonymously on live.
- *
- * Allowed today:
- * - JWT + admin | product_manager | inventory_manager
- * - OR env DROPSHIPPER_AUTH_BYPASS=true (non-production only)
+ * Dropshipper partner gate.
+ * Accepts a dropshipper portal JWT only. Staff/admin tokens are not valid here.
+ * DROPSHIPPER_AUTH_BYPASS=true is honored outside production only.
  */
 
-const { verifyToken } = require('../../middlewares/auth.middleware');
-const { authorizeRoles } = require('../../middlewares/authorize-roles.middleware');
+const authService = require('../services/dropshipperAuth.service');
 
-const staffGate = authorizeRoles('admin', 'product_manager', 'inventory_manager');
+function isProduction() {
+  const nodeEnv = String(process.env.NODE_ENV || '').toLowerCase();
+  const appEnv = String(process.env.APP_ENV || '').toLowerCase();
+  return nodeEnv === 'production' || appEnv === 'production';
+}
 
-function requireDropshipperAccess(req, res, next) {
+function sendError(res, err) {
+  const status = Number(err?.statusCode) || 401;
+  return res.status(status).json({
+    success: false,
+    code: err?.code || 'UNAUTHORIZED',
+    message: err?.message || 'Login required'
+  });
+}
+
+async function requireDropshipperAccess(req, res, next) {
   const bypass = String(process.env.DROPSHIPPER_AUTH_BYPASS || '').toLowerCase() === 'true';
-  const isProd =
-    String(process.env.NODE_ENV || '').toLowerCase() === 'production' ||
-    String(process.env.APP_ENV || '').toLowerCase() === 'production';
-
-  if (bypass && !isProd) {
+  if (bypass && !isProduction()) {
     req.dropshipperAccess = { mode: 'bypass' };
     return next();
   }
 
-  // verifyToken sends 401 itself on failure (does not call next).
-  return verifyToken(req, res, () => {
-    return staffGate(req, res, () => {
-      req.dropshipperAccess = { mode: 'staff', userId: req.userId };
-      return next();
+  try {
+    const token = authService.readBearer(req.headers.authorization);
+    const auth = await authService.authenticateAccessToken(token);
+    req.dropshipperId = auth.id;
+    req.userId = auth.id;
+    req.dropshipper = auth.publicProfile;
+    req.dropshipperAccess = { mode: 'dropshipper', dropshipperId: auth.id };
+    return next();
+  } catch (err) {
+    return sendError(res, err);
+  }
+}
+
+function requireActiveSubscription(req, res, next) {
+  if (req.dropshipperAccess?.mode === 'bypass') return next();
+  const gate = authService.subscriptionGate(req.dropshipper);
+  if (!gate.ok) {
+    return res.status(gate.status).json({
+      success: false,
+      code: gate.code,
+      message: gate.message
     });
-  });
+  }
+  return next();
 }
 
 module.exports = {
-  requireDropshipperAccess
+  requireDropshipperAccess,
+  requireActiveSubscription
 };

@@ -398,10 +398,35 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
       if (!order) {
         return { success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found after reset' };
       }
+      // After cancel/NEW, refresh durable Shiprocket ids from channel-order lookup.
+      // Keeps Ship now working when the previous numeric shiprocketOrderId went stale.
+      const refreshPayload = {
+        lastError: null,
+        providerStatus: snapshot.providerStatus || built.resetReason || order.shipmentInfo?.providerStatus
+      };
+      if (snapshot.shiprocketOrderId) {
+        refreshPayload.shiprocketOrderId = String(snapshot.shiprocketOrderId).trim();
+      }
+      if (snapshot.shipmentId) {
+        refreshPayload.shipmentId = String(snapshot.shipmentId).trim();
+      }
+      if (snapshot.providerSnapshot) {
+        refreshPayload.providerSnapshot = snapshot.providerSnapshot;
+      }
+      await applyUpsertShipmentInfo({
+        order,
+        shipmentPayload: refreshPayload,
+        trigger: `${source}_reset_id_refresh`,
+        allowOrderStatusUpdate: false
+      });
+      order = await Order.findOne({ orderId: order.orderId });
     } else {
       await applyUpsertShipmentInfo({
         order,
-        shipmentPayload: built.payload,
+        shipmentPayload: {
+          ...built.payload,
+          lastError: null
+        },
         trigger: source,
         allowOrderStatusUpdate
       });
@@ -440,13 +465,28 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
             trackingResult.events,
             providerStatus
           );
+          // Do NOT spread trackingResult — null awbCode/courier would wipe panel-booked fields.
+          const shipmentPayload = {
+            events: sanitizedEvents,
+            providerStatus
+          };
+          const trackAwb = String(trackingResult.awbCode || '').trim();
+          if (trackAwb) {
+            shipmentPayload.awbCode = trackAwb;
+            shipmentPayload.trackingNumber = trackAwb;
+          }
+          if (trackingResult.courier) {
+            shipmentPayload.courier = trackingResult.courier;
+          }
+          if (trackingResult.shipmentId) {
+            shipmentPayload.shipmentId = trackingResult.shipmentId;
+          }
+          if (trackingResult.estimatedDelivery) {
+            shipmentPayload.estimatedDelivery = trackingResult.estimatedDelivery;
+          }
           await applyUpsertShipmentInfo({
             order,
-            shipmentPayload: {
-              ...trackingResult,
-              events: sanitizedEvents,
-              providerStatus
-            },
+            shipmentPayload,
             trigger: `${source}_tracking`,
             allowOrderStatusUpdate
           });

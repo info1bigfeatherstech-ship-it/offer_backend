@@ -106,6 +106,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     syncShiprocket: false,
     refreshTracking: false,
     retryPickup: false,
+    reassignCourier: false,
     cancelShipment: false,
     selfPickup: false,
     openShiprocketSupport: false,
@@ -243,7 +244,13 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.cancelShipment = shipmozoReady && gateOk;
         caps.schedulePickup = awb && gateOk;
       } else {
-        caps.retryPickup = shipmentId && gateOk;
+        // Retry / Reassign both need an existing AWB. Without AWB this state should be PROVIDER_RESET
+        // (Case 3) — kept defensive here if classification lags.
+        caps.retryPickup = shipmentId && awb && gateOk;
+        caps.reassignCourier = shipmentId && awb && gateOk;
+        if (!awb && ['confirmed', 'processing'].includes(st) && gateOk) {
+          caps.shipNow = true;
+        }
         enableSupportLink();
         caps.syncShiprocket = shiprocket;
         caps.refreshTracking = awb;
@@ -251,9 +258,17 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
         caps.track = awb;
         if (!shipmentId) {
           blockReasons.retryPickup = 'No shipment_id on order — refresh Shiprocket sync first.';
+          blockReasons.reassignCourier = 'No shipment_id on order — refresh Shiprocket sync first.';
+        } else if (!awb) {
+          blockReasons.retryPickup =
+            'No AWB on order — Retry pickup does not apply. Refresh sync, then use Ship now.';
+          blockReasons.reassignCourier =
+            'No AWB on order yet — refresh Shiprocket sync, or use Ship now / Cancel and ship again.';
         }
         blockFulfillmentArtifacts(
-          'Pickup exception on Shiprocket. Retry pickup, open Shiprocket support, or cancel and ship again before manifest/label.'
+          awb
+            ? 'Pickup exception on Shiprocket. Reassign courier (preferred for stressed/wrong courier), retry pickup, open Shiprocket support, or cancel and ship again before manifest/label.'
+            : 'Pickup exception without AWB (often after cancel / NEW). Refresh Shiprocket, then use Ship now — Retry does not re-ship.'
         );
       }
       break;
@@ -366,6 +381,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.downloadLabel = false;
     caps.cancelShipment = false;
     caps.retryPickup = false;
+    caps.reassignCourier = false;
     caps.selfPickup = false;
   }
 
@@ -376,6 +392,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.generateManifest = false;
     caps.cancelShipment = false;
     caps.retryPickup = false;
+    caps.reassignCourier = false;
     caps.selfPickup = false;
   }
 
@@ -391,6 +408,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     caps.syncShiprocket = false;
     caps.refreshTracking = false;
     caps.retryPickup = false;
+    caps.reassignCourier = false;
     caps.cancelShipment = false;
     caps.selfPickup = false;
     caps.openShiprocketSupport = false;
@@ -406,6 +424,7 @@ function buildActionPolicy({ opsState, order, fulfillmentPaymentGate, canConfirm
     blockReasons.syncShiprocket = sddReason;
     blockReasons.refreshTracking = sddReason;
     blockReasons.retryPickup = sddReason;
+    blockReasons.reassignCourier = sddReason;
     blockReasons.cancelShipment = sddReason;
     blockReasons.selfPickup = sddReason;
   }
@@ -460,10 +479,13 @@ function buildNextStepMessage(opsState, blockReasons, primaryAction, opts = {}) 
   switch (opsState) {
     case OPS_STATES.PICKUP_EXCEPTION:
       return (
+        blockReasons.reassignCourier ||
         blockReasons.retryPickup ||
         (isShipmozo
           ? 'Pickup needs attention on Shipmozo. Refresh tracking, schedule pickup if required, or cancel and ship again.'
-          : 'Pickup failed on Shiprocket. Try Retry pickup first. If it persists, open Shiprocket support or cancel and ship again.')
+          : primaryAction === ACTION_KEYS.reassignCourier
+            ? 'Pickup failed on Shiprocket. Reassign to another courier (preferred when courier is stressed/unavailable). Retry pickup only if the same courier should try again.'
+            : 'Pickup failed on Shiprocket. Try Retry pickup first. If it persists, reassign courier, open Shiprocket support, or cancel and ship again.')
       );
     case OPS_STATES.PROVIDER_RESET:
       return `${provider} reset this shipment (e.g. cancel). Refresh sync, then use Ship now to re-create the shipment.`;

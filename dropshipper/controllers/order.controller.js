@@ -2,6 +2,9 @@
 
 const dropshipOrderService = require('../services/dropshipOrder.service');
 const { assertDropshipPaymentAccess } = require('../services/dropshipOrderPayment.service');
+const shipmozoLabelSettingsService = require('../../services/shipmozoLabelSettings.service');
+const { buildLabelViewModel } = require('../../services/shipmozoLabelViewModel.service');
+const { renderLabelPdf } = require('../../services/shipmozoLabelPdf.service');
 const logger = require('../../utils/logger');
 
 /** Lazy-load: core order.controller constructs Razorpay at import time. */
@@ -42,6 +45,7 @@ exports.createOrder = async (req, res) => {
 
     const result = await dropshipOrderService.createDropshipOrder({
       userId,
+      dropshipperId: req.dropshipperId,
       body: req.body || {}
     });
 
@@ -124,6 +128,57 @@ exports.getMyOrder = async (req, res) => {
       success: true,
       order: dropshipOrderService.serializeDropshipOrder(order)
     });
+  } catch (err) {
+    return handleServiceError(res, err);
+  }
+};
+
+/**
+ * GET /orders/:orderId/shipping-label
+ * Dropshipper panel: custom branded PDF only (settings=dropship). No provider choice.
+ */
+exports.downloadShippingLabel = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return respondError(res, 401, 'UNAUTHORIZED', 'Login required');
+    }
+    const order = await dropshipOrderService.getDropshipOrderForUser(
+      req.userId,
+      req.params.orderId
+    );
+    if (!order) {
+      return respondError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+    }
+
+    const awb = String(
+      order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || ''
+    ).trim();
+    if (!awb) {
+      return respondError(
+        res,
+        400,
+        'AWB_REQUIRED',
+        'Assign AWB before downloading a shipping label.'
+      );
+    }
+
+    // Hardcode dropship settings — never fall through to ecomm.
+    const saved = await shipmozoLabelSettingsService.getPublicSettings('dropship');
+    const vm = await buildLabelViewModel(order, saved.settings);
+    const pdfBuf = await renderLabelPdf(vm);
+    if (!pdfBuf || !Buffer.isBuffer(pdfBuf) || pdfBuf.length < 80) {
+      return respondError(res, 502, 'CUSTOM_LABEL_EMPTY', 'Custom shipping label PDF was empty.');
+    }
+
+    const safe = String(order.orderId || 'order').replace(/[^\w.-]+/g, '_').slice(0, 80);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Shipping-label-${safe}.pdf"`);
+    res.setHeader('X-Label-Source', 'custom');
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Disposition, Content-Type, X-Label-Source'
+    );
+    return res.status(200).send(pdfBuf);
   } catch (err) {
     return handleServiceError(res, err);
   }

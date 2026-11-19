@@ -96,6 +96,55 @@ function isCourierInactive(courier) {
 }
 
 /**
+ * Detect Shiprocket stress / suppress / blocked signals on a serviceability row.
+ * Fail-open: unknown shapes return false (do not drop healthy couriers).
+ * Used only for admin Ship Now substitute / reassign ranking — not checkout quotes.
+ * @param {object|null|undefined} courier
+ */
+function isCourierStressedOrSuppressed(courier) {
+  if (!courier || typeof courier !== 'object') return false;
+  if (
+    courier.stressed === true ||
+    courier.is_stressed === true ||
+    courier.high_volume === true ||
+    courier.suppressed === true ||
+    courier.is_suppressed === true ||
+    courier.is_blocked === true ||
+    courier.blocked === true ||
+    courier.blocked === 1
+  ) {
+    return true;
+  }
+  if (courier.suppress_date || courier.suppressed_until || courier.blocked_until) {
+    return true;
+  }
+  const status = String(
+    courier.courier_status ||
+      courier.availability_status ||
+      courier.assignment_status ||
+      courier.stress_status ||
+      courier.status ||
+      ''
+  ).toLowerCase();
+  if (/stress|suppress|blocked|unavailable|congest|delay/.test(status)) return true;
+
+  const flagText = [
+    courier.remark,
+    courier.remarks,
+    courier.message,
+    courier.warning,
+    courier.availability,
+    courier.reason
+  ]
+    .map((x) => String(x || '').toLowerCase())
+    .join(' ');
+  if (/stressed\s*at\s*assignment|stress|suppress|blocked|not\s*available|unavailable|congest/.test(flagText)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * @param {Array<object>} couriers
  * @returns {Array<object>}
  */
@@ -105,14 +154,30 @@ function filterActiveCouriers(couriers) {
 }
 
 /**
+ * Active couriers without known stress/suppress flags. Fail-open: if all are flagged,
+ * returns the full active list so Ship Now never dead-ends.
+ * @param {Array<object>} couriers
+ * @returns {Array<object>}
+ */
+function filterPreferNonStressedCouriers(couriers) {
+  const active = filterActiveCouriers(couriers);
+  if (!active.length) return [];
+  const calm = active.filter((c) => !isCourierStressedOrSuppressed(c));
+  return calm.length ? calm : active;
+}
+
+/**
  * Pick cheapest active courier (same logic as ShiprocketService.pickRecommendedCourierId).
  * When maxCharge is set, prefer cheapest with rate <= maxCharge; else overall cheapest.
  * @param {Array<object>} couriers
- * @param {{ codRequired?: boolean, maxCharge?: number|null }} [opts]
+ * @param {{ codRequired?: boolean, maxCharge?: number|null, excludeCourierIds?: number[], preferNonStressed?: boolean }} [opts]
  * @returns {{ courier: object, courierCompanyId: number, courierName: string, rate: number }|null}
  */
 function pickCheapestActiveCourier(couriers, opts = {}) {
-  const active = filterActiveCouriers(couriers);
+  const preferNonStressed = Boolean(opts.preferNonStressed);
+  const active = preferNonStressed
+    ? filterPreferNonStressedCouriers(couriers)
+    : filterActiveCouriers(couriers);
   if (!active.length) return null;
 
   const excludeIds = new Set(
@@ -207,7 +272,9 @@ module.exports = {
   getCourierCompanyIdFromRow,
   getCourierNameFromRow,
   isCourierInactive,
+  isCourierStressedOrSuppressed,
   filterActiveCouriers,
+  filterPreferNonStressedCouriers,
   pickCheapestActiveCourier,
   buildCourierSubstituteNote
 };

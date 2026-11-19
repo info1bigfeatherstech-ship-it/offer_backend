@@ -6,7 +6,7 @@
  * Phase 2: serviceability check (warehouse → customer)
  * Phase 3: dropshipper catalog (list / detail / download-pack)
  * Phase 4: create order + Razorpay (online only) + admin dropship order list
- * Later: login / registration / subscription
+ * Auth: dropshipper register / login / subscription (partner JWT, not staff)
  */
 
 module.exports = {

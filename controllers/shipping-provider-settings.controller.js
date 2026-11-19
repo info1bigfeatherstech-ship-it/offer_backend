@@ -112,21 +112,30 @@ exports.testShipmozoConnection = async (req, res) => {
 };
 
 function resolveSettingsStorefront(req) {
-  if (req.adminScope?.storefront === 'wholesale' || req.adminScope?.storefront === 'ecomm') {
-    return req.adminScope.storefront;
-  }
-  return req.storefront === 'wholesale' ? 'wholesale' : 'ecomm';
+  const raw =
+    req.adminScope?.storefront ||
+    req.headers['x-storefront'] ||
+    req.storefront ||
+    'ecomm';
+  return shipmozoLabelSettingsService.normalizeStorefront(raw);
+}
+
+function resolveWarehouseSfForPickup(labelStorefront) {
+  return shipmozoLabelSettingsService.resolveWarehouseStorefront(labelStorefront);
 }
 
 /**
  * GET /api/shipping-provider/admin/shipmozo-label-settings
- * Storefront-scoped: ecomm panel ↔ ecomm settings, wholesale panel ↔ wholesale settings.
+ * Storefront-scoped: ecomm / wholesale / dropship label layouts (dropship pickup preview uses ecomm warehouse).
  */
 exports.getShipmozoLabelSettings = async (req, res) => {
   try {
     const storefront = resolveSettingsStorefront(req);
     const data = await shipmozoLabelSettingsService.getPublicSettings(storefront);
-    const pickup = await resolvePickupWarehouse(storefront, data.settings?.pickup?.sellerName);
+    const pickup = await resolvePickupWarehouse(
+      resolveWarehouseSfForPickup(storefront),
+      data.settings?.pickup?.sellerName
+    );
     data.pickupIdentity = {
       name: pickup?.name || '',
       source: pickup?.source || 'env'
@@ -146,7 +155,10 @@ exports.updateShipmozoLabelSettings = async (req, res) => {
     const storefront = resolveSettingsStorefront(req);
     const patch = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : req.body;
     const data = await shipmozoLabelSettingsService.saveSettings(storefront, patch, req.userId || null);
-    const pickup = await resolvePickupWarehouse(storefront, data.settings?.pickup?.sellerName);
+    const pickup = await resolvePickupWarehouse(
+      resolveWarehouseSfForPickup(storefront),
+      data.settings?.pickup?.sellerName
+    );
     data.pickupIdentity = {
       name: pickup?.name || '',
       source: pickup?.source || 'env'
@@ -176,7 +188,10 @@ exports.previewShipmozoLabelSettings = async (req, res) => {
     );
     const vm = buildSampleViewModel(settings, storefront);
     try {
-      const pickup = await resolvePickupWarehouse(storefront, settings.pickup?.sellerName);
+      const pickup = await resolvePickupWarehouse(
+        resolveWarehouseSfForPickup(storefront),
+        settings.pickup?.sellerName
+      );
       if (pickup?.name) {
         vm.pickup = { ...vm.pickup, ...pickup };
         vm.rto = vm.pickup;
@@ -205,7 +220,10 @@ exports.uploadShipmozoLabelLogo = async (req, res) => {
       return jsonError(res, 400, 'LOGO_FILE_REQUIRED', 'Upload a logo image (PNG, JPG, or WebP, max 1 MB).');
     }
     const result = await uploadLabelLogo(storefront, req.file.buffer, req.userId || null);
-    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    const pickup = await resolvePickupWarehouse(
+      resolveWarehouseSfForPickup(storefront),
+      result.settings?.pickup?.sellerName
+    );
     return res.json({
       success: true,
       message: `Label logo saved for ${storefront} storefront`,
@@ -233,7 +251,10 @@ exports.removeShipmozoLabelLogo = async (req, res) => {
   try {
     const storefront = resolveSettingsStorefront(req);
     const result = await removeLabelLogo(storefront, req.userId || null);
-    const pickup = await resolvePickupWarehouse(storefront, result.settings?.pickup?.sellerName);
+    const pickup = await resolvePickupWarehouse(
+      resolveWarehouseSfForPickup(storefront),
+      result.settings?.pickup?.sellerName
+    );
     return res.json({
       success: true,
       message: `Label logo removed for ${storefront} storefront`,

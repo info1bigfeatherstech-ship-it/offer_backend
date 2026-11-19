@@ -1,6 +1,6 @@
   /**
  * Per-storefront Shipmozo label logo — Cloudinary upload/delete.
- * Ecomm and wholesale logos are isolated (separate DB docs + folders).
+ * Per-storefront logos: ecomm, wholesale, and dropship (separate DB docs + Cloudinary folders).
  */
 
 const sharp = require('sharp');

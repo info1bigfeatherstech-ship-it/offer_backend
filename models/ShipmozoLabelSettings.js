@@ -1,15 +1,15 @@
 const mongoose = require('mongoose');
 
 /**
- * Per-storefront Shipmozo shipping-label layout.
- * Ecomm admin writes storefront=ecomm; wholesale admin writes storefront=wholesale.
- * Applied only when generating custom labels for Shipmozo orders (never Shiprocket).
+ * Per-storefront custom shipping-label layout (Shipmozo-backed orders only; never Shiprocket).
+ * Ecomm → storefront=ecomm; wholesale → wholesale; dropship → dropship (layout only).
+ * Dropship warehouse/pickup still uses ecomm shipping-provider settings at render time.
  */
 const shipmozoLabelSettingsSchema = new mongoose.Schema(
   {
     storefront: {
       type: String,
-      enum: ['ecomm', 'wholesale'],
+      enum: ['ecomm', 'wholesale', 'dropship'],
       required: true,
       unique: true,
       index: true

@@ -296,10 +296,17 @@ async function quoteDropshipOrder(input = {}) {
   };
 }
 
-async function createDropshipOrder({ userId, body }) {
-  if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
-    throw createError(401, 'UNAUTHORIZED', 'Authenticated user required to place dropship order');
+async function createDropshipOrder({ userId, dropshipperId, body }) {
+  const partnerId =
+    dropshipperId && mongoose.Types.ObjectId.isValid(String(dropshipperId))
+      ? dropshipperId
+      : null;
+  const ownerId =
+    userId && mongoose.Types.ObjectId.isValid(String(userId)) ? userId : partnerId;
+  if (!ownerId || !partnerId) {
+    throw createError(401, 'UNAUTHORIZED', 'Authenticated dropshipper required to place dropship order');
   }
+  userId = ownerId;
 
   const paymentMethod = String(body?.paymentMethod || 'online').toLowerCase().trim();
   if (paymentMethod !== 'online') {
@@ -440,6 +447,7 @@ async function createDropshipOrder({ userId, body }) {
       dropshipMeta: {
         ref: dropshipRef,
         placedByUserId: userId,
+        dropshipperId: partnerId,
         customerPhone: addressCheck.data.phone,
         customerName: addressCheck.data.fullName
       },
@@ -528,6 +536,7 @@ async function createDropshipOrder({ userId, body }) {
       notes: {
         orderId: order.orderId,
         userId: String(userId),
+        dropshipperId: String(partnerId),
         channel: 'dropship',
         dropshipRef: dropshipRef || ''
       }
@@ -611,7 +620,11 @@ async function listDropshipOrdersForUser(userId, { page = 1, limit = 20, ref } =
   const l = Math.min(100, Math.max(1, Number(limit) || 20));
   const filter = {
     storefront: DROPSHIP_STOREFRONT,
-    $or: [{ userId }, { 'dropshipMeta.placedByUserId': userId }]
+    $or: [
+      { userId },
+      { 'dropshipMeta.placedByUserId': userId },
+      { 'dropshipMeta.dropshipperId': userId }
+    ]
   };
   const refNorm = normalizeDropshipRef(ref);
   if (refNorm) filter['dropshipMeta.ref'] = refNorm;
@@ -638,7 +651,11 @@ async function getDropshipOrderForUser(userId, orderId) {
   const order = await Order.findOne({
     orderId: String(orderId || '').trim(),
     storefront: DROPSHIP_STOREFRONT,
-    $or: [{ userId }, { 'dropshipMeta.placedByUserId': userId }]
+    $or: [
+      { userId },
+      { 'dropshipMeta.placedByUserId': userId },
+      { 'dropshipMeta.dropshipperId': userId }
+    ]
   }).lean();
   return order;
 }

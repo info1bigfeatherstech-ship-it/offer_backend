@@ -67,6 +67,21 @@ function run() {
   assert.strictEqual(r4.changed, false);
   assert.strictEqual(adminCancelledPaid.orderStatus, 'cancelled');
 
+  const previousLegacy = process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT;
+  process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT = 'true';
+  const dropshipPaid = {
+    storefront: 'dropship',
+    orderStatus: 'pending',
+    paymentStatus: 'paid',
+    amountPaidInr: 800,
+    paymentInfo: { method: 'online', status: 'success' }
+  };
+  const r5 = recoverOrderStatusAfterSuccessfulCapture(dropshipPaid, { trigger: 'test' });
+  assert.strictEqual(r5.changed, false);
+  assert.strictEqual(dropshipPaid.orderStatus, 'pending');
+  if (previousLegacy == null) delete process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT;
+  else process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT = previousLegacy;
+
   console.log('verify-order-payment-state: OK');
 }
 

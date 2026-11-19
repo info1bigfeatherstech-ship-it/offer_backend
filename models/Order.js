@@ -57,10 +57,17 @@ const orderSchema = new mongoose.Schema(
     /**
      * Dropship-only metadata (ignored for ecomm/wholesale).
      * ref = dropshipper-facing tag/code; placedByUserId = staff/dropshipper who created the order.
+     * dropshipperId = partner account that owns the order.
      */
     dropshipMeta: {
       ref: { type: String, trim: true, default: null, index: true },
       placedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      dropshipperId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Dropshipper',
+        default: null,
+        index: true
+      },
       customerPhone: { type: String, default: null },
       customerName: { type: String, default: null }
     },
