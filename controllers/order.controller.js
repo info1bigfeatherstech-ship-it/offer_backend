@@ -3243,21 +3243,46 @@ exports.getOrder = async (req, res) => {
 // ========== GET USER ORDERS ==========
 exports.getUserOrders = async (req, res) => {
     try {
-        const orders = await Order.find({ userId: req.userId })
-            .sort({ createdAt: -1 })
-            .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo items removedItemsArchive returnInfo refundHistory addressSnapshot storefront fulfillmentMode'
-            );
-        const normalizedOrders = orders.map((doc) => {
-            const plain = doc.toObject();
+        const pageRaw = parseInt(String(req.query.page || '1'), 10);
+        const limitRaw = parseInt(String(req.query.limit || '20'), 10);
+        const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+        const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 20));
+        const skip = (page - 1) * limit;
+        const filter = { userId: req.userId };
+
+        // List card only — full order body comes from GET /items/:orderId.
+        // Uses existing index { userId: 1, createdAt: -1 }.
+        const listSelect =
+            'orderId totalAmount orderStatus paymentStatus createdAt amountPaidInr balanceDueInr paymentHoldExpiresAt paymentInfo.method fulfillmentMode storefront';
+
+        const [total, orders] = await Promise.all([
+            Order.countDocuments(filter),
+            Order.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .select(listSelect)
+                .lean()
+        ]);
+
+        const normalizedOrders = (orders || []).map((plain) => {
             normalizeTerminalUnpaidFinancials(plain);
             return plain;
         });
 
+        const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
+
         return res.json({
             success: true,
             count: normalizedOrders.length,
-            orders: normalizedOrders
+            orders: normalizedOrders,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages,
+                hasMore: page < totalPages
+            }
         });
 
     } catch (error) {
