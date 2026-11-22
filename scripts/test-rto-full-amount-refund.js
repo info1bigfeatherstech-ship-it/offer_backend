@@ -1,5 +1,5 @@
 /**
- * Full paid-amount RTO refund (courier no-attempt) — unit tests.
+ * Full paid-amount RTO refund + admin matrix — unit tests.
  * Run: node scripts/test-rto-full-amount-refund.js
  */
 process.env.RTO_MIN_ORDER_VALUE_FOR_REFUND = '100';
@@ -19,7 +19,9 @@ const {
   isCourierNoAttemptRto,
   calculateFullPaidAmountRtoRefund,
   calculateRtoRefund,
-  canOfferFullPaidAmountRtoRefund
+  canOfferFullPaidAmountRtoRefund,
+  canOfferStandardRtoRefund,
+  resolveOrderRtoReasonCategory
 } = require('../services/rtoRefund.service');
 
 let passed = 0;
@@ -36,6 +38,7 @@ function assert(name, cond, detail) {
 }
 
 function baseOrder(overrides = {}) {
+  const { returnInfo: riOverride, shipmentInfo: siOverride, ...rest } = overrides;
   return {
     paymentInfo: { method: 'online', razorpayPaymentId: 'pay_test_1' },
     paymentStatus: 'paid',
@@ -46,7 +49,8 @@ function baseOrder(overrides = {}) {
     refundHistory: [],
     returnInfo: {
       rtoStatus: 'pending',
-      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z')
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      ...(riOverride || {})
     },
     shipmentInfo: {
       providerStatus: 'RTO Delivered',
@@ -54,20 +58,21 @@ function baseOrder(overrides = {}) {
         { status: 'RTO Initiated', at: '2026-01-01T10:00:00Z' },
         { status: 'RTO In Transit', at: '2026-01-02T10:00:00Z' },
         { status: 'RTO Delivered', at: '2026-01-03T10:00:00Z' }
-      ]
+      ],
+      ...(siOverride || {})
     },
-    ...overrides
+    ...rest
   };
 }
 
-console.log('\n1) Detector — no attempt');
+console.log('\n1) Detector — no attempt (analytics only)');
 {
   const o = baseOrder();
   assert('no attempt on silent RTO', isCourierNoAttemptRto(o) === true);
   assert('hasAttempt false', orderHasDeliveryAttemptOrCustomerFault(o) === false);
 }
 
-console.log('\n2) Detector — Out For Delivery');
+console.log('\n2) Detector — Out For Delivery still detected, but full refund NOT blocked');
 {
   const o = baseOrder({
     shipmentInfo: {
@@ -77,71 +82,91 @@ console.log('\n2) Detector — Out For Delivery');
         { status: 'RTO Initiated', at: '2026-01-02T10:00:00Z' },
         { status: 'RTO Delivered', at: '2026-01-03T10:00:00Z' }
       ]
+    },
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'courier'
     }
   });
-  assert('OFD blocks full amount', orderHasDeliveryAttemptOrCustomerFault(o) === true);
-  assert('calc blocked', calculateFullPaidAmountRtoRefund(o).eligible === false);
-  assert(
-    'blocked reason attempt',
-    calculateFullPaidAmountRtoRefund(o).reason === 'delivery_attempt_or_customer_fault'
-  );
+  assert('OFD detected', orderHasDeliveryAttemptOrCustomerFault(o) === true);
+  assert('full amount still eligible after OFD', calculateFullPaidAmountRtoRefund(o).eligible === true);
+  assert('can offer full after OFD', canOfferFullPaidAmountRtoRefund(o) === true);
+  assert('net also offerable', canOfferStandardRtoRefund(o) === true);
 }
 
-console.log('\n3) Detector — Not Contactable (Shipmozo-style status)');
+console.log('\n3) Fully paid + customer fault → both net and full');
 {
   const o = baseOrder({
-    shipmentInfo: {
-      providerStatus: 'RTO Delivered',
-      rawEvents: [
-        { status: 'Not Contactable', time: '10:00', date: '01-01-2026' },
-        { status: 'RTO Delivered', time: '12:00', date: '03-01-2026' }
-      ]
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'customer'
     }
   });
-  assert('not contactable = fault', orderHasDeliveryAttemptOrCustomerFault(o) === true);
-  assert('full amount not eligible', calculateFullPaidAmountRtoRefund(o).eligible === false);
+  assert('category customer', resolveOrderRtoReasonCategory(o) === 'customer');
+  assert('full offerable', canOfferFullPaidAmountRtoRefund(o) === true);
+  assert('net offerable', canOfferStandardRtoRefund(o) === true);
 }
 
-console.log('\n4) Detector — customer refuse');
+console.log('\n4) Fully paid + courier fault → both');
 {
   const o = baseOrder({
-    shipmentInfo: {
-      providerStatus: 'RTO Delivered',
-      rawEvents: [{ status: 'Customer refused to accept', at: '2026-01-01T10:00:00Z' }]
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'courier',
+      rtoShiprocketReason: 'pincode_updated'
     }
   });
-  assert('refuse = fault', orderHasDeliveryAttemptOrCustomerFault(o) === true);
-}
-
-console.log('\n5) Full amount calc — full paid silent RTO');
-{
-  const o = baseOrder();
-  const calc = calculateFullPaidAmountRtoRefund(o);
-  assert('eligible', calc.eligible === true);
-  assert('max = paid', calc.maxRefundableInr === 910, `got ${calc.maxRefundableInr}`);
-  assert('deductions zero', calc.totalDeductions === 0);
-  assert('mode', calc.refundMode === 'full_paid_amount');
-  assert('can offer', canOfferFullPaidAmountRtoRefund(o) === true);
-
+  assert('category courier', resolveOrderRtoReasonCategory(o) === 'courier');
+  assert('full offerable', canOfferFullPaidAmountRtoRefund(o) === true);
+  assert('net offerable', canOfferStandardRtoRefund(o) === true);
+  const full = calculateFullPaidAmountRtoRefund(o);
+  assert('full = paid', full.maxRefundableInr === 910, `got ${full.maxRefundableInr}`);
   const standard = calculateRtoRefund(o);
-  assert('standard still eligible independently', standard.eligible === true);
   assert('standard net < paid', standard.maxRefundableInr < 910);
 }
 
-console.log('\n6) Full amount calc — partial paid silent RTO');
+console.log('\n5) Partial + courier → both (full = amount paid)');
 {
   const o = baseOrder({
     paymentStatus: 'partially_paid',
     totalAmount: 1200,
     amountPaidInr: 400,
     subtotal: 1100,
-    deliveryCharges: 100
+    deliveryCharges: 100,
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'courier'
+    }
   });
   const calc = calculateFullPaidAmountRtoRefund(o);
-  assert('partial eligible for full-amount path', calc.eligible === true);
+  assert('partial courier full eligible', calc.eligible === true);
   assert('refunds only paid', calc.maxRefundableInr === 400, `got ${calc.maxRefundableInr}`);
-  assert('standard still blocked for partial', calculateRtoRefund(o).eligible === false);
-  assert('can offer partial', canOfferFullPaidAmountRtoRefund(o) === true);
+  assert('standard eligible for partial', calculateRtoRefund(o).eligible === true);
+  assert('can offer full', canOfferFullPaidAmountRtoRefund(o) === true);
+  assert('can offer net', canOfferStandardRtoRefund(o) === true);
+}
+
+console.log('\n6) Partial + customer → net only (no full)');
+{
+  const o = baseOrder({
+    paymentStatus: 'partially_paid',
+    totalAmount: 1200,
+    amountPaidInr: 400,
+    subtotal: 1100,
+    deliveryCharges: 100,
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'customer'
+    }
+  });
+  assert('full blocked', calculateFullPaidAmountRtoRefund(o).eligible === false);
+  assert('cannot offer full', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('net still possible when above threshold', canOfferStandardRtoRefund(o) === true);
 }
 
 console.log('\n7) COD blocked');
@@ -152,7 +177,8 @@ console.log('\n7) COD blocked');
     amountPaidInr: 0
   });
   assert('cod not eligible', calculateFullPaidAmountRtoRefund(o).eligible === false);
-  assert('cannot offer cod', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('cannot offer full', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('cannot offer net', canOfferStandardRtoRefund(o) === false);
 }
 
 console.log('\n8) Already refunded amount reduces remaining');
@@ -164,29 +190,32 @@ console.log('\n8) Already refunded amount reduces remaining');
   assert('remaining 810', calc.maxRefundableInr === 810, `got ${calc.maxRefundableInr}`);
 }
 
-console.log('\n9) Stored customer category blocks');
+console.log('\n9) Warehouse not delivered → cannot offer either');
 {
   const o = baseOrder({
-    returnInfo: {
-      rtoStatus: 'pending',
-      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
-      rtoReasonCategory: 'customer'
-    }
-  });
-  assert('category customer blocks', orderHasDeliveryAttemptOrCustomerFault(o) === true);
-  assert('not offerable', canOfferFullPaidAmountRtoRefund(o) === false);
-}
-
-console.log('\n10) Warehouse not delivered → cannot offer');
-{
-  const o = baseOrder({
-    returnInfo: { rtoStatus: 'pending', rtoWarehouseDeliveredAt: null },
+    returnInfo: { rtoStatus: 'pending', rtoWarehouseDeliveredAt: null, rtoReasonCategory: 'courier' },
     shipmentInfo: {
       providerStatus: 'RTO Initiated',
       rawEvents: [{ status: 'RTO Initiated', at: '2026-01-01T10:00:00Z' }]
     }
   });
-  assert('no warehouse latch', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('no warehouse → no full', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('no warehouse → no net', canOfferStandardRtoRefund(o) === false);
+}
+
+console.log('\n10) One-shot lock after refund initiated');
+{
+  const o = baseOrder({
+    returnInfo: {
+      rtoStatus: 'pending',
+      rtoWarehouseDeliveredAt: new Date('2026-01-01T00:00:00Z'),
+      rtoReasonCategory: 'courier',
+      rtoRefundId: 'rfnd_done',
+      refundInitiatedAt: new Date()
+    }
+  });
+  assert('locked full', canOfferFullPaidAmountRtoRefund(o) === false);
+  assert('locked net', canOfferStandardRtoRefund(o) === false);
 }
 
 console.log(`\nDone: ${passed} passed, ${failed} failed`);

@@ -73,7 +73,7 @@ const cases = [
     expectReason: 'full_online_payment'
   },
   {
-    name: 'Ex6 — partial payment → no refund',
+    name: 'Ex6 — partial payment → net eligible (capped at paid)',
     order: {
       subtotal: 1200,
       deliveryCharges: 0,
@@ -82,9 +82,11 @@ const cases = [
       paymentStatus: 'partially_paid',
       amountPaidInr: 500
     },
-    expectEligible: false,
-    expectNet: 0,
-    expectReason: 'partial_or_unpaid_no_refund'
+    rto: 0,
+    expectEligible: true,
+    expectNet: 1146,
+    expectReason: 'partial_online_payment',
+    expectMaxRefundable: 500
   },
   {
     name: 'Ex7 — same as Ex5 (above ₹20 threshold)',
@@ -148,7 +150,9 @@ for (const c of cases) {
   const netOk = r.netRefund === c.expectNet;
   const eligOk = r.eligible === c.expectEligible;
   const reasonOk = r.reason === c.expectReason;
-  const ok = netOk && eligOk && reasonOk;
+  const maxOk =
+    c.expectMaxRefundable == null || r.maxRefundableInr === c.expectMaxRefundable;
+  const ok = netOk && eligOk && reasonOk && maxOk;
   if (!ok) failed += 1;
   console.log(
     c.name,
@@ -163,7 +167,10 @@ for (const c of cases) {
     c.expectEligible,
     '| reason:',
     r.reason,
-    reasonOk ? '' : `(expected ${c.expectReason})`
+    reasonOk ? '' : `(expected ${c.expectReason})`,
+    c.expectMaxRefundable != null
+      ? `| maxRefundable: ${r.maxRefundableInr} expected ${c.expectMaxRefundable}`
+      : ''
   );
   if (!ok && r.deductions) {
     console.log('  deductions:', JSON.stringify(r.deductions));

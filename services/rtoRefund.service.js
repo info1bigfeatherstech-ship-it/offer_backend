@@ -450,6 +450,8 @@ async function enrichRtoOrdersFreightCharges(orders, options = {}) {
 function classifyRtoRefundEligibility(order) {
   const method = String(order?.paymentInfo?.method || '').toLowerCase();
   const status = String(order?.paymentStatus || '').toLowerCase();
+  const total = roundMoney2(Number(order?.totalAmount) || 0);
+  const paid = roundMoney2(Number(order?.amountPaidInr) || 0);
 
   if (method === 'cod') {
     return {
@@ -469,32 +471,97 @@ function classifyRtoRefundEligibility(order) {
     };
   }
 
-  if (status !== 'paid') {
+  if (paid <= 0.01) {
     return {
       eligible: false,
-      reason: 'partial_or_unpaid_no_refund',
+      reason: 'no_online_amount_paid',
       paymentMethod: method,
       paymentStatus: status
     };
   }
 
-  const total = roundMoney2(order.totalAmount);
-  const paid = roundMoney2(Number(order.amountPaidInr) || total);
-  if (paid + 0.005 < total) {
+  // Full online paid — classic net-refund path.
+  if (status === 'paid' && (total <= 0.01 || paid + 0.005 >= total)) {
     return {
-      eligible: false,
-      reason: 'partial_payment_no_refund',
+      eligible: true,
+      reason: 'full_online_payment',
+      paymentMethod: method,
+      paymentStatus: status
+    };
+  }
+
+  // Partial prepaid — net refund capped at amountPaidInr (admin matrix).
+  if (status === 'partially_paid' || (paid > 0.01 && total > 0.01 && paid + 0.005 < total)) {
+    return {
+      eligible: true,
+      reason: 'partial_online_payment',
       paymentMethod: method,
       paymentStatus: status
     };
   }
 
   return {
-    eligible: true,
-    reason: 'full_online_payment',
+    eligible: false,
+    reason: 'partial_or_unpaid_no_refund',
     paymentMethod: method,
     paymentStatus: status
   };
+}
+
+/**
+ * Effective RTO fault category for admin refund matrix.
+ * Prefers stored returnInfo.rtoReasonCategory, then reason / provider text.
+ * @param {import('mongoose').Document|object} order
+ * @returns {'customer'|'courier'|'unknown'}
+ */
+function resolveOrderRtoReasonCategory(order) {
+  try {
+    const ri = order?.returnInfo || {};
+    const stored = String(ri.rtoReasonCategory || '')
+      .trim()
+      .toLowerCase();
+    if (stored === 'customer' || stored === 'courier') return stored;
+
+    const fromStoredReason = classifyRtoReasonCategory(ri.rtoShiprocketReason);
+    if (fromStoredReason !== 'unknown') return fromStoredReason;
+
+    const fromProvider = classifyRtoReasonCategory(order?.shipmentInfo?.providerStatus);
+    if (fromProvider !== 'unknown') return fromProvider;
+
+    for (const text of collectRtoEvidenceTexts(order)) {
+      const cat = classifyRtoReasonCategory(text);
+      if (cat !== 'unknown') return cat;
+    }
+    return 'unknown';
+  } catch (_) {
+    return 'unknown';
+  }
+}
+
+/**
+ * Shared open-window checks for any Razorpay RTO refund action.
+ * Warehouse delivered is mandatory — never unlock earlier.
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean}
+ */
+function isRtoRefundActionWindowOpen(order) {
+  try {
+    if (!order) return false;
+    if (!isRtoWarehouseDeliveredForOrder(order)) return false;
+    if (hasRtoRefundBeenInitiated(order)) return false;
+    const ri = order.returnInfo || {};
+    if (ri.rtoRejectedAt) return false;
+    const st = String(ri.rtoStatus || 'pending')
+      .trim()
+      .toLowerCase();
+    if (['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(st)) {
+      return false;
+    }
+    if (!order?.paymentInfo?.razorpayPaymentId) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -950,13 +1017,20 @@ function isCourierNoAttemptRto(order) {
 
 /**
  * Refund the amount the customer actually paid online — zero shipping/platform deductions.
- * Allowed for full_paid and partial_paid online; blocked for COD.
+ *
+ * Admin matrix:
+ * - Fully paid → always eligible (customer or courier)
+ * - Partial paid → only when courier / logistics fault
+ * - COD → never
+ *
+ * OFD / delivery-attempt evidence no longer blocks this path; admin chooses net vs full.
  * @param {import('mongoose').Document|object} order
  * @returns {object}
  */
 function calculateFullPaidAmountRtoRefund(order) {
   const method = String(order?.paymentInfo?.method || '').toLowerCase();
   const paymentType = classifyRtoPaymentType(order);
+  const category = resolveOrderRtoReasonCategory(order);
   const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
   const alreadyRefundedInr = roundMoney2(
     (order?.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
@@ -985,6 +1059,8 @@ function calculateFullPaidAmountRtoRefund(order) {
     maxRefundableInr: 0,
     amountPaidInr: paidInr,
     alreadyRefundedInr,
+    reasonCategory: category,
+    paymentTypeKey: paymentType.key,
     minOrderValue: getMinOrderValueForRefund(),
     minRefundThreshold: 0,
     ...extra
@@ -1002,13 +1078,17 @@ function calculateFullPaidAmountRtoRefund(order) {
   if (remainingPaidInr <= 0.01) {
     return buildBlocked('already_fully_refunded', { netRefund: 0, maxRefundableInr: 0 });
   }
-  if (!isCourierNoAttemptRto(order)) {
-    return buildBlocked('delivery_attempt_or_customer_fault');
+  // Partial + non-courier → no full-amount path (net only / close).
+  if (paymentType.key === 'partial_paid' && category !== 'courier') {
+    return buildBlocked('partial_non_courier_no_full_amount');
   }
 
   return {
     eligible: true,
-    reason: 'full_paid_amount_no_attempt',
+    reason:
+      paymentType.key === 'partial_paid'
+        ? 'full_paid_amount_partial_courier'
+        : 'full_paid_amount_admin_choice',
     refundMode: 'full_paid_amount',
     cartValue: deductions.cartValue,
     orderTotal: deductions.orderTotal,
@@ -1019,28 +1099,40 @@ function calculateFullPaidAmountRtoRefund(order) {
     maxRefundableInr: remainingPaidInr,
     amountPaidInr: paidInr,
     alreadyRefundedInr,
+    reasonCategory: category,
+    paymentTypeKey: paymentType.key,
     minOrderValue: getMinOrderValueForRefund(),
     minRefundThreshold: 0
   };
 }
 
 /**
- * Whether admin may offer "Refund full amount" (Razorpay of amountPaidInr).
+ * Whether admin may offer "Full refund" (Razorpay of remaining amountPaidInr).
+ * Requires warehouse delivered + open case. One-shot with net refund (same lock).
  * @param {import('mongoose').Document|object} order
  * @returns {boolean}
  */
 function canOfferFullPaidAmountRtoRefund(order) {
   try {
-    if (!isRtoWarehouseDeliveredForOrder(order)) return false;
-    if (hasRtoRefundBeenInitiated(order)) return false;
-    const ri = order?.returnInfo || {};
-    const st = String(ri.rtoStatus || 'pending').trim().toLowerCase();
-    if (ri.rtoRejectedAt) return false;
-    if (['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(st)) {
-      return false;
-    }
-    if (!order?.paymentInfo?.razorpayPaymentId) return false;
+    if (!isRtoRefundActionWindowOpen(order)) return false;
     const calc = calculateFullPaidAmountRtoRefund(order);
+    return Boolean(calc.eligible && calc.maxRefundableInr > 0.01);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Whether admin may offer standard net refund (deductions applied, capped at paid).
+ * Available for full paid always; for partial paid when calc is eligible (customer or courier).
+ * Mutually exclusive at execution time with full refund via hasRtoRefundBeenInitiated.
+ * @param {import('mongoose').Document|object} order
+ * @returns {boolean}
+ */
+function canOfferStandardRtoRefund(order) {
+  try {
+    if (!isRtoRefundActionWindowOpen(order)) return false;
+    const calc = calculateRtoRefund(order);
     return Boolean(calc.eligible && calc.maxRefundableInr > 0.01);
   } catch (_) {
     return false;
@@ -1334,6 +1426,9 @@ module.exports = {
   calculateRtoRefund,
   calculateFullPaidAmountRtoRefund,
   canOfferFullPaidAmountRtoRefund,
+  canOfferStandardRtoRefund,
+  isRtoRefundActionWindowOpen,
+  resolveOrderRtoReasonCategory,
   orderHasDeliveryAttemptOrCustomerFault,
   isCourierNoAttemptRto,
   getRtoOrderTotal,

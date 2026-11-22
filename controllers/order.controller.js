@@ -3246,7 +3246,7 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo items removedItemsArchive returnInfo refundHistory addressSnapshot storefront'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo items removedItemsArchive returnInfo refundHistory addressSnapshot storefront fulfillmentMode'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();

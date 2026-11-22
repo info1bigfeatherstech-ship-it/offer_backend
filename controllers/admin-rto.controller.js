@@ -20,8 +20,10 @@ const {
   calculateRtoRefund,
   calculateFullPaidAmountRtoRefund,
   canOfferFullPaidAmountRtoRefund,
+  canOfferStandardRtoRefund,
   isCourierNoAttemptRto,
   classifyRtoReasonCategory,
+  resolveOrderRtoReasonCategory,
   mapShiprocketRtoStage,
   isRtoWarehouseDeliveredForOrder,
   ensureRtoWarehouseDeliveredLatch,
@@ -304,20 +306,23 @@ function mapRtoOrderRow(order) {
   const calc = calculateRtoRefund(o);
   const fullAmountCalc = calculateFullPaidAmountRtoRefund(o);
   const canFullAmountRefund = canOfferFullPaidAmountRtoRefund(o);
+  const canRefund = canOfferStandardRtoRefund(o);
   const courierNoAttempt = isCourierNoAttemptRto(o);
   const providerStatus = o.shipmentInfo?.providerStatus || null;
-  const reasonCategory =
-    o.returnInfo?.rtoReasonCategory || classifyRtoReasonCategory(providerStatus);
+  const reasonCategory = resolveOrderRtoReasonCategory(o);
   const rtoStage = mapShiprocketRtoStage(providerStatus);
   const rtoStatus = normalizeRtoTerminalStatus(ri.rtoStatus || 'pending');
   const refundTrack = deriveRefundTrackStatus(o);
   const warehouseDelivered = isRtoWarehouseDeliveredForOrder(o);
   const paymentType = classifyRtoPaymentType(o);
+  /** Outer badge — courier fault only (admin can still refund customer-fault from Actions). */
+  const refundEligibleBadge =
+    reasonCategory === 'courier' && warehouseDelivered && (canRefund || canFullAmountRefund);
   const adminActionRequired =
     warehouseDelivered &&
     rtoStatus === 'pending' &&
     !hasRtoRefundBeenInitiated(o) &&
-    ((paymentType.refundAllowed && calc.eligible) || canFullAmountRefund);
+    (canRefund || canFullAmountRefund);
   const displayReason = resolveRtoDisplayReason(o);
 
   const customerName =
@@ -395,23 +400,22 @@ function mapRtoOrderRow(order) {
     paymentType,
     warehouseDelivered,
     courierNoAttempt,
-    /** Standard deduction refund — hidden when silent courier no-attempt full-amount path applies. */
-    canRefund:
-      calc.eligible &&
-      warehouseDelivered &&
-      !canFullAmountRefund &&
-      ['pending', null].includes(rtoStatus) &&
-      !ri.rtoRejectedAt &&
-      !hasRtoRefundBeenInitiated(o),
     /**
-     * No-attempt courier RTO: refund amountPaidInr with zero deductions
-     * (full_paid + partial_paid online).
+     * Net refund (deductions). Can appear together with canFullAmountRefund;
+     * executing either locks the case (one-shot).
+     */
+    canRefund,
+    /**
+     * Full paid-amount refund (no deductions).
+     * Fully paid: always (with warehouse). Partial: courier fault only.
      */
     canFullAmountRefund,
     fullAmountRefundInr: canFullAmountRefund ? fullAmountCalc.maxRefundableInr : 0,
+    /** Courier-fault only — shown next to status/reason in admin list. */
+    refundEligibleBadge,
     /** Deny when a Razorpay refund is otherwise possible (standard or full-amount). */
     canReject:
-      ((calc.eligible && paymentType.refundAllowed) || canFullAmountRefund) &&
+      (canRefund || canFullAmountRefund) &&
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
       !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
@@ -419,23 +423,28 @@ function mapRtoOrderRow(order) {
       ['pending', null].includes(rtoStatus) &&
       !hasRtoRefundBeenInitiated(o) &&
       !['refunded', 'refund_rejected', 'refund_failed', 'closed', 'resolved'].includes(rtoStatus),
-    refundBlockedReason: canFullAmountRefund
-      ? null
-      : calc.eligible && !warehouseDelivered
-        ? 'Waiting for Shiprocket RTO Delivered to warehouse'
-        : !calc.eligible
-          ? paymentType.key === 'partial_paid'
-            ? 'Partial payment — close case (no Razorpay)'
-            : paymentType.key === 'cod'
-              ? 'COD — close case (no Razorpay)'
-              : calc.reason === 'order_below_min_value'
-                ? `Order ₹${minGateLabel} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — no refund`
-                : calc.reason === 'refund_below_min_threshold'
-                  ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} — no refund`
-                  : calc.reason === 'zero_or_negative_net_refund'
-                    ? 'Deductions exceed order total — no refund'
-                    : 'Not eligible for RTO refund'
-          : null
+    refundBlockedReason:
+      canRefund || canFullAmountRefund
+        ? null
+        : !warehouseDelivered &&
+            (paymentType.key === 'full_paid' ||
+              paymentType.key === 'partial_paid' ||
+              calc.eligible ||
+              fullAmountCalc.eligible)
+          ? 'Waiting for Shiprocket RTO Delivered to warehouse'
+          : paymentType.key === 'cod'
+            ? 'COD — close case (no Razorpay)'
+            : calc.reason === 'order_below_min_value'
+              ? `Order ₹${minGateLabel} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — no refund`
+              : calc.reason === 'refund_below_min_threshold' && !canFullAmountRefund
+                ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} — no refund`
+                : calc.reason === 'zero_or_negative_net_refund' && !canFullAmountRefund
+                  ? 'Deductions exceed order total — no refund'
+                  : !canRefund && !canFullAmountRefund
+                    ? paymentType.key === 'partial_paid' && reasonCategory !== 'courier'
+                      ? 'Partial + customer fault — net refund only if above threshold; else close case'
+                      : null
+                    : null
   };
 }
 
@@ -702,8 +711,8 @@ exports.processRtoRefund = async (req, res) => {
           'RTO_FULL_AMOUNT_NOT_ELIGIBLE',
           calc.reason === 'cod_no_refund'
             ? 'COD orders are not eligible for refund. Close the case instead.'
-            : calc.reason === 'delivery_attempt_or_customer_fault'
-              ? 'Tracking shows a delivery attempt or customer fault — use the standard refund path instead.'
+            : calc.reason === 'partial_non_courier_no_full_amount'
+              ? 'Partial paid + customer fault — full refund is not available. Use net refund or close the case.'
               : calc.reason === 'already_fully_refunded'
                 ? 'This order has already been fully refunded for the amount paid.'
                 : calc.reason === 'no_online_amount_paid'
@@ -715,7 +724,9 @@ exports.processRtoRefund = async (req, res) => {
         throw createHttpError(
           400,
           'RTO_FULL_AMOUNT_NOT_ELIGIBLE',
-          'Full paid-amount refund is not available for this order right now.'
+          !isRtoWarehouseDeliveredForOrder(order)
+            ? 'Refund is available only after Shiprocket reports RTO Delivered to warehouse.'
+            : 'Full paid-amount refund is not available for this order right now.'
         );
       }
     } else {
@@ -725,15 +736,7 @@ exports.processRtoRefund = async (req, res) => {
         /* non-blocking — calc still uses whatever is on the order */
       }
 
-      // Silent courier no-attempt RTOs must use full_paid_amount, not deducted standard.
-      if (canOfferFullPaidAmountRtoRefund(order)) {
-        throw createHttpError(
-          400,
-          'USE_FULL_PAID_AMOUNT_REFUND',
-          'No delivery attempt found on tracking — use “Refund full amount” for this order.'
-        );
-      }
-
+      // Admin may choose net OR full — both can be offered; one-shot lock after either.
       calc = calculateRtoRefund(order, { rtoShippingOverride });
       if (!calc.eligible || calc.maxRefundableInr <= 0) {
         throw createHttpError(
@@ -741,13 +744,26 @@ exports.processRtoRefund = async (req, res) => {
           'RTO_REFUND_NOT_ELIGIBLE',
           calc.reason === 'cod_no_refund'
             ? 'COD orders are not eligible for refund. Close the case instead.'
-            : calc.reason === 'partial_or_unpaid_no_refund' || calc.reason === 'partial_payment_no_refund'
-              ? 'Partial payment orders are not eligible for refund. Close the case instead.'
+            : calc.reason === 'no_online_amount_paid'
+              ? 'No online amount paid to refund.'
               : calc.reason === 'order_below_min_value'
                 ? `Order ₹${roundMoney2(Number(calc.minGateAmount) || Number(calc.orderTotal) || 0)} (items + shipping) is below ₹${calc.minOrderValue ?? 100} — not eligible for RTO refund.`
                 : calc.reason === 'refund_below_min_threshold'
                   ? `Net refund ₹${roundMoney2(Number(calc.netRefund) || 0)} must exceed ₹${calc.minRefundThreshold ?? 20} after deductions.`
-                  : 'This order is not eligible for RTO refund.'
+                  : canOfferFullPaidAmountRtoRefund(order)
+                    ? 'Net refund not eligible — use Full refund instead.'
+                    : 'This order is not eligible for RTO refund.'
+        );
+      }
+      if (!canOfferStandardRtoRefund(order)) {
+        throw createHttpError(
+          400,
+          'RTO_REFUND_NOT_ELIGIBLE',
+          !isRtoWarehouseDeliveredForOrder(order)
+            ? 'Refund is available only after Shiprocket reports RTO Delivered to warehouse.'
+            : canOfferFullPaidAmountRtoRefund(order)
+              ? 'Net refund not available right now — use Full refund instead.'
+              : 'Net refund is not available for this order right now.'
         );
       }
       calc = { ...calc, refundMode: 'standard' };
@@ -1038,12 +1054,14 @@ exports.bulkRtoAction = async (req, res) => {
             });
             continue;
           }
-          if (canOfferFullPaidAmountRtoRefund(order)) {
+          if (!canOfferStandardRtoRefund(order)) {
             results.push({
               orderId,
               success: false,
-              code: 'USE_FULL_PAID_AMOUNT_REFUND',
-              message: 'No delivery attempt — use “Refund full amount” on this order (bulk standard refund skipped)'
+              code: 'RTO_REFUND_NOT_ELIGIBLE',
+              message: canOfferFullPaidAmountRtoRefund(order)
+                ? 'Net refund not eligible — use Full refund on this order'
+                : 'Not eligible for net refund'
             });
             continue;
           }
