@@ -1097,14 +1097,39 @@ class ShiprocketService {
 
       // Some Shiprocket responses nest under data / payload.
       const root = data?.data && typeof data.data === 'object' ? { ...data, ...data.data } : data;
+      const nestedShipment =
+        root.shipment ||
+        (Array.isArray(root.shipments) ? root.shipments[0] : null) ||
+        (root.shipments && typeof root.shipments === 'object' ? root.shipments : null) ||
+        {};
+
+      const reverseShiprocketOrderId =
+        root.order_id != null
+          ? String(root.order_id)
+          : root.orderId != null
+            ? String(root.orderId)
+            : root.id != null
+              ? String(root.id)
+              : null;
+      const reverseShipmentId =
+        root.shipment_id != null
+          ? String(root.shipment_id)
+          : nestedShipment?.id != null
+            ? String(nestedShipment.id)
+            : nestedShipment?.shipment_id != null
+              ? String(nestedShipment.shipment_id)
+              : root.return_id != null
+                ? String(root.return_id)
+                : null;
 
       return {
         success: true,
-        reverseShipmentId: root.shipment_id || root.return_id || root.order_id || null,
-        reverseAwbCode: root.awb_code || root.tracking_number || null,
-        reverseTrackingNumber: root.tracking_number || root.awb_code || null,
-        reverseCourier: root.courier_name || null,
-        providerStatus: root.status || root.current_status || 'reverse_pickup_created',
+        reverseShiprocketOrderId,
+        reverseShipmentId,
+        reverseAwbCode: root.awb_code || nestedShipment?.awb || root.tracking_number || null,
+        reverseTrackingNumber: root.tracking_number || root.awb_code || nestedShipment?.awb || null,
+        reverseCourier: root.courier_name || nestedShipment?.courier || null,
+        providerStatus: root.status || root.current_status || 'RETURN PENDING',
         raw: data,
         mock: false
       };
@@ -1114,6 +1139,262 @@ class ShiprocketService {
       logger.error('[Shiprocket] createReturnPickup failed:', details || err.message);
       return { success: false, error: message, details };
     }
+  }
+
+  /**
+   * Resolve Shiprocket return order snapshot via channel id and/or numeric ids.
+   * Prefer channel …-RET, then reverseShiprocketOrderId, then legacy reverseShipmentId as order id fallback.
+   */
+  async fetchReturnOrderSnapshot({
+    channelOrderId = null,
+    shiprocketOrderId = null,
+    shipmentIdFallbackAsOrderId = null
+  } = {}) {
+    const candidates = [];
+    const push = (id, via) => {
+      const v = id != null ? String(id).trim() : '';
+      if (!v) return;
+      if (candidates.some((c) => c.id === v)) return;
+      candidates.push({ id: v, via });
+    };
+    push(channelOrderId, 'channel_order_id');
+    push(shiprocketOrderId, 'shiprocket_order_id');
+    // Legacy rows may have stored Shiprocket order id in reverseShipmentId.
+    push(shipmentIdFallbackAsOrderId, 'legacy_id');
+
+    let lastFail = null;
+    for (const c of candidates) {
+      try {
+        const data = await this.requestWithAuth({
+          method: 'get',
+          url: `${this.baseURL}/external/orders/show/${encodeURIComponent(c.id)}`,
+          timeout: 20000
+        });
+        if (!data) {
+          lastFail = { message: 'Shiprocket auth failed' };
+          continue;
+        }
+        const root = ShiprocketService.normalizeForwardOrderRoot(data);
+        if (!root) {
+          lastFail = { message: 'Empty Shiprocket order payload' };
+          continue;
+        }
+        let snapshot = ShiprocketService.extractForwardOrderSnapshot(root);
+        const rawStatus = String(root.status || root.current_status || root.shipment_status || '').trim();
+        if (!snapshot) {
+          // Minimal snapshot for return-pending orders if extractor is overly forward-specific.
+          const sh0 = ShiprocketService.getPrimaryShipment(root) || {};
+          snapshot = {
+            shiprocketOrderId:
+              root.id != null
+                ? String(root.id)
+                : root.order_id != null
+                  ? String(root.order_id)
+                  : null,
+            shipmentId:
+              sh0.id != null
+                ? String(sh0.id)
+                : sh0.shipment_id != null
+                  ? String(sh0.shipment_id)
+                  : root.shipment_id != null
+                    ? String(root.shipment_id)
+                    : null,
+            awbCode: root.awb || root.awb_code || sh0.awb || sh0.awb_code || null,
+            trackingNumber: root.awb || root.awb_code || sh0.awb || null,
+            courier: root.courier_name || sh0.courier_name || sh0.courier || null,
+            providerStatus: rawStatus || null
+          };
+        } else if (!snapshot.providerStatus && rawStatus) {
+          snapshot.providerStatus = rawStatus;
+        }
+
+        if (snapshot.shiprocketOrderId || snapshot.shipmentId || snapshot.providerStatus || snapshot.awbCode) {
+          return {
+            success: true,
+            snapshot,
+            raw: root,
+            resolvedVia: c.via,
+            lookupId: c.id
+          };
+        }
+        lastFail = { message: 'Shiprocket return payload missing identifiers' };
+      } catch (err) {
+        lastFail = err.response?.data || { message: err.message };
+        logger.warn('[Shiprocket] fetchReturnOrderSnapshot failed', {
+          id: c.id,
+          via: c.via,
+          status: err.response?.status,
+          message: err?.message
+        });
+      }
+    }
+
+    return {
+      success: false,
+      code: 'RETURN_ORDER_LOOKUP_FAILED',
+      message:
+        'Could not load Shiprocket return order. Confirm it exists under Returns (channel id …-RET).',
+      details: lastFail || null
+    };
+  }
+
+  /**
+   * Panel "Initiate Return" — assign AWB on a return shipment.
+   * POST /external/courier/assign/awb with is_return: 1 (courier_id optional).
+   */
+  async assignReturnAwb({ shipmentId, courierId = null } = {}) {
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (!sid) {
+      return { success: false, code: 'INVALID_SHIPMENT_ID', message: 'Valid return shipment_id is required' };
+    }
+    if (!this.enabled) {
+      return {
+        success: true,
+        mock: true,
+        awbCode: `MOCK-RET-AWB-${sid}`,
+        trackingNumber: `MOCK-RET-AWB-${sid}`,
+        courier: 'Mock Return Courier',
+        providerStatus: 'RETURN INITIATED',
+        raw: { mock: true, is_return: 1 }
+      };
+    }
+
+    try {
+      const body = {
+        shipment_id: sid,
+        is_return: 1
+      };
+      if (courierId != null && Number.isFinite(Number(courierId))) {
+        body.courier_id = Number(courierId);
+      }
+
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url: `${this.baseURL}/external/courier/assign/awb`,
+        data: body,
+        timeout: 30000
+      });
+      if (!data) {
+        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+      }
+
+      const nested = data.response?.data && typeof data.response.data === 'object' ? data.response.data : {};
+      const awbCode =
+        data.awb_code || nested.awb_code || data.awb || nested.awb || null;
+      const trackingNumber = data.tracking_number || nested.tracking_number || awbCode || null;
+      const courierName = data.courier_name || nested.courier_name || null;
+      const awbAssignStatus = data.awb_assign_status != null ? Number(data.awb_assign_status) : null;
+      const hasAwb = Boolean(String(awbCode || trackingNumber || '').trim());
+      const assignSucceeded = hasAwb || awbAssignStatus === 1;
+
+      if (!assignSucceeded) {
+        const errMsg =
+          nested.awb_assign_error ||
+          data.awb_error ||
+          (typeof data.payload === 'string' ? data.payload : null) ||
+          data.message ||
+          'Shiprocket did not assign a return AWB. Check wallet / courier availability.';
+        return {
+          success: false,
+          code: 'RETURN_AWB_ASSIGN_FAILED',
+          message: ShiprocketService.formatProviderError(errMsg),
+          details: data
+        };
+      }
+
+      return {
+        success: true,
+        reverseShipmentId: String(sid),
+        reverseAwbCode: awbCode ? String(awbCode) : null,
+        reverseTrackingNumber: trackingNumber ? String(trackingNumber) : null,
+        reverseCourier: courierName ? String(courierName) : null,
+        providerStatus: data.status || nested.status || 'AWB ASSIGNED',
+        raw: data,
+        mock: false
+      };
+    } catch (err) {
+      const details = err.response?.data || null;
+      return {
+        success: false,
+        code: 'RETURN_AWB_ASSIGN_FAILED',
+        message: ShiprocketService.formatProviderError(details || err.message),
+        details
+      };
+    }
+  }
+
+  /**
+   * Ensure return has shipment_id, then assign return AWB (Initiate Return).
+   * Does not create the return order — caller must have created it already.
+   */
+  async initiateReturnAwbForOrder(order, returnInfo = {}) {
+    const channelOrderId = `${String(order?.orderId || '').trim()}-RET`.slice(0, 50);
+    let shipmentId = returnInfo.reverseShipmentId ? String(returnInfo.reverseShipmentId).trim() : '';
+    let shiprocketOrderId = returnInfo.reverseShiprocketOrderId
+      ? String(returnInfo.reverseShiprocketOrderId).trim()
+      : '';
+
+    // If shipment id missing OR we only have a legacy id, resolve via show.
+    const needsResolve = !shipmentId || !shiprocketOrderId || !/^\d+$/.test(shipmentId);
+    if (needsResolve) {
+      const lookup = await this.fetchReturnOrderSnapshot({
+        channelOrderId,
+        shiprocketOrderId: shiprocketOrderId || null,
+        shipmentIdFallbackAsOrderId: shipmentId || null
+      });
+      if (lookup?.success && lookup.snapshot) {
+        if (lookup.snapshot.shipmentId) shipmentId = String(lookup.snapshot.shipmentId).trim();
+        if (lookup.snapshot.shiprocketOrderId) {
+          shiprocketOrderId = String(lookup.snapshot.shiprocketOrderId).trim();
+        }
+        // If AWB already present, treat as success (idempotent).
+        if (lookup.snapshot.awbCode) {
+          return {
+            success: true,
+            alreadyAssigned: true,
+            reverseShiprocketOrderId: shiprocketOrderId || null,
+            reverseShipmentId: shipmentId || null,
+            reverseAwbCode: String(lookup.snapshot.awbCode),
+            reverseTrackingNumber: String(lookup.snapshot.trackingNumber || lookup.snapshot.awbCode),
+            reverseCourier: lookup.snapshot.courier || null,
+            providerStatus: lookup.snapshot.providerStatus || 'AWB ASSIGNED',
+            raw: lookup.raw
+          };
+        }
+      }
+    }
+
+    if (!shipmentId || !/^\d+$/.test(shipmentId)) {
+      // Last resort: if stored id is numeric, try it as shipment id for assign.
+      const legacy = String(returnInfo.reverseShipmentId || '').trim();
+      if (/^\d+$/.test(legacy)) shipmentId = legacy;
+    }
+
+    if (!shipmentId || !/^\d+$/.test(shipmentId)) {
+      return {
+        success: false,
+        code: 'RETURN_SHIPMENT_ID_MISSING',
+        message:
+          'Shiprocket return shipment_id not found yet. Open the return in Shiprocket Returns, or Sync after the return is fully created.',
+        reverseShiprocketOrderId: shiprocketOrderId || null,
+        reverseShipmentId: shipmentId || null
+      };
+    }
+
+    const assigned = await this.assignReturnAwb({ shipmentId });
+    if (!assigned.success) {
+      return {
+        ...assigned,
+        reverseShiprocketOrderId: shiprocketOrderId || null,
+        reverseShipmentId: shipmentId
+      };
+    }
+
+    return {
+      ...assigned,
+      reverseShiprocketOrderId: shiprocketOrderId || null,
+      reverseShipmentId: shipmentId
+    };
   }
 
   normalizeTrackingResponse(rawData) {

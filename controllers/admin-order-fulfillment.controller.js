@@ -3115,9 +3115,14 @@ exports.adminInvoiceHtml = async (req, res) => {
 function hasReturnReverseCreated(returnInfo) {
   return Boolean(
     returnInfo?.reverseShipmentId ||
+      returnInfo?.reverseShiprocketOrderId ||
       returnInfo?.reverseAwbCode ||
       returnInfo?.reverseTrackingNumber
   );
+}
+
+function hasReturnReverseAwb(returnInfo) {
+  return Boolean(returnInfo?.reverseAwbCode || returnInfo?.reverseTrackingNumber);
 }
 
 /** POST /orders/admin/returns/requests/:orderId/reverse-pickup/retry */
@@ -3168,22 +3173,144 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
         details: reverse?.details || reverse?.error || null
       });
     }
-    order.returnInfo = mergeReturnInfo(order.returnInfo, {
+    let reversePatch = {
       status: 'approved',
       reverseShipmentId: reverse.reverseShipmentId || order.returnInfo?.reverseShipmentId || null,
+      reverseShiprocketOrderId:
+        reverse.reverseShiprocketOrderId || order.returnInfo?.reverseShiprocketOrderId || null,
       reverseAwbCode: reverse.reverseAwbCode || order.returnInfo?.reverseAwbCode || null,
-      reverseTrackingNumber: reverse.reverseTrackingNumber || order.returnInfo?.reverseTrackingNumber || null,
+      reverseTrackingNumber:
+        reverse.reverseTrackingNumber || order.returnInfo?.reverseTrackingNumber || null,
       reverseCourier: reverse.reverseCourier || order.returnInfo?.reverseCourier || null,
-      reverseProviderStatus: reverse.providerStatus || 'reverse_pickup_created',
+      reverseProviderStatus: reverse.providerStatus || 'RETURN PENDING',
+      reverseLastSyncAt: new Date(),
+      reverseLastError: null
+    };
+
+    if (!isShipmozoOrder(order) && !reversePatch.reverseAwbCode) {
+      const initiated = await ShiprocketService.initiateReturnAwbForOrder(order, reversePatch);
+      if (initiated?.success) {
+        reversePatch = {
+          ...reversePatch,
+          reverseShipmentId: initiated.reverseShipmentId || reversePatch.reverseShipmentId,
+          reverseShiprocketOrderId:
+            initiated.reverseShiprocketOrderId || reversePatch.reverseShiprocketOrderId,
+          reverseAwbCode: initiated.reverseAwbCode || reversePatch.reverseAwbCode,
+          reverseTrackingNumber:
+            initiated.reverseTrackingNumber || reversePatch.reverseTrackingNumber,
+          reverseCourier: initiated.reverseCourier || reversePatch.reverseCourier,
+          reverseProviderStatus: initiated.providerStatus || reversePatch.reverseProviderStatus,
+          reverseLastError: null
+        };
+      } else if (initiated?.message) {
+        reversePatch.reverseLastError = String(initiated.message).slice(0, 800);
+        if (initiated.reverseShipmentId) reversePatch.reverseShipmentId = initiated.reverseShipmentId;
+        if (initiated.reverseShiprocketOrderId) {
+          reversePatch.reverseShiprocketOrderId = initiated.reverseShiprocketOrderId;
+        }
+      }
+    }
+
+    order.returnInfo = mergeReturnInfo(order.returnInfo, reversePatch);
+    order.markModified('returnInfo');
+    await order.save();
+    return res.json({
+      success: true,
+      message: reversePatch.reverseAwbCode
+        ? 'Reverse pickup re-created and return AWB assigned'
+        : 'Reverse pickup re-created (AWB assign pending — use Initiate reverse)',
+      orderId: order.orderId
+    });
+  } catch (error) {
+    logger.error('adminReturnReversePickupRetry', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'RETURN_RETRY_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * POST /orders/admin/returns/requests/:orderId/reverse-pickup/initiate
+ * Shiprocket panel "Initiate Return" — assign AWB with is_return=1. Never refunds.
+ */
+exports.adminReturnReversePickupInitiate = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!isCustomerProductReturnRequest(order)) {
+      return jsonError(
+        res,
+        404,
+        'RETURN_REQUEST_NOT_FOUND',
+        'No customer product return request found for this order'
+      );
+    }
+    if (isShipmozoOrder(order)) {
+      return jsonError(res, 400, 'RETURN_INITIATE_PROVIDER', 'Shipmozo initiate is not available here');
+    }
+
+    const st = String(order.returnInfo?.status || '').toLowerCase();
+    if (!hasReturnReverseCreated(order.returnInfo) || !['approved', 'approval_failed', 'reverse_pickup_created', 'pickup_in_progress'].includes(st)) {
+      return jsonError(
+        res,
+        409,
+        'RETURN_INITIATE_NOT_ALLOWED',
+        'Initiate reverse is only for an approved return that already exists on Shiprocket.'
+      );
+    }
+    if (hasReturnReverseAwb(order.returnInfo)) {
+      return res.json({
+        success: true,
+        message: 'Return AWB already assigned',
+        orderId: order.orderId,
+        alreadyAssigned: true
+      });
+    }
+
+    const initiated = await ShiprocketService.initiateReturnAwbForOrder(order, order.returnInfo || {});
+    if (!initiated?.success) {
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        reverseShipmentId: initiated?.reverseShipmentId || order.returnInfo?.reverseShipmentId || null,
+        reverseShiprocketOrderId:
+          initiated?.reverseShiprocketOrderId || order.returnInfo?.reverseShiprocketOrderId || null,
+        reverseLastError: ShiprocketService.formatProviderError(
+          initiated?.message || 'Could not assign return AWB'
+        ),
+        reverseLastSyncAt: new Date()
+      });
+      order.markModified('returnInfo');
+      await order.save();
+      return jsonError(res, 502, 'RETURN_INITIATE_FAILED', initiated?.message || 'Could not assign return AWB', {
+        details: initiated?.details || null
+      });
+    }
+
+    order.returnInfo = mergeReturnInfo(order.returnInfo, {
+      status: st === 'approval_failed' ? 'approved' : order.returnInfo.status,
+      reverseShipmentId: initiated.reverseShipmentId || order.returnInfo?.reverseShipmentId || null,
+      reverseShiprocketOrderId:
+        initiated.reverseShiprocketOrderId || order.returnInfo?.reverseShiprocketOrderId || null,
+      reverseAwbCode: initiated.reverseAwbCode || null,
+      reverseTrackingNumber: initiated.reverseTrackingNumber || initiated.reverseAwbCode || null,
+      reverseCourier: initiated.reverseCourier || order.returnInfo?.reverseCourier || null,
+      reverseProviderStatus: initiated.providerStatus || 'AWB ASSIGNED',
       reverseLastSyncAt: new Date(),
       reverseLastError: null
     });
     order.markModified('returnInfo');
     await order.save();
-    return res.json({ success: true, message: 'Reverse pickup re-initiated', orderId: order.orderId });
+    return res.json({
+      success: true,
+      message: 'Return AWB assigned (Shiprocket Initiate Return)',
+      orderId: order.orderId,
+      reverse: {
+        reverseShipmentId: order.returnInfo.reverseShipmentId,
+        reverseShiprocketOrderId: order.returnInfo.reverseShiprocketOrderId,
+        reverseAwbCode: order.returnInfo.reverseAwbCode,
+        reverseProviderStatus: order.returnInfo.reverseProviderStatus
+      }
+    });
   } catch (error) {
-    logger.error('adminReturnReversePickupRetry', { message: error.message, stack: error.stack });
-    return jsonError(res, 500, 'RETURN_RETRY_FAILED', error.message || 'Server error');
+    logger.error('adminReturnReversePickupInitiate', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'RETURN_INITIATE_FAILED', error.message || 'Server error');
   }
 };
 
@@ -3225,13 +3352,17 @@ exports.adminReturnReversePickupSync = async (req, res) => {
 
     const { mapReturnCarrierStatus, buildReturnChannelOrderId } = require('./order.controller');
     const channelReturnId = buildReturnChannelOrderId(order.orderId);
-    const existingSrId = order.returnInfo?.reverseShipmentId
+    const existingOrderId = order.returnInfo?.reverseShiprocketOrderId
+      ? String(order.returnInfo.reverseShiprocketOrderId).trim()
+      : '';
+    const existingShipmentOrLegacy = order.returnInfo?.reverseShipmentId
       ? String(order.returnInfo.reverseShipmentId).trim()
       : '';
 
-    const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
-      shiprocketOrderId: existingSrId || null,
-      channelOrderId: channelReturnId
+    const lookup = await ShiprocketService.fetchReturnOrderSnapshot({
+      channelOrderId: channelReturnId,
+      shiprocketOrderId: existingOrderId || null,
+      shipmentIdFallbackAsOrderId: existingShipmentOrLegacy || null
     });
 
     if (!lookup?.success || !lookup.snapshot) {
@@ -3247,7 +3378,6 @@ exports.adminReturnReversePickupSync = async (req, res) => {
     const snap = lookup.snapshot;
     const providerStatus =
       snap.providerStatus ||
-      snap.statusLabel ||
       order.returnInfo?.reverseProviderStatus ||
       null;
     const awb =
@@ -3258,11 +3388,9 @@ exports.adminReturnReversePickupSync = async (req, res) => {
     const mappedReturnStatus = mapReturnCarrierStatus(providerStatus);
 
     const patch = {
-      reverseShipmentId:
-        snap.shipmentId ||
-        snap.shiprocketOrderId ||
-        order.returnInfo?.reverseShipmentId ||
-        null,
+      reverseShiprocketOrderId:
+        snap.shiprocketOrderId || order.returnInfo?.reverseShiprocketOrderId || null,
+      reverseShipmentId: snap.shipmentId || order.returnInfo?.reverseShipmentId || null,
       reverseAwbCode: awb || order.returnInfo?.reverseAwbCode || null,
       reverseTrackingNumber: awb || order.returnInfo?.reverseTrackingNumber || null,
       reverseCourier: snap.courier || order.returnInfo?.reverseCourier || null,

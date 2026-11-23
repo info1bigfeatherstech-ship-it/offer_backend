@@ -4149,11 +4149,13 @@ exports.listAdminReturnRequests = async (req, res) => {
                 rejectedAt: o.returnInfo?.rejectedAt || null,
                 reverseProviderStatus: o.returnInfo?.reverseProviderStatus || null,
                 reverseShipmentId: o.returnInfo?.reverseShipmentId || null,
+                reverseShiprocketOrderId: o.returnInfo?.reverseShiprocketOrderId || null,
                 reverseAwbCode: o.returnInfo?.reverseAwbCode || null,
                 reverseTrackingNumber: o.returnInfo?.reverseTrackingNumber || null,
                 // Only expose -RET channel id after Shiprocket reverse was actually created.
                 reverseChannelOrderId:
                     o.returnInfo?.reverseShipmentId ||
+                    o.returnInfo?.reverseShiprocketOrderId ||
                     o.returnInfo?.reverseAwbCode ||
                     o.returnInfo?.reverseTrackingNumber
                         ? buildReturnChannelOrderId(o.orderId)
@@ -4200,6 +4202,7 @@ exports.getAdminReturnRequest = async (req, res) => {
             );
             const reverseCreated = Boolean(
                 order.returnInfo.reverseShipmentId ||
+                    order.returnInfo.reverseShiprocketOrderId ||
                     order.returnInfo.reverseAwbCode ||
                     order.returnInfo.reverseTrackingNumber
             );
@@ -4282,25 +4285,58 @@ exports.adminDecideReturnRequest = async (req, res) => {
             );
         }
 
-        order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        let reversePatch = {
             status: 'approved',
             approvedAt: new Date(),
             approvedBy: req.userId || null,
             decisionReason: decisionReason || null,
             reverseShipmentId: reverse.reverseShipmentId || null,
+            reverseShiprocketOrderId: reverse.reverseShiprocketOrderId || null,
             reverseAwbCode: reverse.reverseAwbCode || null,
             reverseTrackingNumber: reverse.reverseTrackingNumber || null,
             reverseCourier: reverse.reverseCourier || null,
-            reverseProviderStatus: reverse.providerStatus || 'reverse_pickup_created',
+            reverseProviderStatus: reverse.providerStatus || 'RETURN PENDING',
             reverseLastSyncAt: new Date(),
             reverseLastError: null
-        });
+        };
+
+        // Best-effort Shiprocket "Initiate Return" (assign AWB is_return=1). Never auto-refund.
+        // If this fails, return stays approved so admin can retry Initiate from Returns tab.
+        if (!isShipmozoOrder(order) && !reversePatch.reverseAwbCode) {
+            const initiated = await ShiprocketService.initiateReturnAwbForOrder(order, reversePatch);
+            if (initiated?.success) {
+                reversePatch = {
+                    ...reversePatch,
+                    reverseShipmentId: initiated.reverseShipmentId || reversePatch.reverseShipmentId,
+                    reverseShiprocketOrderId:
+                        initiated.reverseShiprocketOrderId || reversePatch.reverseShiprocketOrderId,
+                    reverseAwbCode: initiated.reverseAwbCode || reversePatch.reverseAwbCode,
+                    reverseTrackingNumber:
+                        initiated.reverseTrackingNumber || reversePatch.reverseTrackingNumber,
+                    reverseCourier: initiated.reverseCourier || reversePatch.reverseCourier,
+                    reverseProviderStatus: initiated.providerStatus || reversePatch.reverseProviderStatus,
+                    reverseLastError: null
+                };
+            } else if (initiated?.message) {
+                reversePatch.reverseLastError = String(initiated.message).slice(0, 800);
+                if (initiated.reverseShipmentId) {
+                    reversePatch.reverseShipmentId = initiated.reverseShipmentId;
+                }
+                if (initiated.reverseShiprocketOrderId) {
+                    reversePatch.reverseShiprocketOrderId = initiated.reverseShiprocketOrderId;
+                }
+            }
+        }
+
+        order.returnInfo = mergeReturnInfo(order.returnInfo, reversePatch);
         order.markModified('returnInfo');
         await order.save();
 
         return res.json({
             success: true,
-            message: 'Return request approved and reverse pickup initiated',
+            message: reversePatch.reverseAwbCode
+                ? 'Return approved, reverse created, and return AWB assigned'
+                : 'Return approved and reverse created on Shiprocket (AWB assign pending — use Initiate reverse)',
             orderId: order.orderId
         });
     } catch (error) {

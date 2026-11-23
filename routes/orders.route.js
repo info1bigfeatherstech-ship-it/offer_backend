@@ -104,6 +104,12 @@ router.post(
 );
 
 router.post(
+  '/admin/returns/requests/:orderId/reverse-pickup/initiate',
+  ...adminOrderStaff,
+  adminFulfillment.adminReturnReversePickupInitiate
+);
+
+router.post(
   '/admin/items/:orderId/edit-pending/preview',
   ...adminOrderStaff,
   adminPendingOrderEdit.previewPendingOrderEdit

@@ -272,6 +272,8 @@ const orderSchema = new mongoose.Schema(
       rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
       decisionReason: { type: String, default: null },
       reverseShipmentId: { type: String, default: null },
+      /** Shiprocket numeric return order id (orders/show). Distinct from reverseShipmentId. */
+      reverseShiprocketOrderId: { type: String, default: null },
       reverseAwbCode: { type: String, default: null },
       reverseTrackingNumber: { type: String, default: null },
       reverseCourier: { type: String, default: null },
