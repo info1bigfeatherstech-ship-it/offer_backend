@@ -837,8 +837,145 @@ class ShiprocketService {
   }
 
   /**
-   * Create reverse pickup / return shipment.
-   * Note: Shiprocket account configurations vary; endpoint is overridable via env.
+   * Guess city from STORE_ADDRESS like "..., Ulhasnagar, Thane, India - 421004".
+   */
+  static guessCityFromStoreAddress(address) {
+    const addr = String(address || '').trim();
+    if (!addr) return '';
+    const m = addr.match(/,\s*([^,]+),\s*([^,]+),\s*India\b/i);
+    if (m) return String(m[1] || '').trim();
+    return '';
+  }
+
+  static isValidIndianMobile(phone) {
+    const p = String(phone || '').replace(/\D/g, '').slice(-10);
+    return /^[6-9]\d{9}$/.test(p);
+  }
+
+  /**
+   * Warehouse / seller destination for Shiprocket return create (shipping_*).
+   * Prefer STORE_* env; enrich phone/address from Shiprocket pickup location when needed.
+   */
+  async resolveReturnWarehouseDestination() {
+    const envAddress = String(process.env.STORE_ADDRESS || '').trim();
+    const envName = String(process.env.STORE_LEGAL_NAME || process.env.STORE_NAME || 'Offer Wale Baba').trim();
+    const envState = String(process.env.STORE_STATE || '').trim();
+    const envCountry = String(process.env.STORE_COUNTRY || 'India').trim() || 'India';
+    const envCity =
+      String(process.env.STORE_CITY || '').trim() ||
+      ShiprocketService.guessCityFromStoreAddress(envAddress);
+    const envPin = String(process.env.STORE_PINCODE || process.env.PICKUP_PINCODE || '')
+      .replace(/\D/g, '')
+      .slice(0, 6);
+    let envPhone = String(process.env.STORE_PHONE || '').replace(/\D/g, '').slice(-10);
+    const envEmail = String(process.env.STORE_EMAIL || 'orders@example.com').trim() || 'orders@example.com';
+
+    let dest = {
+      name: envName || 'Offer Wale Baba',
+      address: envAddress,
+      address2: '',
+      city: envCity,
+      state: envState,
+      country: envCountry,
+      pincode: envPin,
+      phone: envPhone,
+      email: envEmail,
+      source: 'env'
+    };
+
+    const needsEnrich =
+      !dest.address ||
+      !dest.city ||
+      !dest.state ||
+      dest.pincode.length !== 6 ||
+      !ShiprocketService.isValidIndianMobile(dest.phone);
+
+    if (needsEnrich && this.enabled) {
+      try {
+        const loc = await this.fetchPickupLocationsRaw();
+        if (loc?.success && loc.raw) {
+          const nick = this.getConfiguredPickupLocationNickname().toLowerCase();
+          const queue = [loc.raw];
+          const seen = new Set();
+          let match = null;
+          while (queue.length) {
+            const node = queue.shift();
+            if (!node || typeof node !== 'object' || seen.has(node)) continue;
+            seen.add(node);
+            if (Array.isArray(node)) {
+              for (const item of node) queue.push(item);
+              continue;
+            }
+            const nickname = String(
+              node.pickup_location || node.pickupLocation || node.nickname || ''
+            )
+              .trim()
+              .toLowerCase();
+            const hasAddress = Boolean(node.address || node.pin_code || node.pincode || node.city);
+            if (hasAddress && (!nick || nickname === nick || !match)) {
+              if (!nick || nickname === nick) match = node;
+              else if (!match) match = node;
+            }
+            for (const v of Object.values(node)) {
+              if (v && typeof v === 'object') queue.push(v);
+            }
+          }
+          if (match) {
+            const pin = String(match.pin_code || match.pincode || match.postal_code || '')
+              .replace(/\D/g, '')
+              .slice(0, 6);
+            const phone = String(match.phone || match.phone_number || match.mobile || '')
+              .replace(/\D/g, '')
+              .slice(-10);
+            const address = String(match.address || match.address_1 || match.address1 || '').trim();
+            const address2 = String(match.address_2 || match.address2 || '').trim();
+            const city = String(match.city || '').trim();
+            const state = String(match.state || '').trim();
+            const name = String(match.name || match.contact_person || match.pickup_location || '').trim();
+            if (!dest.address && address) dest.address = address;
+            if (!dest.address2 && address2) dest.address2 = address2;
+            if (!dest.city && city) dest.city = city;
+            if (!dest.state && state) dest.state = state;
+            if (dest.pincode.length !== 6 && pin.length === 6) dest.pincode = pin;
+            if (!ShiprocketService.isValidIndianMobile(dest.phone) && ShiprocketService.isValidIndianMobile(phone)) {
+              dest.phone = phone;
+            }
+            if (name && dest.name === 'Offer Wale Baba') dest.name = name;
+            dest.source = 'env+shiprocket_pickup';
+          }
+        }
+      } catch (err) {
+        logger.warn('[Shiprocket] resolveReturnWarehouseDestination enrich failed', {
+          message: err?.message
+        });
+      }
+    }
+
+    const missing = [];
+    if (!dest.name) missing.push('warehouse name (STORE_LEGAL_NAME)');
+    if (!dest.address) missing.push('warehouse address (STORE_ADDRESS)');
+    if (!dest.city) missing.push('warehouse city (STORE_CITY)');
+    if (!dest.state) missing.push('warehouse state (STORE_STATE)');
+    if (dest.pincode.length !== 6) missing.push('warehouse pincode (STORE_PINCODE)');
+    if (!ShiprocketService.isValidIndianMobile(dest.phone)) {
+      missing.push('warehouse phone (STORE_PHONE — valid 10-digit Indian mobile)');
+    }
+
+    if (missing.length) {
+      return {
+        success: false,
+        error: `Return warehouse destination incomplete: ${missing.join(', ')}`
+      };
+    }
+
+    return { success: true, destination: dest };
+  }
+
+  /**
+   * Create reverse pickup / return shipment via Shiprocket Create Return Order API.
+   * pickup_* = customer address; shipping_* = warehouse/seller destination.
+   * Endpoint overridable via SHIPROCKET_RETURN_CREATE_ENDPOINT.
+   * Does NOT initiate any refund — refund remains admin-only after warehouse receipt.
    */
   async createReturnPickup(order, returnInfo = {}) {
     if (!this.enabled) {
@@ -854,20 +991,95 @@ class ShiprocketService {
     const endpointPath = configuredEndpoint || '/external/orders/create/return';
     const endpoint = endpointPath.startsWith('http') ? endpointPath : `${this.baseURL}${endpointPath}`;
 
+    let parts;
+    try {
+      parts = await this.buildAdhocPayloadParts(order);
+    } catch (err) {
+      logger.error('[Shiprocket] createReturnPickup parts failed:', err?.message || err);
+      return {
+        success: false,
+        error: `Could not build return package metrics: ${err?.message || 'unknown error'}`
+      };
+    }
+
+    const addr = parts.addr || order.addressSnapshot || {};
+    const pickupPhone = String(addr.phone || '').replace(/\D/g, '').slice(-10);
+    const pickupPin = String(addr.postalCode || '').replace(/\D/g, '').slice(0, 6);
+    const pickupName = sanitizeCourierConsigneeName(addr.fullName) || 'Customer';
+    const pickupAddress =
+      [addr.houseNumber, addr.building, addr.floor, addr.addressLine1].filter(Boolean).join(', ') ||
+      String(addr.addressLine1 || '').trim();
+    const pickupAddress2 = [addr.addressLine2, addr.area, addr.landmark].filter(Boolean).join(', ');
+
+    if (!pickupAddress) {
+      return { success: false, error: 'Customer pickup address is missing on this order' };
+    }
+    if (!addr.city || !addr.state || pickupPin.length !== 6) {
+      return { success: false, error: 'Customer pickup city/state/pincode is incomplete on this order' };
+    }
+    if (!ShiprocketService.isValidIndianMobile(pickupPhone)) {
+      return { success: false, error: 'Customer pickup phone is invalid on this order' };
+    }
+
+    const warehouse = await this.resolveReturnWarehouseDestination();
+    if (!warehouse.success) {
+      return { success: false, error: warehouse.error };
+    }
+    const wh = warehouse.destination;
+
+    const orderItems = (parts.orderItems || []).map((it) => ({
+      name: it.name || 'Product',
+      sku: it.sku || 'SKU',
+      units: Math.max(1, Number(it.units) || 1),
+      selling_price: Math.max(0, Number(it.selling_price) || 0),
+      discount: Number(it.discount) || 0,
+      hsn: it.hsn || undefined,
+      qc_enable: false
+    }));
+    if (!orderItems.length) {
+      return { success: false, error: 'Order has no line items for reverse pickup' };
+    }
+
+    const subTotal = roundMoney2(
+      orderItems.reduce(
+        (s, it) => s + (Number(it.selling_price) || 0) * Math.max(1, Number(it.units) || 1),
+        0
+      )
+    );
+    const orderDate = (order.createdAt || new Date()).toISOString().slice(0, 19).replace('T', ' ');
+    // Unique from forward channel order id (Shiprocket rejects duplicate order_id).
+    const returnOrderId = `${String(order.orderId || '').trim()}-RET`.slice(0, 50);
+
     const payload = {
-      order_id: order.orderId,
-      shipment_id: order.shipmentInfo?.shipmentId || null,
-      awb_code: order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || null,
-      reason: returnInfo.reasonType || 'damaged',
-      remarks: returnInfo.reasonMessage || 'Return approved by admin',
-      pickup_name: sanitizeCourierConsigneeName(order.addressSnapshot?.fullName),
-      pickup_phone: String(order.addressSnapshot?.phone || '').replace(/\D/g, '').slice(-10) || undefined,
-      pickup_address: [order.addressSnapshot?.houseNumber, order.addressSnapshot?.building, order.addressSnapshot?.floor, order.addressSnapshot?.addressLine1].filter(Boolean).join(', ') || undefined,
-      pickup_address_2: [order.addressSnapshot?.addressLine2, order.addressSnapshot?.area, order.addressSnapshot?.landmark].filter(Boolean).join(', ') || undefined,
-      pickup_city: order.addressSnapshot?.city || undefined,
-      pickup_state: order.addressSnapshot?.state || undefined,
-      pickup_pincode: String(order.addressSnapshot?.postalCode || '').replace(/\D/g, '').slice(0, 6) || undefined,
-      pickup_country: order.addressSnapshot?.country || 'India'
+      order_id: returnOrderId,
+      order_date: orderDate,
+      pickup_customer_name: pickupName,
+      pickup_last_name: '.',
+      pickup_address: pickupAddress,
+      pickup_address_2: pickupAddress2 || '',
+      pickup_city: String(addr.city).trim(),
+      pickup_state: String(addr.state).trim(),
+      pickup_country: String(addr.country || 'India').trim() || 'India',
+      pickup_pincode: Number(pickupPin),
+      pickup_email: String(addr.email || process.env.STORE_EMAIL || 'orders@example.com').trim(),
+      pickup_phone: pickupPhone,
+      shipping_customer_name: sanitizeCourierConsigneeName(wh.name) || wh.name,
+      shipping_last_name: '.',
+      shipping_address: wh.address,
+      shipping_address_2: wh.address2 || '',
+      shipping_city: wh.city,
+      shipping_state: wh.state,
+      shipping_country: wh.country || 'India',
+      shipping_pincode: Number(wh.pincode),
+      shipping_email: wh.email,
+      shipping_phone: Number(wh.phone),
+      order_items: orderItems,
+      payment_method: 'Prepaid',
+      sub_total: subTotal > 0 ? subTotal : roundMoney2(Number(order.subtotal) || Number(order.totalAmount) || 1),
+      length: Math.max(1, Number(parts.maxL) || 10),
+      breadth: Math.max(1, Number(parts.maxB) || 10),
+      height: Math.max(1, Number(parts.maxH) || 10),
+      weight: Math.max(0.05, Number(parts.totalWeight) || 0.5)
     };
 
     try {
@@ -882,19 +1094,24 @@ class ShiprocketService {
         return { success: false, error: 'Shiprocket auth failed' };
       }
 
+      // Some Shiprocket responses nest under data / payload.
+      const root = data?.data && typeof data.data === 'object' ? { ...data, ...data.data } : data;
+
       return {
         success: true,
-        reverseShipmentId: data.shipment_id || data.return_id || null,
-        reverseAwbCode: data.awb_code || data.tracking_number || null,
-        reverseTrackingNumber: data.tracking_number || data.awb_code || null,
-        reverseCourier: data.courier_name || null,
-        providerStatus: data.status || data.current_status || 'reverse_pickup_created',
+        reverseShipmentId: root.shipment_id || root.return_id || root.order_id || null,
+        reverseAwbCode: root.awb_code || root.tracking_number || null,
+        reverseTrackingNumber: root.tracking_number || root.awb_code || null,
+        reverseCourier: root.courier_name || null,
+        providerStatus: root.status || root.current_status || 'reverse_pickup_created',
         raw: data,
         mock: false
       };
     } catch (err) {
-      logger.error('[Shiprocket] createReturnPickup failed:', err.response?.data || err.message);
-      return { success: false, error: err.response?.data || err.message };
+      const details = err.response?.data || null;
+      const message = ShiprocketService.formatProviderError(details || err.message);
+      logger.error('[Shiprocket] createReturnPickup failed:', details || err.message);
+      return { success: false, error: message, details };
     }
   }
 
@@ -1028,13 +1245,43 @@ class ShiprocketService {
   static formatAxiosError(err) {
     const d = err?.response?.data;
     if (d && typeof d === 'object') {
-      if (Array.isArray(d.errors) && d.errors.length) {
-        return String(d.errors[0]?.message || d.errors[0] || d.message || JSON.stringify(d)).slice(0, 800);
-      }
-      if (d.message) return String(d.message);
-      return JSON.stringify(d).slice(0, 800);
+      return ShiprocketService.formatProviderError(d);
     }
     return err?.message ? String(err.message) : String(err);
+  }
+
+  /**
+   * Human-readable Shiprocket / provider error for DB + admin UI (never "[object Object]").
+   */
+  static formatProviderError(value) {
+    if (value == null || value === '') return 'Could not initiate reverse pickup';
+    if (typeof value === 'string') return value.slice(0, 800);
+    if (typeof value !== 'object') return String(value).slice(0, 800);
+
+    const errors = value.errors;
+    if (Array.isArray(errors) && errors.length) {
+      const first = errors[0];
+      return String(first?.message || first || value.message || JSON.stringify(value)).slice(0, 800);
+    }
+    if (errors && typeof errors === 'object') {
+      const parts = [];
+      for (const [field, msgs] of Object.entries(errors)) {
+        const list = Array.isArray(msgs) ? msgs : [msgs];
+        for (const msg of list) {
+          if (msg != null && String(msg).trim()) parts.push(`${field}: ${String(msg).trim()}`);
+        }
+      }
+      if (parts.length) {
+        const head = value.message ? `${String(value.message)} — ` : '';
+        return `${head}${parts.slice(0, 12).join('; ')}`.slice(0, 800);
+      }
+    }
+    if (value.message) return String(value.message).slice(0, 800);
+    try {
+      return JSON.stringify(value).slice(0, 800);
+    } catch (_) {
+      return 'Could not initiate reverse pickup';
+    }
   }
 
   parseNumericShipmentId(shipmentId) {
@@ -2940,4 +3187,8 @@ class ShiprocketService {
   }
 }
 
-module.exports = new ShiprocketService();
+const shiprocketService = new ShiprocketService();
+// Expose static helpers on the singleton so controllers can call them safely.
+shiprocketService.formatProviderError = ShiprocketService.formatProviderError;
+shiprocketService.formatAxiosError = ShiprocketService.formatAxiosError;
+module.exports = shiprocketService;

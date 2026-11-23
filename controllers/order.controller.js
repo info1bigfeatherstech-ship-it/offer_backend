@@ -4233,18 +4233,23 @@ exports.adminDecideReturnRequest = async (req, res) => {
               })
             : await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
         if (!reverse?.success) {
+            const reverseErr = ShiprocketService.formatProviderError(
+                reverse?.error || 'Could not initiate reverse pickup'
+            );
             order.returnInfo = mergeReturnInfo(order.returnInfo, {
                 status: 'approval_failed',
-                reverseLastError: String(reverse?.error || 'Could not initiate reverse pickup')
+                reverseLastError: reverseErr
             });
             order.markModified('returnInfo');
             await order.save();
+            // Approval intentionally NOT completed — no refund is started here.
+            // Refund remains admin-only after reverse parcel is received at warehouse.
             return respondOrderError(
                 res,
                 502,
                 'REVERSE_PICKUP_CREATE_FAILED',
                 'Return approved but reverse pickup initiation failed',
-                { details: reverse?.error || null }
+                { details: reverse?.details || reverse?.error || null }
             );
         }
 
@@ -4298,20 +4303,23 @@ exports.adminInitiateReturnRefund = async (req, res) => {
                 res,
                 400,
                 'RETURN_REFUND_NON_ONLINE',
-                'Automatic refund is available only for online payments'
+                'Online refund is available only for online payments'
             );
         }
         if (!order.paymentInfo?.razorpayPaymentId) {
             return respondOrderError(res, 400, 'RAZORPAY_PAYMENT_MISSING', 'No Razorpay payment found on this order');
         }
-        if (!['paid', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) {
+        if (!['paid', 'partially_paid', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) {
             return respondOrderError(res, 400, 'ORDER_NOT_REFUNDABLE', 'Order is not in refundable payment state');
         }
 
+        // Never auto-refund: this endpoint is admin-triggered only, and only after warehouse receipt.
+        // Refund only what was captured online (not COD balance / full order total).
         const alreadyRefundedInr = roundMoney2(
             (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
         );
-        const remainingInr = roundMoney2(order.totalAmount - alreadyRefundedInr);
+        const paidOnlineInr = roundMoney2(Number(order.amountPaidInr) || 0);
+        const remainingInr = roundMoney2(Math.max(0, paidOnlineInr - alreadyRefundedInr));
         if (remainingInr <= 0) {
             return respondOrderError(res, 400, 'REFUND_NOTHING_PENDING', 'Nothing left to refund');
         }
@@ -4321,7 +4329,7 @@ exports.adminInitiateReturnRefund = async (req, res) => {
             speed: 'normal',
             notes: {
                 orderId: order.orderId,
-                reason: 'return_received_refund'
+                reason: 'return_received_refund_admin'
             }
         });
 

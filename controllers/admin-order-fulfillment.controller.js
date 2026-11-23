@@ -3136,15 +3136,24 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
         'Reverse pickup retry is only allowed after a failed Shiprocket pickup create, or an approved return without reverse AWB yet.'
       );
     }
-    const reverse = await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
+    const reverse = isShipmozoOrder(order)
+      ? await ShipmozoService.pushReturnOrder(order, order.returnInfo || {}, {
+          returnReasonId: req.body?.returnReasonId,
+          customerRequest: req.body?.customerRequest || 'REFUND'
+        })
+      : await ShiprocketService.createReturnPickup(order, order.returnInfo || {});
     if (!reverse?.success) {
+      const reverseErr = ShiprocketService.formatProviderError(
+        reverse?.error || 'Could not initiate reverse pickup'
+      );
       order.returnInfo = mergeReturnInfo(order.returnInfo, {
-        reverseLastError: String(reverse?.error || 'Could not initiate reverse pickup')
+        reverseLastError: reverseErr
       });
       order.markModified('returnInfo');
       await order.save();
+      // Retry never refunds — refund is admin-only after warehouse delivery.
       return jsonError(res, 502, 'REVERSE_PICKUP_CREATE_FAILED', 'Reverse pickup initiation failed', {
-        details: reverse?.error || null
+        details: reverse?.details || reverse?.error || null
       });
     }
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
