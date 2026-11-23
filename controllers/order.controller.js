@@ -255,8 +255,17 @@ function mapReturnCarrierStatus(rawStatus) {
     if (status.includes('out for pickup') || status.includes('pickup')) return 'pickup_in_progress';
     if (status.includes('in transit') || status.includes('transit')) return 'in_transit_to_warehouse';
     if (status.includes('created') || status.includes('booked')) return 'reverse_pickup_created';
+    // Keep "RETURN PENDING" etc. as provider label only — do not remap return status.
     return null;
 }
+
+exports.mapReturnCarrierStatus = mapReturnCarrierStatus;
+
+/** Channel order id used when creating Shiprocket return orders. */
+function buildReturnChannelOrderId(orderId) {
+    return `${String(orderId || '').trim()}-RET`.slice(0, 50);
+}
+exports.buildReturnChannelOrderId = buildReturnChannelOrderId;
 
 function isReturnRefundEligible(order) {
     const status = String(order?.returnInfo?.status || '').toLowerCase();
@@ -4138,7 +4147,19 @@ exports.listAdminReturnRequests = async (req, res) => {
                 requestedAt: o.returnInfo?.requestedAt || null,
                 approvedAt: o.returnInfo?.approvedAt || null,
                 rejectedAt: o.returnInfo?.rejectedAt || null,
-                reverseProviderStatus: o.returnInfo?.reverseProviderStatus || null
+                reverseProviderStatus: o.returnInfo?.reverseProviderStatus || null,
+                reverseShipmentId: o.returnInfo?.reverseShipmentId || null,
+                reverseAwbCode: o.returnInfo?.reverseAwbCode || null,
+                reverseTrackingNumber: o.returnInfo?.reverseTrackingNumber || null,
+                // Only expose -RET channel id after Shiprocket reverse was actually created.
+                reverseChannelOrderId:
+                    o.returnInfo?.reverseShipmentId ||
+                    o.returnInfo?.reverseAwbCode ||
+                    o.returnInfo?.reverseTrackingNumber
+                        ? buildReturnChannelOrderId(o.orderId)
+                        : null,
+                reverseLastError: o.returnInfo?.reverseLastError || null,
+                reverseLastSyncAt: o.returnInfo?.reverseLastSyncAt || null
             }
         }));
 
@@ -4177,6 +4198,14 @@ exports.getAdminReturnRequest = async (req, res) => {
             order.returnInfo.isChatActive = Boolean(
                 order.returnInfo.requestedAt && !order.returnInfo.chatClosedAt
             );
+            const reverseCreated = Boolean(
+                order.returnInfo.reverseShipmentId ||
+                    order.returnInfo.reverseAwbCode ||
+                    order.returnInfo.reverseTrackingNumber
+            );
+            order.returnInfo.reverseChannelOrderId = reverseCreated
+                ? buildReturnChannelOrderId(order.orderId)
+                : null;
         }
         return res.json({
             success: true,

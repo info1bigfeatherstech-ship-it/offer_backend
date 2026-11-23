@@ -98,6 +98,12 @@ router.post(
 );
 
 router.post(
+  '/admin/returns/requests/:orderId/reverse-pickup/sync',
+  ...adminOrderStaff,
+  adminFulfillment.adminReturnReversePickupSync
+);
+
+router.post(
   '/admin/items/:orderId/edit-pending/preview',
   ...adminOrderStaff,
   adminPendingOrderEdit.previewPendingOrderEdit

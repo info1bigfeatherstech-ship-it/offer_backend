@@ -3112,6 +3112,14 @@ exports.adminInvoiceHtml = async (req, res) => {
   }
 };
 
+function hasReturnReverseCreated(returnInfo) {
+  return Boolean(
+    returnInfo?.reverseShipmentId ||
+      returnInfo?.reverseAwbCode ||
+      returnInfo?.reverseTrackingNumber
+  );
+}
+
 /** POST /orders/admin/returns/requests/:orderId/reverse-pickup/retry */
 exports.adminReturnReversePickupRetry = async (req, res) => {
   try {
@@ -3126,14 +3134,18 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
       );
     }
     const st = String(order.returnInfo?.status || '').toLowerCase();
-    const hasReverse = Boolean(order.returnInfo?.reverseAwbCode || order.returnInfo?.reverseTrackingNumber);
+    // If Shiprocket already created a return (shipment/order id), do not create another.
+    // Use sync to refresh AWB/status instead.
+    const hasReverse = hasReturnReverseCreated(order.returnInfo);
     const canRetry = st === 'approval_failed' || (st === 'approved' && !hasReverse);
     if (!canRetry) {
       return jsonError(
         res,
         409,
         'RETURN_RETRY_NOT_ALLOWED',
-        'Reverse pickup retry is only allowed after a failed Shiprocket pickup create, or an approved return without reverse AWB yet.'
+        hasReverse
+          ? 'Reverse return already exists on Shiprocket. Use Sync reverse status instead of Retry.'
+          : 'Reverse pickup retry is only allowed after a failed create, or an approved return with no reverse shipment yet.'
       );
     }
     const reverse = isShipmozoOrder(order)
@@ -3172,6 +3184,134 @@ exports.adminReturnReversePickupRetry = async (req, res) => {
   } catch (error) {
     logger.error('adminReturnReversePickupRetry', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'RETURN_RETRY_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * POST /orders/admin/returns/requests/:orderId/reverse-pickup/sync
+ * Read-only refresh of reverse return from Shiprocket. Never initiates refund.
+ */
+exports.adminReturnReversePickupSync = async (req, res) => {
+  try {
+    const order = await loadStaffOrder(req, res, req.params.orderId);
+    if (!order) return;
+    if (!isCustomerProductReturnRequest(order)) {
+      return jsonError(
+        res,
+        404,
+        'RETURN_REQUEST_NOT_FOUND',
+        'No customer product return request found for this order'
+      );
+    }
+
+    const st = String(order.returnInfo?.status || '').toLowerCase();
+    if (['rejected', 'requested'].includes(st)) {
+      return jsonError(
+        res,
+        409,
+        'RETURN_SYNC_NOT_ALLOWED',
+        'Sync is available after the return is approved / reverse pickup is created.'
+      );
+    }
+
+    if (isShipmozoOrder(order)) {
+      return jsonError(
+        res,
+        400,
+        'RETURN_SYNC_PROVIDER',
+        'Shipmozo reverse sync is not available from this action yet.'
+      );
+    }
+
+    const { mapReturnCarrierStatus, buildReturnChannelOrderId } = require('./order.controller');
+    const channelReturnId = buildReturnChannelOrderId(order.orderId);
+    const existingSrId = order.returnInfo?.reverseShipmentId
+      ? String(order.returnInfo.reverseShipmentId).trim()
+      : '';
+
+    const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
+      shiprocketOrderId: existingSrId || null,
+      channelOrderId: channelReturnId
+    });
+
+    if (!lookup?.success || !lookup.snapshot) {
+      return jsonError(
+        res,
+        502,
+        'RETURN_SYNC_FAILED',
+        lookup?.message ||
+          `Could not load Shiprocket return ${channelReturnId}. Confirm it exists under Returns.`
+      );
+    }
+
+    const snap = lookup.snapshot;
+    const providerStatus =
+      snap.providerStatus ||
+      snap.statusLabel ||
+      order.returnInfo?.reverseProviderStatus ||
+      null;
+    const awb =
+      (snap.awbCode && String(snap.awbCode).trim()) ||
+      (snap.trackingNumber && String(snap.trackingNumber).trim()) ||
+      null;
+    const previousReturnStatus = String(order.returnInfo?.status || '').toLowerCase();
+    const mappedReturnStatus = mapReturnCarrierStatus(providerStatus);
+
+    const patch = {
+      reverseShipmentId:
+        snap.shipmentId ||
+        snap.shiprocketOrderId ||
+        order.returnInfo?.reverseShipmentId ||
+        null,
+      reverseAwbCode: awb || order.returnInfo?.reverseAwbCode || null,
+      reverseTrackingNumber: awb || order.returnInfo?.reverseTrackingNumber || null,
+      reverseCourier: snap.courier || order.returnInfo?.reverseCourier || null,
+      reverseProviderStatus: providerStatus,
+      reverseLastSyncAt: new Date(),
+      reverseLastError: null
+    };
+
+    // Advance return lifecycle from carrier status only — never auto-refund.
+    if (
+      mappedReturnStatus &&
+      !['rejected', 'refunded'].includes(previousReturnStatus)
+    ) {
+      if (
+        mappedReturnStatus === 'received' &&
+        ['approved', 'reverse_pickup_created', 'pickup_in_progress', 'in_transit_to_warehouse'].includes(
+          previousReturnStatus
+        )
+      ) {
+        patch.status = 'refund_pending';
+      } else if (
+        ['approved', 'reverse_pickup_created', 'pickup_in_progress', 'in_transit_to_warehouse', 'approval_failed'].includes(
+          previousReturnStatus
+        )
+      ) {
+        patch.status = mappedReturnStatus === 'reverse_pickup_created' ? 'approved' : mappedReturnStatus;
+      }
+    }
+
+    order.returnInfo = mergeReturnInfo(order.returnInfo, patch);
+    order.markModified('returnInfo');
+    await order.save();
+
+    return res.json({
+      success: true,
+      message: 'Reverse status synced from Shiprocket',
+      orderId: order.orderId,
+      reverse: {
+        channelOrderId: channelReturnId,
+        reverseShipmentId: order.returnInfo.reverseShipmentId || null,
+        reverseAwbCode: order.returnInfo.reverseAwbCode || null,
+        reverseTrackingNumber: order.returnInfo.reverseTrackingNumber || null,
+        reverseProviderStatus: order.returnInfo.reverseProviderStatus || null,
+        status: order.returnInfo.status || null
+      }
+    });
+  } catch (error) {
+    logger.error('adminReturnReversePickupSync', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'RETURN_SYNC_FAILED', error.message || 'Server error');
   }
 };
 

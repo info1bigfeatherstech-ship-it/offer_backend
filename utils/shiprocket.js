@@ -1048,6 +1048,7 @@ class ShiprocketService {
     );
     const orderDate = (order.createdAt || new Date()).toISOString().slice(0, 19).replace('T', ' ');
     // Unique from forward channel order id (Shiprocket rejects duplicate order_id).
+    // Keep in sync with order.controller buildReturnChannelOrderId.
     const returnOrderId = `${String(order.orderId || '').trim()}-RET`.slice(0, 50);
 
     const payload = {
