@@ -6,7 +6,9 @@ const assert = require('assert');
 const {
   recoverOrderStatusAfterSuccessfulCapture,
   recordOnlinePaymentAttemptFailure,
-  isUnpaidTerminalOrder
+  isUnpaidTerminalOrder,
+  isCustomerHiddenAbandonedOrder,
+  buildCustomerVisibleOrdersFilter
 } = require('../utils/orderPaymentState');
 
 function run() {
@@ -81,6 +83,62 @@ function run() {
   assert.strictEqual(dropshipPaid.orderStatus, 'pending');
   if (previousLegacy == null) delete process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT;
   else process.env.LEGACY_AUTO_FULFILL_ON_CHECKOUT = previousLegacy;
+
+  // Customer-hidden abandoned checkout cancellations
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'cancelled',
+      paymentInfo: { cancellationReason: 'checkout_gateway_dismissed' }
+    }),
+    true
+  );
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'cancelled',
+      paymentInfo: { cancellationReason: 'payment_timeout' }
+    }),
+    true
+  );
+  // Admin cancellations & active pending orders MUST remain visible to customers
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'cancelled',
+      paymentInfo: { cancellationReason: 'admin_cancelled' }
+    }),
+    false
+  );
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'cancelled',
+      paymentInfo: { cancellationReason: 'admin_amended_empty' }
+    }),
+    false
+  );
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'cancelled',
+      paymentInfo: {}
+    }),
+    false
+  );
+  assert.strictEqual(
+    isCustomerHiddenAbandonedOrder({
+      orderStatus: 'pending',
+      paymentStatus: 'pending',
+      paymentInfo: { method: 'online' }
+    }),
+    false
+  );
+
+  const wrappedFilter = buildCustomerVisibleOrdersFilter({ userId: 'u1' });
+  assert.strictEqual(Array.isArray(wrappedFilter.$and), true);
+  assert.strictEqual(wrappedFilter.$and[0].userId, 'u1');
+  assert.deepStrictEqual(wrappedFilter.$and[1].$nor, [
+    {
+      orderStatus: 'cancelled',
+      'paymentInfo.cancellationReason': { $in: ['checkout_gateway_dismissed', 'payment_timeout'] }
+    }
+  ]);
 
   console.log('verify-order-payment-state: OK');
 }

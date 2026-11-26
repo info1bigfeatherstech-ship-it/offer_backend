@@ -4494,6 +4494,7 @@ async function resolveVariantImagesForUpdate({
   existingImages,
   keptImages,
   newFiles,
+  imageOrder = null,
   uploadPublicIdPrefix,
   productName
 }) {
@@ -4537,7 +4538,8 @@ async function resolveVariantImagesForUpdate({
     throw new Error("variantKeptImages must be a JSON array");
   }
 
-  const nextImages = [];
+  const keptResolved = [];
+  const keptByPid = new Map();
   for (const item of keptImages) {
     const pid = normalizeImagePublicId(item?.publicId ?? item?.public_id);
     if (!pid || !existingByPid.has(pid)) {
@@ -4545,34 +4547,76 @@ async function resolveVariantImagesForUpdate({
         `existingImages/variantKeptImages: publicId not found on this variant (${pid || "missing"})`
       );
     }
-    if (nextImages.length >= MAX_VARIANT_IMAGES) {
+    if (keptResolved.length >= MAX_VARIANT_IMAGES) {
       throw new Error(`A variant can have at most ${MAX_VARIANT_IMAGES} images`);
     }
     const orig = existingByPid.get(pid);
-    nextImages.push({
+    const resolved = {
       url: orig.url,
       publicId: orig.publicId,
-      altText: item.altText != null ? String(item.altText) : orig.altText || productName,
-      order: nextImages.length
-    });
+      altText: item.altText != null ? String(item.altText) : orig.altText || productName
+    };
+    keptResolved.push(resolved);
+    keptByPid.set(pid, resolved);
   }
 
+  if (keptResolved.length + newBuffers.length > MAX_VARIANT_IMAGES) {
+    throw new Error(`A variant can have at most ${MAX_VARIANT_IMAGES} images`);
+  }
+
+  const uploadedNew = [];
   for (let i = 0; i < newBuffers.length; i++) {
-    if (nextImages.length >= MAX_VARIANT_IMAGES) {
-      throw new Error(`A variant can have at most ${MAX_VARIANT_IMAGES} images`);
-    }
     const optimizedBuffer = await optimizeProductImageBuffer(newBuffers[i].buffer);
     const uploadResult = await uploadToCloudinary(
       optimizedBuffer,
       "products",
       `${uploadPublicIdPrefix}-add-${i}-${Date.now()}`
     );
-    nextImages.push({
+    uploadedNew.push({
       url: uploadResult.url,
       publicId: uploadResult.publicId,
-      altText: productName,
-      order: nextImages.length
+      altText: productName
     });
+  }
+
+  const nextImages = [];
+  if (Array.isArray(imageOrder) && imageOrder.length > 0) {
+    const usedPids = new Set();
+    const usedNewIdx = new Set();
+    for (const slot of imageOrder) {
+      if (!slot || typeof slot !== "object") continue;
+      if (slot.kind === "existing") {
+        const pid = normalizeImagePublicId(slot.publicId ?? slot.public_id);
+        if (pid && keptByPid.has(pid) && !usedPids.has(pid)) {
+          usedPids.add(pid);
+          nextImages.push({ ...keptByPid.get(pid), order: nextImages.length });
+        }
+      } else if (slot.kind === "new") {
+        const idx = Number(slot.fileIndex);
+        if (Number.isInteger(idx) && idx >= 0 && idx < uploadedNew.length && !usedNewIdx.has(idx)) {
+          usedNewIdx.add(idx);
+          nextImages.push({ ...uploadedNew[idx], order: nextImages.length });
+        }
+      }
+    }
+    // Append any unreferenced kept or uploaded items defensively so nothing is dropped.
+    for (const item of keptResolved) {
+      if (!usedPids.has(item.publicId)) {
+        nextImages.push({ ...item, order: nextImages.length });
+      }
+    }
+    for (let i = 0; i < uploadedNew.length; i++) {
+      if (!usedNewIdx.has(i)) {
+        nextImages.push({ ...uploadedNew[i], order: nextImages.length });
+      }
+    }
+  } else {
+    for (const item of keptResolved) {
+      nextImages.push({ ...item, order: nextImages.length });
+    }
+    for (const item of uploadedNew) {
+      nextImages.push({ ...item, order: nextImages.length });
+    }
   }
 
   const keepSet = new Set(
@@ -5112,11 +5156,28 @@ const updateProduct = async (req, res) => {
             f.fieldname === "variantImages" ||
             /^variantImages_/i.test(String(f.fieldname)))
       );
+      let parsedImageOrder = null;
+      if (updates.variantImageOrder != null && String(updates.variantImageOrder).trim() !== "") {
+        try {
+          const rawOrder = Array.isArray(updates.variantImageOrder)
+            ? updates.variantImageOrder
+            : JSON.parse(String(updates.variantImageOrder));
+          if (Array.isArray(rawOrder)) {
+            parsedImageOrder = rawOrder;
+          }
+        } catch {
+          return res.status(400).json({
+            success: false,
+            message: "variantImageOrder must be valid JSON array"
+          });
+        }
+      }
       try {
         const { nextImages, removedPublicIds } = await resolveVariantImagesForUpdate({
           existingImages: variant.images,
           keptImages: hasKeptKey ? keptArray : null,
           newFiles: files,
+          imageOrder: parsedImageOrder,
           uploadPublicIdPrefix: `${doc.slug}-v-${normalizeProductCode(variant.productCode)}`,
           productName: doc.name
         });

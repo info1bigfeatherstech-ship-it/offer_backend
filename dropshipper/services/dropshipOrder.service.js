@@ -26,6 +26,7 @@ const { buildShippingWeightSnapshotFromCheckoutLines } = require('../../utils/sh
 const { resolveVariantShipping } = require('../../utils/variantCatalogFields');
 const { validatePhysicalAddressForSave } = require('../../utils/addressValidation');
 const paymentHoldExpiryService = require('../../services/paymentHoldExpiry.service');
+const { buildCustomerVisibleOrdersFilter } = require('../../utils/orderPaymentState');
 const shippingProviderSettingsService = require('../../services/shippingProviderSettings.service');
 const { SHIPPING_PROVIDERS } = require('../../constants/shippingProviders');
 const logger = require('../../utils/logger');
@@ -629,13 +630,15 @@ async function listDropshipOrdersForUser(userId, { page = 1, limit = 20, ref } =
   const refNorm = normalizeDropshipRef(ref);
   if (refNorm) filter['dropshipMeta.ref'] = refNorm;
 
+  const customerFilter = buildCustomerVisibleOrdersFilter(filter);
+
   const [rows, total] = await Promise.all([
-    Order.find(filter)
+    Order.find(customerFilter)
       .sort({ createdAt: -1 })
       .skip((p - 1) * l)
       .limit(l)
       .lean(),
-    Order.countDocuments(filter)
+    Order.countDocuments(customerFilter)
   ]);
 
   return {
@@ -648,15 +651,17 @@ async function listDropshipOrdersForUser(userId, { page = 1, limit = 20, ref } =
 }
 
 async function getDropshipOrderForUser(userId, orderId) {
-  const order = await Order.findOne({
-    orderId: String(orderId || '').trim(),
-    storefront: DROPSHIP_STOREFRONT,
-    $or: [
-      { userId },
-      { 'dropshipMeta.placedByUserId': userId },
-      { 'dropshipMeta.dropshipperId': userId }
-    ]
-  }).lean();
+  const order = await Order.findOne(
+    buildCustomerVisibleOrdersFilter({
+      orderId: String(orderId || '').trim(),
+      storefront: DROPSHIP_STOREFRONT,
+      $or: [
+        { userId },
+        { 'dropshipMeta.placedByUserId': userId },
+        { 'dropshipMeta.dropshipperId': userId }
+      ]
+    })
+  ).lean();
   return order;
 }
 

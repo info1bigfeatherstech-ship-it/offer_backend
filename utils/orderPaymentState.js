@@ -19,6 +19,15 @@ const RECOVERABLE_CANCEL_REASONS = new Set([
   'payment_timeout'
 ]);
 
+/**
+ * Customer-abandoned checkout cancel reasons hidden from customer order lists/details.
+ * Admin/ops views do not use this filter so full audit visibility is preserved.
+ */
+const CUSTOMER_HIDDEN_ABANDONED_CANCEL_REASONS = [
+  'checkout_gateway_dismissed',
+  'payment_timeout'
+];
+
 function normalizeLower(value) {
   return String(value || '')
     .trim()
@@ -222,12 +231,47 @@ function recordOnlinePaymentAttemptFailure(order, failedPayment) {
   return { changed: true };
 }
 
+/**
+ * True when an order was cancelled solely because the customer dismissed the payment gateway
+ * or let the online payment hold expire. Hidden from customer-facing responses while remaining
+ * visible in admin/ops views. Admin-initiated cancellations remain visible to customers.
+ */
+function isCustomerHiddenAbandonedOrder(order) {
+  if (!order) return false;
+  if (normalizeLower(order.orderStatus) !== 'cancelled') return false;
+  const reason = normalizeLower(order.paymentInfo?.cancellationReason);
+  return CUSTOMER_HIDDEN_ABANDONED_CANCEL_REASONS.includes(reason);
+}
+
+/**
+ * Wraps a MongoDB order query filter to exclude customer-abandoned unpaid checkout cancellations
+ * (`checkout_gateway_dismissed`, `payment_timeout`) from customer-facing order lists/lookups.
+ * Preserves existing $or/$and clauses safely.
+ */
+function buildCustomerVisibleOrdersFilter(baseFilter = {}) {
+  const excludeAbandoned = {
+    $nor: [
+      {
+        orderStatus: 'cancelled',
+        'paymentInfo.cancellationReason': { $in: CUSTOMER_HIDDEN_ABANDONED_CANCEL_REASONS }
+      }
+    ]
+  };
+  if (!baseFilter || typeof baseFilter !== 'object' || Object.keys(baseFilter).length === 0) {
+    return excludeAbandoned;
+  }
+  return { $and: [baseFilter, excludeAbandoned] };
+}
+
 module.exports = {
   MONEY_CAPTURED_PAYMENT_STATUSES,
   RECOVERABLE_AFTER_CAPTURE_ORDER_STATUSES,
   RECOVERABLE_CANCEL_REASONS,
+  CUSTOMER_HIDDEN_ABANDONED_CANCEL_REASONS,
   isMoneyCapturedPaymentStatus,
   isUnpaidTerminalOrder,
+  isCustomerHiddenAbandonedOrder,
+  buildCustomerVisibleOrdersFilter,
   targetOrderStatusAfterSuccessfulCapture,
   recoverOrderStatusAfterSuccessfulCapture,
   recordOnlinePaymentAttemptFailure

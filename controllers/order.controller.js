@@ -87,7 +87,9 @@ const { isLegacyAutoFulfillOnCheckout } = require('../constants/orderFulfillment
 const {
     recoverOrderStatusAfterSuccessfulCapture,
     recordOnlinePaymentAttemptFailure,
-    isMoneyCapturedPaymentStatus
+    isMoneyCapturedPaymentStatus,
+    isCustomerHiddenAbandonedOrder,
+    buildCustomerVisibleOrdersFilter
 } = require('../utils/orderPaymentState');
 
 const normalizeDecisionCode = (errorLike, fallback) =>
@@ -308,26 +310,46 @@ function uploadReturnProofToCloudinary(file, orderId) {
     });
 }
 
-async function applyRefundEntryToOrder(order, refundEntity) {
+const PENDING_REFUND_STATUSES = new Set(['', 'pending', 'created']);
+
+async function applyRefundEntryToOrder(order, refundEntity, opts = {}) {
     if (!order || !refundEntity) return;
     const amountPaise = Number(refundEntity.amount);
     if (!Number.isFinite(amountPaise) || amountPaise <= 0) return;
     const amountInr = roundMoney2(amountPaise / 100);
+    const nextStatus = String(refundEntity.status || opts.fallbackStatus || 'processed')
+        .trim()
+        .toLowerCase();
     const entry = {
         refundId: refundEntity.id,
         amountInr,
         amountPaise,
-        status: refundEntity.status || 'processed',
+        status: nextStatus,
         reason: (refundEntity.notes && refundEntity.notes.reason) || '',
         createdAt: new Date()
     };
     order.refundHistory = order.refundHistory || [];
-    if (!order.refundHistory.some((r) => r.refundId === entry.refundId)) {
+    const existing = order.refundHistory.find((r) => r && r.refundId === entry.refundId);
+    if (!existing) {
         order.refundHistory.push(entry);
+    } else {
+        const prevStatus = String(existing.status || '').trim().toLowerCase();
+        // Never downgrade a settled `processed` refund back to `pending`/`created` on out-of-order webhooks.
+        const isDowngradeFromProcessed =
+            prevStatus === 'processed' && PENDING_REFUND_STATUSES.has(nextStatus);
+        if (!isDowngradeFromProcessed && nextStatus && prevStatus !== nextStatus) {
+            existing.status = nextStatus;
+        }
+        if (!existing.reason && entry.reason) {
+            existing.reason = entry.reason;
+        }
     }
+    order.markModified('refundHistory');
 
     const totalRefundedInr = roundMoney2(
-        (order.refundHistory || []).reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
+        (order.refundHistory || [])
+            .filter((r) => String(r?.status || '').trim().toLowerCase() !== 'failed')
+            .reduce((s, r) => s + (Number(r.amountInr) || 0), 0)
     );
     if (totalRefundedInr >= roundMoney2(order.totalAmount)) {
         order.paymentStatus = 'refunded';
@@ -336,13 +358,64 @@ async function applyRefundEntryToOrder(order, refundEntity) {
     }
     // Use mergeReturnInfo — naive spread can write undefined nested paths
     // (e.g. rtoDeductions) and crash Mongoose cast on save.
+    const effectiveStatus = existing ? existing.status : entry.status;
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
         refundAmount: totalRefundedInr,
         refundId: entry.refundId,
-        status: entry.status
+        status: effectiveStatus
     });
     order.markModified('returnInfo');
     await order.save();
+}
+
+/**
+ * Best-effort live sync for refundHistory entries still stuck in `pending`/`created`.
+ * Called on admin order detail so historical or missed-webhook refunds reflect Razorpay's current status.
+ */
+async function syncPendingRefundStatusesFromRazorpay(order) {
+    if (!order || !Array.isArray(order.refundHistory) || order.refundHistory.length === 0) {
+        return false;
+    }
+    if (!razorpay?.refunds || typeof razorpay.refunds.fetch !== 'function') {
+        return false;
+    }
+    const pendingEntries = order.refundHistory
+        .filter((r) => {
+            if (!r?.refundId || !String(r.refundId).startsWith('rfnd_')) return false;
+            return PENDING_REFUND_STATUSES.has(String(r.status || '').trim().toLowerCase());
+        })
+        .slice(0, 5);
+
+    if (pendingEntries.length === 0) return false;
+
+    let dirty = false;
+    for (const entry of pendingEntries) {
+        try {
+            const liveRefund = await razorpay.refunds.fetch(entry.refundId);
+            const liveStatus = String(liveRefund?.status || '').trim().toLowerCase();
+            const prevStatus = String(entry.status || '').trim().toLowerCase();
+            if (liveStatus && liveStatus !== prevStatus) {
+                entry.status = liveStatus;
+                dirty = true;
+                if (order.returnInfo && order.returnInfo.refundId === entry.refundId) {
+                    order.returnInfo = mergeReturnInfo(order.returnInfo, { status: liveStatus });
+                    order.markModified('returnInfo');
+                }
+            }
+        } catch (err) {
+            logger.warn('[syncPendingRefundStatusesFromRazorpay] fetch skipped', {
+                orderId: order.orderId,
+                refundId: entry.refundId,
+                message: err?.error?.description || err?.message || String(err)
+            });
+        }
+    }
+
+    if (dirty) {
+        order.markModified('refundHistory');
+        await order.save();
+    }
+    return dirty;
 }
 
 async function abortTransactionSafely(session) {
@@ -2347,7 +2420,8 @@ exports.razorpayWebhook = async (req, res) => {
                 const refund = payload.refund.entity;
                 const refundOrder = await Order.findOne({ 'paymentInfo.razorpayPaymentId': refund.payment_id });
                 if (refundOrder) {
-                    await applyRefundEntryToOrder(refundOrder, refund);
+                    const fallbackStatus = event === 'refund.processed' ? 'processed' : 'pending';
+                    await applyRefundEntryToOrder(refundOrder, refund, { fallbackStatus });
                     try {
                         const { handleRazorpayRefundForRtoNotifications } = require('../services/rtoNotification.service');
                         await handleRazorpayRefundForRtoNotifications(refundOrder, refund, event);
@@ -2365,6 +2439,7 @@ exports.razorpayWebhook = async (req, res) => {
                 const refund = payload.refund.entity;
                 const refundOrder = await Order.findOne({ 'paymentInfo.razorpayPaymentId': refund.payment_id });
                 if (refundOrder) {
+                    await applyRefundEntryToOrder(refundOrder, refund, { fallbackStatus: 'failed' });
                     try {
                         const { handleRazorpayRefundForRtoNotifications } = require('../services/rtoNotification.service');
                         await handleRazorpayRefundForRtoNotifications(refundOrder, refund, event);
@@ -3070,7 +3145,22 @@ exports.getOrder = async (req, res) => {
             }
         }
 
+        // Hide customer-abandoned checkout cancellations (gateway dismissed / payment timeout) from customers.
+        // Checked after capture self-heal so a late-captured recovered order remains visible to the customer.
+        if (!isOrderStaff && isCustomerHiddenAbandonedOrder(order)) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
         if (isOrderStaff) {
+            try {
+                await syncPendingRefundStatusesFromRazorpay(order);
+            } catch (refundSyncErr) {
+                logger.warn('[getOrder] refund status sync skipped', {
+                    orderId,
+                    message: refundSyncErr?.message || String(refundSyncErr)
+                });
+            }
+
             const {
                 ensureShiprocketPickupId,
                 isEligibleForShiprocketPickupIdBackfill
@@ -3257,7 +3347,7 @@ exports.getUserOrders = async (req, res) => {
         const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
         const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 20));
         const skip = (page - 1) * limit;
-        const filter = { userId: req.userId };
+        const filter = buildCustomerVisibleOrdersFilter({ userId: req.userId });
 
         // List card only — full order body comes from GET /items/:orderId.
         // Uses existing index { userId: 1, createdAt: -1 }.
